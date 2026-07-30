@@ -108,14 +108,43 @@ Module['preRun'].push(function () {
 
   // ------------------------------------------------------------------ eager fallback (pass 30)
 
+  // Pass 50: serve straight out of the already-downloaded buffer instead of FS.writeFile, which
+  // makes MEMFS allocate and memcpy a SECOND ~size-of-file buffer on top of the one `bytes`
+  // already holds. On a host that can't do Range requests (GitHub Pages — confirmed by curl:
+  // responds 200 with the full body regardless of a Range header, despite advertising
+  // `accept-ranges: bytes`) this IS the whole-file path for every cold boot, so that transient
+  // doubling — on top of whatever the download itself (chunks array + concat, see eagerFetch)
+  // was already holding — is real peak-memory pressure, not a rounding error. iOS Safari's
+  // per-tab memory ceiling is tighter than desktop, and this function's old body was the
+  // single biggest resident allocation in the whole boot path (52 MB copy of a 52 MB copy). No
+  // reports of an actual crash/OOM message — Safari fails this kind of pressure silently, which
+  // reads indistinguishable from "stuck loading forever". This makes the file resident exactly
+  // once for its whole lazy-node lifetime (same node shape as installLazyNode below, minus any
+  // network path — `read` is a plain subarray copy out of `bytes`).
   function populateEager(bytes) {
     try { FS.mkdirTree('/bundle'); } catch (e) { /* already created by the media preloads */ }
+    try { FS.unlink('/bundle/Eden.eden'); } catch (e) { /* not there yet, the normal case */ }
     try {
-      FS.writeFile('/bundle/Eden.eden', bytes);
+      var node = FS.createFile('/bundle', 'Eden.eden', {}, true, false);
+      node.contents = null;
+      Object.defineProperty(node, 'usedBytes', { get: function () { return bytes.length; }, configurable: true });
+
+      var ops = Object.create(null);
+      for (var key in node.stream_ops) ops[key] = node.stream_ops[key];
+      ops.read = function (stream, buffer, offset, length, position) {
+        if (position >= bytes.length || length <= 0) return 0;
+        if (position + length > bytes.length) length = bytes.length - position;
+        buffer.set(bytes.subarray(position, position + length), offset);
+        return length;
+      };
+      ops.write = function () { throw new FS.ErrnoError(63 /* EPERM */); };
+      ops.mmap = function () { throw new FS.ErrnoError(63 /* EPERM */); };
+      node.stream_ops = ops;
+
       Module['EdenWorldFS'].mode = 'eager';
       Module['EdenWorldFS'].size = bytes.length;
     } catch (e) {
-      console.warn('[eden] writing /bundle/Eden.eden failed:', e);
+      console.warn('[eden] installing /bundle/Eden.eden failed:', e);
     }
     doneDep();
   }
@@ -293,8 +322,17 @@ Module['preRun'].push(function () {
     // are synchronous — which they have to be, because they happen underneath a synchronous
     // fread() inside the engine.
     var eagerFetch = function () {
-      // Pass 30's path, unchanged: stream the response body so public/eden-loading.js can show
-      // byte-level progress for what is then the largest download of a cold boot.
+      // Pass 30's path, streaming so public/eden-loading.js can show byte-level progress for
+      // what is then the largest download of a cold boot. Pass 50: when the response carries a
+      // Content-Length (GitHub Pages always sends one), pre-allocate ONE destination buffer and
+      // fill it in place, instead of accumulating a chunks[] array and concatenating into a
+      // second buffer at the end — that old pattern peaked at 2x the file's resident size during
+      // the copy, stacked on top of what populateEager then duplicated AGAIN via FS.writeFile
+      // (fixed separately, see that function). A stated Content-Length is the wire/encoded size,
+      // which is smaller than the decoded body only when the response is compression-encoded;
+      // GitHub Pages does not compress `application/octet-stream`, but if some future host does,
+      // overflowing the pre-allocated buffer falls back to the safe chunks[] path for the rest of
+      // the transfer rather than throwing.
       fetch(URL_PATH).then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         var total = Number(r.headers.get('Content-Length')) || 0;
@@ -303,17 +341,28 @@ Module['preRun'].push(function () {
         if (!r.body || !r.body.getReader) return r.arrayBuffer();
 
         var reader = r.body.getReader();
-        var chunks = [];
+        var out = total > 0 ? new Uint8Array(total) : null;   // pre-sized, filled in place
+        var chunks = out ? null : [];                          // fallback path, only if no size
         var loaded = 0;
         function pump() {
           return reader.read().then(function (step) {
             if (step.done) {
-              var out = new Uint8Array(loaded);
-              var offset = 0;
-              for (var i = 0; i < chunks.length; i++) { out.set(chunks[i], offset); offset += chunks[i].length; }
-              return out.buffer;
+              if (out) return (loaded === out.length) ? out.buffer : out.buffer.slice(0, loaded);
+              var merged = new Uint8Array(loaded);
+              var mergedOffset = 0;
+              for (var i = 0; i < chunks.length; i++) { merged.set(chunks[i], mergedOffset); mergedOffset += chunks[i].length; }
+              return merged.buffer;
             }
-            chunks.push(step.value);
+            if (out && loaded + step.value.length > out.length) {
+              // Content-Length under-reported the real (decoded) size — bail to the chunked path
+              // for the remainder rather than throwing on an out-of-bounds .set().
+              chunks = [out.subarray(0, loaded), step.value];
+              out = null;
+            } else if (out) {
+              out.set(step.value, loaded);
+            } else {
+              chunks.push(step.value);
+            }
             loaded += step.value.length;
             if (reportProgress) reportProgress(loaded, total || loaded);
             return pump();

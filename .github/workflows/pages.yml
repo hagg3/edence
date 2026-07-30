@@ -49,6 +49,12 @@ jobs:
           # Real files, not the absolute-path symlinks CMake just (re)created on this runner.
           cp -RL public/. _site/public/
 
+          # Registered from eden-st.html as '../service-worker.js', i.e. resolved against the
+          # site root — was missing here entirely (never copied into _site), so every deployed
+          # page load 404'd on it. Non-fatal (registration failure is caught), but breaks the
+          # PWA/offline-shell feature this file exists for.
+          cp -f service-worker.js _site/service-worker.js
+
           cp -f build-rel/eden.js _site/build-rel/
           cp -f build-rel/eden.wasm _site/build-rel/
           [ -f build-rel/eden.data ] && cp -f build-rel/eden.data _site/build-rel/ || true
