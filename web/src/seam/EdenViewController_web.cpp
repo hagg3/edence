@@ -2,10 +2,12 @@
 // reused Objective-C interface).
 #include "EdenViewController_web.h"
 #include <cstdio>
+#include <algorithm>
 #include "../../../Classes/World.h"
 #include "../../../Classes/Globals.h"
 #include <chrono>
 #include "../shim/gl/gl_es1_shim.h"
+#include "../shim/foundation/NSAutoreleasePool.h"
 
 namespace eden_web {
 
@@ -49,7 +51,7 @@ void EdenViewController::stopAnimation() {
     animating = false;
 }
 
-bool EdenViewController::drawFrame() {
+bool EdenViewController::drawFrame(bool renderThisFrame) {
     // Mirrors Classes/EdenViewController.mm:188-229. TODO P2: the EAGLView setFramebuffer/
     // presentFramebuffer/deleteFramebuffer/createFramebuffer calls are intentionally omitted
     // here — this class's job for Stage P1 is proving `world->update(etime)` runs headless;
@@ -59,11 +61,22 @@ bool EdenViewController::drawFrame() {
     float etime = (float)(now - lastTime);
     lastTime = now;
 
-    // TODO P1: real Foundation code wraps this in an NSAutoreleasePool per frame
-    // (Classes/EdenViewController.mm:198) — do the same once World::update's Foundation
-    // touchpoints are exercised; harmless to omit for a headless no-GL smoke test but
-    // load-bearing once real engine work happens per frame (autorelease pool draining is
-    // exactly what audit findings C3/H6/M2 are about, per web-port-plan.md D3).
+    // Audit row A3: clamp etime. Unclamped, a backgrounded tab / GC pause / devtools breakpoint
+    // / syncfs stall feeds a multi-second delta straight into Terrain::update and physics —
+    // guaranteed on the very first tab-switch, not an edge case. Cap chosen as ~3 frames at
+    // 30 fps (matches the mobile fps-cap floor elsewhere in this file's caller); World::update
+    // itself already substeps large etime less gracefully than this cap avoids needing to rely on.
+    constexpr float kMaxEtime = 0.1f;
+    etime = std::min(etime, kMaxEtime);
+
+    // Audit row A2 (TODO P1, Classes/EdenViewController.mm:198): real Foundation code wraps
+    // each frame in an NSAutoreleasePool. Without one, every autorelease'd object World::update/
+    // render create (the shim's NSSet/UIEvent/NSString paths autorelease routinely) accumulated
+    // into whatever outer pool existed, or leaked outright — a slow heap climb that only shows up
+    // as a long-session memory ramp. C-linkage push/drain (NSAutoreleasePool.h) keeps this file
+    // plain C++ per its header comment's rationale.
+    void *autoreleasePool = eden_autoreleasepool_push();
+
     // Stage P1's success bar is "world->update(etime) runs one headless tick", and a run that
     // meets it looks EXACTLY like a run that hung during construction — emscripten_set_main_loop
     // never returns, so `node eden.js` just sits there either way. These three lines are the
@@ -92,10 +105,16 @@ bool EdenViewController::drawFrame() {
     // Perf-audit item #4: rotate the GL shim's per-frame draw-call accounting. Here rather than
     // inside the shim's glClear, because prepareScene does not clear the colour buffer — see
     // eden_gl_stats_frame_boundary()'s comment. Cheap (two struct copies) and it is what
-    // Module._eden_gl_stat() reports.
-    eden_gl_stats_frame_boundary();
+    // Module._eden_gl_stat() reports. Only rotated on frames that actually draw, so a capped
+    // frame does not report a spurious zero-draw frame to _eden_gl_stat().
+    if (renderThisFrame) eden_gl_stats_frame_boundary();
 
-    if (world) world->render(); // TODO P2: no-op until the GL shim (src/shim/gl) is wired up
+    // Audit row A4: even when the cap says "don't draw", renderFrame() is still CALLED — it owns
+    // the GAME_MODE_WAIT -> target_game_mode transition and the exit_to_menu check, neither of
+    // which is reachable from World::update(). Skipping the call outright wedges a loading world
+    // in WAIT forever. (The port's recurring defect class: a replacement owes the side effects,
+    // not just the visible output.)
+    if (world) world->renderFrame(renderThisFrame);
 
     if (retinaSwapRequested) {
         // Mirrors Classes/EdenViewController.mm:207-226's IS_RETINA/IS_IPAD/SCALE_WIDTH/
@@ -114,6 +133,9 @@ bool EdenViewController::drawFrame() {
             SCALE_HEIGHT = 2;
         }
     }
+
+    eden_autoreleasepool_drain(autoreleasePool);
+
     return retinaSwapRequested;
 }
 

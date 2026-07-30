@@ -136,6 +136,11 @@
      loop below inits and ticks it. -->
 <script src="eden-gamepad.js"></script>
 
+<!-- Dev console (project-audit-2026-07-30 row F5) — teleport/spawn/world-stats, backtick to
+     open. Feature-detects its EDEN_DIAGNOSTICS-only wasm exports at call time, so it is inert
+     (not just hidden) on a build without them. Self-contained; no tick() to wire in. -->
+<script src="eden-console.js"></script>
+
 <script>
   // Q1 (dazzling-munching-bengio.md perf audit): pick which configured build to run.
   // `?build=rel` -> build-rel/ (Release, -O2 -fno-strict-aliasing, no DWARF — see CMakeLists.txt).
@@ -1096,6 +1101,10 @@
   canvasEl.addEventListener('mousedown', (e) => {
     if (!pointerLocked) return;
     e.preventDefault();
+    // Middle-click "pick block" (audit row 31/F3) — not a hold-to-act button, just a one-shot
+    // read of whatever's under the crosshair into the current hotbar slot. preventDefault above
+    // already suppresses the browser's native middle-click autoscroll cursor.
+    if (e.button === 1) { callIfReady(() => Module._eden_pick_block_at_crosshair()); return; }
     callIfReady(() => holdActStart(e.button === 2 ? 1 : 0));
   });
   window.addEventListener('mouseup', (e) => {

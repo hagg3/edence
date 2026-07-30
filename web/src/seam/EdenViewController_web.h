@@ -46,7 +46,11 @@ public:
     // caller (src/entry/eden_main.cpp) can decide whether to react — mirrors
     // Classes/EdenViewController.mm:188-229's drawFrame, minus the actual EAGLView
     // framebuffer calls (TODO P2, see EAGLView_web.mm).
-    bool drawFrame();
+    //
+    // Audit row A4: `renderThisFrame == false` runs the update half only (input consumption,
+    // physics, streaming) and hands World::renderFrame(FALSE) the draw skip. The frame-rate cap
+    // in eden_main.cpp uses that instead of skipping the whole tick — see that file's gate.
+    bool drawFrame(bool renderThisFrame = true);
 
     World* world = nullptr;
 

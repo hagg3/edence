@@ -52,8 +52,23 @@ EM_JS(void, eden_prefs_set, (const char* keyC, const char* valC), {
     try { localStorage.setItem('eden.prefs.' + UTF8ToString(keyC), UTF8ToString(valC)); } catch (e) {}
 });
 
+// NON-POD IVARS ARE NOT SAFE IN THIS PORT. src/shim/objc/objc_runtime.cpp's
+// class_createInstance() is `calloc(1, instance_size)` and there is no `.cxx_construct` /
+// `.cxx_destruct` support anywhere in the hand-written runtime — a C++ ivar's constructor NEVER
+// runs and its destructor NEVER runs. For `std::unordered_map` the all-zero state is not a valid
+// empty map: `__max_load_factor_` reads back as 0.0f, so the first insert computes a bucket count
+// of `ceil((size+1) / 0.0f)` = +inf, and libc++'s `__next_prime()` throws — which, with exceptions
+// off, is a bare `abort()`. Measured, not reasoned: an `fprintf` probe at the first
+// -setObject:forKey: reports `bucket_count=0 mlf=0.000000` in EVERY build, Debug and Release.
+//
+// This is why `-flto` "broke" the Release build (audit row B1 follow-up): LTO's cross-TU inlining
+// lets the compiler constant-fold that division and commit to the throw path, whereas the non-LTO
+// -O2 build happened to keep limping. The UB was always there; LTO only made it fatal. Anything
+// added here — or to any other @implementation in src/ — must hold POD ivars only, with real C++
+// objects hung off an explicitly-allocated pointer like `_store` below. NSAutoreleasePool.mm has
+// the same note and the same shape, and they are the only two instances in the tree.
 @implementation NSUserDefaults {
-    std::unordered_map<std::string, id> _store;
+    std::unordered_map<std::string, id> *_store;   // calloc'd to null; allocated by -init
 }
 
 + (NSUserDefaults *)standardUserDefaults {
@@ -62,11 +77,19 @@ EM_JS(void, eden_prefs_set, (const char* keyC, const char* valC), {
     return shared;
 }
 
+- (id)init {
+    self = [super init];
+    if (self) {
+        _store = new std::unordered_map<std::string, id>();
+    }
+    return self;
+}
+
 - (id)objectForKey:(NSString *)key {
     if (!key) return nil;
     std::string k = [key UTF8String];
-    auto it = _store.find(k);
-    if (it != _store.end()) return it->second;
+    auto it = _store->find(k);
+    if (it != _store->end()) return it->second;
 
     if (!eden_prefs_available()) return nil;
     char *raw = eden_prefs_get(k.c_str());
@@ -77,7 +100,7 @@ EM_JS(void, eden_prefs_set, (const char* keyC, const char* valC), {
     std::free(raw);
     if (!value) return nil;          // unknown tag: treat as absent, don't guess
     [value retain];                  // the map owns a reference, same as -setObject:forKey:
-    _store[k] = value;
+    (*_store)[k] = value;
     return value;
 }
 
@@ -86,7 +109,7 @@ EM_JS(void, eden_prefs_set, (const char* keyC, const char* valC), {
     if (value) [value retain];
     id old = [self objectForKey:key];
     std::string k = [key UTF8String];
-    _store[k] = value;
+    (*_store)[k] = value;
     if (old) [old release];
 
     if (!value || !eden_prefs_available()) return;

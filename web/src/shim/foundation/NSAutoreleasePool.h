@@ -19,4 +19,17 @@
 
 @end
 
+// C-linkage push/drain pair for plain-C++ TUs that need per-frame pool semantics without
+// pulling in the ObjC frontend (e.g. EdenViewController_web.cpp — see its header comment on
+// why it stays plain C++). Thin wrappers over +alloc/-init/-drain above; same pool-stack
+// semantics apply.
+#ifdef __cplusplus
+extern "C" {
+#endif
+void *eden_autoreleasepool_push(void);
+void eden_autoreleasepool_drain(void *pool);
+#ifdef __cplusplus
+}
+#endif
+
 #endif

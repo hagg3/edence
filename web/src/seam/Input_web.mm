@@ -415,6 +415,38 @@ void eden_set_hotbar_slot_type(int slot, int type) {
     kHotbarBlocks[slot] = type;
 }
 
+// Project audit 2026-07-30, row F3 — middle-click "pick block" (standard voxel-game affordance,
+// requested from play, audit row 31). Reads whatever block is under the crosshair via the EXACT
+// same raycast Player::processInput's MODE_MINE/PAINT/BURN branch uses (Classes/Player.mm ~313:
+// `findWorldCoords(touches[i].my, touches[i].mx, FC_DESTROY)` — note the swapped arg names, matched
+// here rather than guessed, and `terrain->getLand(point.x, point.z, point.y)` with NO /2, which is
+// specifically the FC_DESTROY-mode reading; FC_PLACE's branch divides by 2 for build_size reasons
+// that don't apply here). No Classes/ edit: findWorldCoords computes its own camera matrices via
+// cam->render2() inside the call rather than reading render-loop leftovers, so it's safe to call
+// from any point in the frame, including here (a JS-invoked seam function, not the update/render
+// pipeline itself).
+EMSCRIPTEN_KEEPALIVE
+int eden_pick_block_at_crosshair(void) {
+    if (!World::getWorld || !World::getWorld->hud || !World::getWorld->terrain) return TYPE_NONE;
+    Input* input = Input::getInput();
+    if (!input) return TYPE_NONE;
+    // Same crosshair math as eden_update_block_preview() below: screen centre, in the
+    // BOTTOM-LEFT-ORIGIN, Y-UP space itouch/findWorldCoords expect.
+    const int cx = (int)(SCREEN_WIDTH / 2.0f);
+    const int cy = (int)(input->scr_height - SCREEN_HEIGHT / 2.0f);
+    Point3D point = findWorldCoords(cy, cx, FC_DESTROY);
+    if (point.x == -1) return TYPE_NONE;
+    int type = World::getWorld->terrain->getLand(point.x, point.z, point.y);
+    if (type == TYPE_NONE || type == -1) return TYPE_NONE;
+    // Same convention Hud::handlePickBlock's real 35-cell picker already established (Phase 4
+    // comment above eden_select_hotbar_slot: a real pick overwrites the CURRENTLY selected slot,
+    // not just the initial palette) — and switches to build mode so a follow-up click places it.
+    eden_set_hotbar_slot_type(hotbarIndex, type);
+    World::getWorld->hud->blocktype = type;
+    World::getWorld->hud->mode = MODE_BUILD;
+    return type;
+}
+
 // Does the UI currently need a real, visible mouse cursor? True in the menu and in the block and
 // colour pickers, which are grid-of-swatches screens you point at — pointer lock hides the cursor
 // and converts mousemove to look deltas, so with it held the pickers are unusable. This is the

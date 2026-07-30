@@ -57,6 +57,7 @@ public:
     BOOL update(float etime);
     void loadWorld(NSString* name);
     void render();
+    void renderFrame(BOOL draw);
     void exitToMenu();
     
     

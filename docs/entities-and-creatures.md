@@ -58,6 +58,16 @@ The raycast (`findWorldCoords`) tests creatures first via
 pick up (`PickupModel` → held in `Hud::holding_creature`, placed with `PlaceModel`),
 paint (`ColorModel`), hit (`HitModel` with knockback), burn (`BurnModel`).
 
+Web port dev console (project-audit-2026-07-30 row F5, `web/src/seam/DevConsole_web.mm`,
+EDEN_DIAGNOSTICS-only): `SpawnCreatureAt(type, pos)` places a creature at an exact position by
+reusing the ambient spawner's slot-scavenging condition and `ResetModel`, skipping
+`addMoreCreaturesIfNeeded`'s randomized ground search and biome-based type selection since the
+caller already knows the position is valid. `CountActiveCreatures()` is a read-only count for the
+console's `stats` command. Both are genuine engine additions (`Classes/Model.{h,mm}`), not seam
+workarounds — the file-static `guys[]`/`nguys` meant a seam file could not read or write creature
+state directly, so a small exported entry point was the only option once a runtime spawn command
+was wanted.
+
 ## Interactions with other systems
 - Terrain: collision reads `getLandc`; spawning samples surface heights; explosions
   come from `Terrain::explode`/`blocktntexplode`.

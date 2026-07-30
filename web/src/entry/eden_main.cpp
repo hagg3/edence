@@ -4,23 +4,17 @@
 //   2. the requestAnimationFrame-equivalent loop that used to be CADisplayLink
 //      (Classes/EdenViewController.mm, replaced) — via emscripten_set_main_loop, which
 //      internally uses rAF and (critically) does NOT block the browser's event loop, unlike a
-//      plain while(true) — this matters doubly under D1 since Stage P2 runs this from a
-//      worker via PROXY_TO_PTHREAD/OffscreenCanvas, per web-port-plan.md D1: "Responsive page
-//      — the game loop blocking in a worker never freezes the browser UI."
+//      plain while(true).
 //
-// STATUS: sketch-level per the task brief ("Sketch-level is fine; label TODOs"). Nothing here
-// touches GL yet (Stage P1's own success bar: "world->update(etime) runs one tick... without
-// touching GL" — World::render() is called per EdenViewController_web's drawFrame(), but every
-// GL call it makes is currently a tracked-state-only or no-op stub, see src/shim/gl —
-// harmless to call, produces nothing on screen until Stage P2).
-//
-// EDEN_THREADED build (default ON, see CMakeLists.txt): this file is expected to run ON THE
-// WORKER thread (PROXY_TO_PTHREAD proxies `main` itself there), talking to an OffscreenCanvas
-// transferred from the page — see public/worker-bootstrap.js for the JS-side half of that
-// handshake. EDEN_THREADED=OFF (single-thread fallback, plan D1 fallback note): this file runs
-// on the browser main thread directly against a normal <canvas>; the #ifdef below is where
-// that fork would go once Stage P2 needs to branch on it — TODO P2, not needed yet since
-// nothing here is thread-sensitive at the P1 stage.
+// WHAT ACTUALLY RUNS: the single-threaded build (EDEN_THREADED=OFF, the default since audit row
+// A1) on the browser's main thread, against a normal <canvas> owned by public/eden-st.html, with
+// a fully wired GL shim behind it. The threaded/OffscreenCanvas architecture the older comments
+// here described — `main` proxied onto a worker via PROXY_TO_PTHREAD, a transferred
+// OffscreenCanvas, public/worker-bootstrap.js's handshake — was never built. It is audit row 36
+// (3-6 weeks, and gated behind row 9's cooperative world load), and worker-bootstrap.js /
+// public/index.html are sketches for it, not live code (audit row 8 disposes of them). Under
+// headless `node eden.js` there is no canvas and no rAF; emscripten falls back to
+// MainLoop.fakeRequestAnimationFrame, a real ~60 Hz setTimeout loop, and the GL shim no-ops.
 
 #include "../seam/main_web.h"
 #include "../seam/EdenAppDelegate_web.h"
@@ -33,8 +27,21 @@
 // perf-audit row #14: an optional frame-rate cap, mainly for thermal/battery on touch profiles
 // (defaulted there — see Settings_web.mm's eden_apply_input_profile). `emscripten_set_main_loop`
 // is registered with fps=0 (rAF-driven, the display's native refresh rate) so the cap is a simple
-// "skip this rAF callback if we're early" gate rather than a second timer — cheap, and it can
-// never make the loop run FASTER than the display, only skip ticks.
+// "are we early?" gate rather than a second timer — cheap, and it can never make the loop run
+// FASTER than the display, only drop frames.
+//
+// Audit row A4 (fixed): the cap used to `return` from this callback outright, which skipped
+// World::update() along with the drawing. World::update() is what consumes queued touches and
+// keys — with a 30 fps cap on a 120 Hz display three of every four pointer events landed in a
+// tick that never ran the consumer, and because every `hud->` input flag is re-derived from the
+// live touch set each frame, a tap that began and ended inside a skipped window was dropped
+// entirely. The cap is defaulted ON for touch profiles, so this was a mobile-only input-drop bug.
+// The gate now only decides whether the frame DRAWS; update runs every rAF.
+//
+// Cost note: capping now saves the render half only, so the thermal/battery win is smaller than
+// it looks on paper (per pass 47, column decode/meshing in Terrain::update is the dominant cost,
+// and that now runs uncapped). That is the deliberate trade — dropped input is a correctness bug,
+// a smaller power saving is not.
 extern "C" int eden_get_fps_cap(void);
 
 static void eden_frame_tick() {
@@ -42,18 +49,23 @@ static void eden_frame_tick() {
     if (!app) return;
     if (!app->viewController.isAnimating()) return;
 
+    bool renderThisFrame = true;
+
 #ifdef __EMSCRIPTEN__
     int capFps = eden_get_fps_cap();
     if (capFps > 0) {
-        static double lastFrameMs = 0.0;
+        static double lastRenderMs = 0.0;
         double now = emscripten_get_now();
         double minInterval = 1000.0 / (double)capFps;
-        if (lastFrameMs != 0.0 && now - lastFrameMs < minInterval) return;
-        lastFrameMs = now;
+        if (lastRenderMs != 0.0 && now - lastRenderMs < minInterval) {
+            renderThisFrame = false;
+        } else {
+            lastRenderMs = now;
+        }
     }
 #endif
 
-    app->viewController.drawFrame();
+    app->viewController.drawFrame(renderThisFrame);
     // TODO P2: react to a true return (retina/graphics-quality swap requested) by actually
     // recreating the WebGL2 context at the new pixel density via EAGLView_web's
     // create/deleteFramebuffer — EdenViewController_web::drawFrame() already flips the
@@ -86,11 +98,6 @@ int main(int argc, char** argv) {
     // and the guard keeps the whole engine running headless — which is exactly what the
     // EDEN_THREADED=OFF debug build wants.
     eden_gl_context_create(0, 0);
-
-    // TODO D1: OffscreenCanvas handshake — see public/worker-bootstrap.js sketch. This main()
-    // is expected to be the PROXY_TO_PTHREAD-proxied entry when EDEN_THREADED=ON (the default,
-    // see CMakeLists.txt EDEN_THREADED option) — Emscripten runs it on the worker
-    // automatically in that configuration, no manual pthread_create needed here.
 
     eden_web::eden_seam_main();
 

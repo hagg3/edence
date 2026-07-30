@@ -30,13 +30,22 @@ set(EDEN_CLASSES_DIR "${EDEN_PARENT_DIR}/Classes")
 # ---------------------------------------------------------------------------------------------
 
 # D1 (web-port-plan.md): run the engine in a Web Worker with real pthreads + OffscreenCanvas +
-# WASMFS/OPFS sync-access, gated behind COOP/COEP headers (see web/cmake/README.md). Default ON
-# per the plan's recommendation. The fallback (OFF) is the plan's documented escape hatch if
-# OffscreenCanvas/COOP-COEP prove unworkable on a target browser: single-threaded build on the
-# main thread, OPFS via WASMFS's async access, load runs synchronously with a progress yield.
-# Kept as a build flag (not a source fork) specifically so this stays cheap to flip — per the
-# plan: "Keep the code thread-agnostic so this stays a build flag, not a rewrite."
-option(EDEN_THREADED "Build with pthreads + OffscreenCanvas + PROXY_TO_PTHREAD (D1). OFF = single-thread fallback." ON)
+# WASMFS/OPFS sync-access, gated behind COOP/COEP headers (see web/cmake/README.md). The
+# single-threaded fallback (default) is the plan's documented escape hatch if OffscreenCanvas/
+# COOP-COEP prove unworkable on a target browser: single-threaded build on the main thread, OPFS
+# via WASMFS's async access, load runs synchronously with a progress yield. Kept as a build flag
+# (not a source fork) specifically so this stays cheap to flip — per the plan: "Keep the code
+# thread-agnostic so this stays a build flag, not a rewrite."
+#
+# Audit row A1 (project-audit-2026-07-30.md): this option defaulted ON despite there being no
+# working host page for it — worker-bootstrap.js is a 38-line sketch, index.html is scaffolding,
+# and the OffscreenCanvas handshake in eden_main.cpp is still TODO D1. Every build anyone actually
+# runs (build-st, build-rel) passes -DEDEN_THREADED=OFF explicitly; a fresh clone running the
+# obvious `cmake ..`/`emcmake cmake -B build` got a target that links but cannot be played. The ON
+# path is real, in-development work (audit row C1, Opus 5 xhigh, 3-6 weeks) — it is not what a
+# first-time builder should get by omitting a flag they don't know exists yet. Default is now OFF;
+# pass -DEDEN_THREADED=ON explicitly to build the in-development threaded target.
+option(EDEN_THREADED "Build with pthreads + OffscreenCanvas + PROXY_TO_PTHREAD (D1, IN DEVELOPMENT — no working host page yet, see audit row C1). Default OFF = single-thread build, the only one with a runnable host page today." OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -240,6 +249,9 @@ set(EDEN_SEAM_SOURCES
 # entirely rather than just gating its prints.
 if(EDEN_DIAGNOSTICS)
   list(APPEND EDEN_SEAM_SOURCES src/seam/DebugState_web.mm)
+  # Audit row F5 — the dev console (teleport/spawn/world-stats) is deliberately gated the same
+  # way: a shipped build should not let a player teleport or spawn creatures at will.
+  list(APPEND EDEN_SEAM_SOURCES src/seam/DevConsole_web.mm)
 endif()
 
 # ---- case-mismatched #import shims -----------------------------------------------------------
@@ -502,7 +514,21 @@ if(EMSCRIPTEN)
     # getting away with UB since -O0 never exploited it. Landing `-O2` (not `-O3`) first is the
     # audit's explicitly recommended lower-risk step — bump to -O3/-Oz only after a real A/B
     # (`node eden.js` P1 tick + a live-Chrome playtest) confirms no regression.
-    $<$<CONFIG:Release>:-O2;-fno-strict-aliasing>
+    #
+    # Project audit 2026-07-30, row B1 — -flto (both compile- and link-side; the pair must match,
+    # see EDEN_LINK_FLAGS below). Pass 53 tried this, hit a hard `Aborted()` partway through menu
+    # asset load under `node eden.js`, and reverted it with the root cause unchased. Pass 56 found
+    # it, and it was NOT an LTO bug: `NSUserDefaults`' `std::unordered_map` ivar was never
+    # constructed, because the hand-written ObjC runtime's class_createInstance() is a bare
+    # `calloc` with no `.cxx_construct` support. A zeroed unordered_map has max_load_factor 0.0,
+    # so the first insert asks for `ceil(1 / 0.0)` buckets; LTO's cross-TU inlining is simply what
+    # let the compiler constant-fold that and commit to libc++'s throw path (= abort, exceptions
+    # being off) where plain -O2 had been limping. Latent UB in every build, LTO or not — fixed at
+    # source in src/shim/foundation/NSUserDefaults.mm (which carries the full write-up, plus the
+    # same-shaped leak found in NSAutoreleasePool.mm). With that fixed, all four headless suites
+    # pass against an LTO build. If a future flag ever "breaks" this port again, that file is the
+    # precedent: suspect our own latent UB before suspecting the optimiser.
+    $<$<CONFIG:Release>:-O2;-fno-strict-aliasing;-flto>
     $<$<CONFIG:Debug>:-O0;-g;-gsource-map>
     # zlib is a PORT, not a shim: Classes/FileArchive/the RLE Eden.eden path include <zlib.h>, and
     # emsdk ships zlib itself, so this is the one "missing header" in the pass-4 list that needed
@@ -685,6 +711,31 @@ if(EMSCRIPTEN)
   target_link_options(eden PRIVATE
     ${EDEN_LINK_FLAGS}
     $<$<CONFIG:Release>:-sASSERTIONS=0>
+    # Project audit 2026-07-30, row B1 — the rest of the Release flag sweep the prior audit's Q1
+    # step 2 left undone. Measured as one pass: fresh Release+diagnostics builds at every point in
+    # the bisect (single flag alone, and all four together) all pass the P1 headless gate and all
+    # three other headless suites (menu-flow, lazy-world, gamepad) clean. -flto is the fifth flag,
+    # landed pass 56 once the abort pass 53 blamed on it turned out to be our own uninitialised
+    # C++ ivar — see the compile-options comment above. It MUST appear on both sides: -flto here
+    # without -flto on the compile side means there is no bitcode to link-time-optimise, and the
+    # reverse silently produces objects the linker treats as ordinary ones.
+    #   -sMALLOC=emmalloc (smaller/faster than dlmalloc for this port's allocation profile —
+    #     mostly fixed-size engine structs and short-lived shim objects, not the varied-size
+    #     workload dlmalloc is tuned for)
+    #   -sGL_TRACK_ERRORS=0 / -sGL_ASSERTIONS=0 (removes Emscripten's own per-GL-call bookkeeping
+    #     in the GL glue it generates around this port's hand-written shim — directly on the
+    #     shim's hot draw-call path; safe in Release since this port's OWN glGetError probe in
+    #     gl_es1_shim.cpp, used by the first-5-frames diagnostic and EDEN_DIAGNOSTICS builds, is
+    #     independent of Emscripten's glue-level tracking)
+    #   -sTEXTDECODER=2 (use TextDecoder for UTF-8 where available, smaller JS glue)
+    #   --emit-symbol-map (so a Release build — which has no -g/DWARF, see above — still has a
+    #     name<->mangled-symbol map on disk for reading a stack trace after the fact)
+    $<$<CONFIG:Release>:-flto>
+    $<$<CONFIG:Release>:-sMALLOC=emmalloc>
+    $<$<CONFIG:Release>:-sGL_TRACK_ERRORS=0>
+    $<$<CONFIG:Release>:-sGL_ASSERTIONS=0>
+    $<$<CONFIG:Release>:-sTEXTDECODER=2>
+    $<$<CONFIG:Release>:--emit-symbol-map>
   )
   # --pre-js files are consumed at LINK time and CMake cannot see that from the flag string, so
   # without this an edit to eden_default_world.pre.js rebuilds NOTHING ("Built target eden") and

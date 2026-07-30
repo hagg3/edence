@@ -534,7 +534,16 @@ BOOL World::update(float etime){
 
 
 void World::render(){
-    if(JUST_TERRAIN_GEN){
+    renderFrame(TRUE);
+}
+// renderFrame(FALSE) draws nothing but still runs the two frame-boundary state transitions that
+// have always lived in render(): the GAME_MODE_WAIT -> target_game_mode flip (update() returns
+// early in WAIT, so render() is the only thing that leaves that state) and the exit_to_menu
+// check. A caller that skips a frame entirely — the web port's frame-rate cap — would otherwise
+// wedge the world in WAIT forever, so "skip the draw" and "skip the frame" must not be the same
+// thing. render() itself is unchanged for every other caller.
+void World::renderFrame(BOOL draw){
+    if(JUST_TERRAIN_GEN&&draw){
         glClearColor(.39f, .25f, .39f, 1.0f);
         Graphics::prepareScene();
         Graphics::prepareMenu();
@@ -567,7 +576,9 @@ void World::render(){
         if(target_game_mode==GAME_MODE_WAIT)target_game_mode=GAME_MODE_MENU;
         return;
     }
-	if(game_mode==GAME_MODE_MENU){
+	if(!draw){
+        //frame's draw half skipped by the caller; the exit_to_menu check below still runs
+	}else if(game_mode==GAME_MODE_MENU){
        // [[World getWorld] loadWorld:menu.selected_world->file_name];	
 		menu->render();
 	}else if(game_mode==GAME_MODE_PLAY){

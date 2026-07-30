@@ -21,7 +21,16 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const edenJsPath = path.resolve(process.argv[2] || path.join(__dirname, '..', 'build-st', 'eden.js'));
+// --fps-cap=N (30/45/60) turns the frame-rate cap on before the flow runs — the audit-row-A4
+// regression leg. With the cap on, eden_main.cpp's gate render-skips roughly half of node's
+// ~60 Hz fake-rAF ticks, and World::renderFrame(FALSE) is then the only thing still running the
+// GAME_MODE_WAIT -> target_game_mode transition. If that side effect were ever lost again, the
+// load below would sit in WAIT forever and 'game_mode reached GAME_MODE_PLAY' would time out.
+const args = process.argv.slice(2);
+const capArg = args.find((a) => a.startsWith('--fps-cap='));
+const fpsCap = capArg ? parseInt(capArg.split('=')[1], 10) : 0;
+const positional = args.filter((a) => !a.startsWith('--'));
+const edenJsPath = path.resolve(positional[0] || path.join(__dirname, '..', 'build-st', 'eden.js'));
 const edenDir = path.dirname(edenJsPath);
 
 global.require = require;
@@ -79,6 +88,18 @@ global.Module.postRun.push(async () => {
     const haveWorldAndMenu = await waitUntil(() => !menuState().error, 5000, 'World/Menu to exist');
     check('World/Menu exist after main()', haveWorldAndMenu);
     if (!haveWorldAndMenu) { console.log('FATAL, aborting'); process.exit(1); }
+
+    if (fpsCap > 0) {
+        const schema = JSON.parse(utf8(global.Module._eden_settings_schema()));
+        const rows = Array.isArray(schema) ? schema : schema.settings;
+        const fpsIdx = rows.findIndex((r) => r.key === 'fps_cap');
+        const optIdx = ['0', '30', '45', '60'].indexOf(String(fpsCap));
+        check('fps_cap row found in the settings schema', fpsIdx >= 0);
+        check(`--fps-cap=${fpsCap} is one of the enum's options`, optIdx > 0);
+        global.Module._eden_settings_set(fpsIdx, optIdx);
+        check(`frame-rate cap is live at ${fpsCap} fps`,
+            global.Module._eden_get_fps_cap() === fpsCap);
+    }
 
     const before = global.Module._eden_menu_world_count();
     console.log('world_count before:', before);

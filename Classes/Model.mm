@@ -546,6 +546,38 @@ void ResetModel(int i){
     guys[i].onground=guys[i].onIce=0;
     guys[i].onfire=FALSE;
 }
+// Web port dev console (row F5): spawns a creature at an EXACT position, bypassing
+// addMoreCreaturesIfNeeded's randomized ground-search and biome-based type selection below (the
+// caller already knows the position is valid — e.g. the player's own feet). Reuses the same
+// slot-scavenging condition and the same post-ResetModel fields (targetangle/model_type/frame)
+// the ambient spawner sets; ResetModel itself already covers alive/update/touched/idx/life/
+// color/vel/acc/onground, so this only sets what ResetModel leaves as a sentinel (-1) or a
+// default (0) that the ambient spawner also overrides.
+bool SpawnCreatureAt(int type,Vector pos){
+    if(type<0||type>=NUM_CREATURES)return FALSE;
+    for(int gc=0;gc<nguys;gc++){
+        if(guys[gc].touched==FALSE&&(guys[gc].model_type==-1||!guys[gc].update||!guys[gc].alive)){
+            ResetModel(gc);
+            guys[gc].pos=PVRTVec3(pos.x,pos.y,pos.z);
+            guys[gc].targetangle=randf(3.14f*2);
+            guys[gc].model_type=type;
+            guys[gc].timer=1;
+            guys[gc].frame=getFrame(type,0,0);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+// Web port dev console (row F5): a read-only count for the console's "world stats" command.
+// Same liveness test addMoreCreaturesIfNeeded's own totalactive scan uses (model_type!=-1 and
+// either actively updating or a nearby touched/saved one), just exposed instead of file-local.
+int CountActiveCreatures(){
+    int n=0;
+    for(int i=0;i<nguys;i++){
+        if(guys[i].model_type!=-1&&guys[i].update)n++;
+    }
+    return n;
+}
 void addMoreCreaturesIfNeeded(){
     int totalactive=0;
     int gc=0;

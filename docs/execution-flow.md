@@ -79,6 +79,13 @@ stateDiagram-v2
   but promote `target_game_mode` — this gives the framebuffer swap a clean frame.
 - `exit_to_menu` is a file-static BOOL in `World.mm` set by the HUD menu; it is checked
   at the *end* of `World::render()` so teardown never happens mid-frame.
+- **Modified from stock (web port, 2026-07-30):** those two transitions are the reason
+  `render()` is now a one-line wrapper over `World::renderFrame(BOOL draw)`.
+  `renderFrame(FALSE)` draws nothing but still runs the WAIT promotion and the
+  `exit_to_menu` check, so a caller that wants to drop a frame's *drawing* (the web
+  port's frame-rate cap, `web/src/entry/eden_main.cpp`) can do so without wedging a
+  loading world in WAIT forever. `render()` itself is behaviourally unchanged and is
+  still what every other caller uses.
 
 ### update() in PLAY mode (`World.mm:450`)
 Order matters and is load-bearing:

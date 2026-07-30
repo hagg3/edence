@@ -18,6 +18,10 @@ void ExplodeModels(Vector pos,int color);
 void SaveModels();
 void LoadModels2();
 void addMoreCreaturesIfNeeded();
+// Web port dev console (row F5, project-audit-2026-07-30): spawn a creature at an exact
+// position. See Model.mm's ResetModel/addMoreCreaturesIfNeeded for the fields this reuses.
+bool SpawnCreatureAt(int type,Vector pos);
+int CountActiveCreatures();
 void setViewNow();
 void killCreature(int idx);
 float wrapx(float x);
