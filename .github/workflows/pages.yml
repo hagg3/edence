@@ -1,0 +1,76 @@
+name: Deploy web port to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Classes/**"
+      - "Lighting.mm"
+      - "web/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install emsdk 3.1.74
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+          actions-cache-folder: emsdk-cache
+
+      - name: Configure (Release, single-threaded)
+        working-directory: web
+        run: emcmake cmake -B build-rel -DCMAKE_BUILD_TYPE=Release -DEDEN_THREADED=OFF
+
+      - name: Build
+        working-directory: web
+        run: cmake --build build-rel -j"$(nproc)"
+
+      - name: Assemble site
+        working-directory: web
+        run: |
+          set -e
+          rm -rf _site
+          mkdir -p _site/public _site/build-rel
+
+          # Real files, not the absolute-path symlinks CMake just (re)created on this runner.
+          cp -RL public/. _site/public/
+
+          cp -f build-rel/eden.js _site/build-rel/
+          cp -f build-rel/eden.wasm _site/build-rel/
+          [ -f build-rel/eden.data ] && cp -f build-rel/eden.data _site/build-rel/ || true
+
+          cat > _site/index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=public/eden-st.html?build=rel">
+          <p>Loading Eden: World Builder… if nothing happens,
+          <a href="public/eden-st.html?build=rel">click here</a>.</p>
+          EOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<!--
+  index.html — sketch-level host page for the Eden web port (Stage P2+, per
+  web-port-plan.md deliverable 6 "Sketch-level is fine; label TODOs").
+
+  Per plan decision D1 (run the engine in a Web Worker + OffscreenCanvas + PROXY_TO_PTHREAD),
+  this page's only real job is:
+    1. host the visible <canvas>,
+    2. transfer control of it to a worker via canvas.transferControlToOffscreen(),
+    3. start the worker (worker-bootstrap.js) and hand it the OffscreenCanvas + the module URL,
+    4. forward DOM lifecycle events (visibilitychange/pagehide — Stage P7, the C1 audit fix)
+       and Pointer Events (Stage P3 input) to the worker via postMessage.
+  None of steps 2-4 are implemented yet — this file is TODO-marked scaffolding, written before
+  emsdk is even installed on this machine (see docs/PORT-STATUS.md), not a working page.
+
+  HOSTING REQUIREMENT (plan D1): SharedArrayBuffer (needed for PROXY_TO_PTHREAD's real
+  pthreads) requires the page be served with:
+    Cross-Origin-Opener-Policy: same-origin
+    Cross-Origin-Embedder-Policy: require-corp
+  A plain `python3 -m http.server` / most static hosts do NOT send these by default — see
+  web/cmake/README.md "Hosting requirement" for the dev-server flag and a same-origin
+  service-worker fallback (the "coi-serviceworker" pattern) for hosts that can't set headers.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Eden: World Builder (web)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #eden-canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+  #eden-status {
+    position: fixed; left: 0; right: 0; top: 0; padding: 8px 12px;
+    font: 12px/1.4 monospace; color: #9f9; background: rgba(0,0,0,0.6);
+    white-space: pre; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="eden-canvas"></canvas>
+<!-- TODO P2: this status line is dev-only scaffolding, not a real HUD element — the engine
+     draws its own HUD (Classes/Hud.mm) through the GL shim once Stage P2 lands. -->
+<div id="eden-status">Eden web port — Stage P0/P1 scaffolding.
+No emsdk on the build machine yet (see docs/PORT-STATUS.md) — this page cannot run a real build.</div>
+
+<script>
+// TODO P2/D1: replace this whole block with the real bootstrap once
+// worker-bootstrap.js / the emcc-built .js/.wasm/.worker.js exist. Sketch of the intended
+// handshake, not executable against anything today:
+//
+//   const canvas = document.getElementById('eden-canvas');
+//   const offscreen = canvas.transferControlToOffscreen();
+//   const worker = new Worker('worker-bootstrap.js');
+//   worker.postMessage({ type: 'init', canvas: offscreen }, [offscreen]);
+//   document.addEventListener('visibilitychange', () => {
+//     worker.postMessage({ type: document.hidden ? 'hide' : 'show' });
+//   });
+//   window.addEventListener('pagehide', () => {
+//     // Stage P7 / audit C1: synchronous-enough save-on-background. OPFS sync access
+//     // handles (D1) are what make this reliable inside the worker; the page side just
+//     // needs to notify before teardown.
+//     worker.postMessage({ type: 'pagehide' });
+//   });
+//   for (const evt of ['pointerdown','pointermove','pointerup','pointercancel']) {
+//     canvas.addEventListener(evt, e => worker.postMessage({
+//       type: evt, pointerId: e.pointerId, x: e.clientX, y: e.clientY, t: e.timeStamp
+//     }));
+//   }
+console.log('[eden] index.html loaded — no worker bootstrap wired up yet, see TODOs.');
+</script>
+</body>
+</html>

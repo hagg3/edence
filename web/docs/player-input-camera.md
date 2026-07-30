@@ -1,0 +1,130 @@
+# Player, Input & Camera (Web Port)
+
+Read [`../../docs/player-input-camera.md`](../../docs/player-input-camera.md) first —
+`Input.mm`'s touch-slot model, `findWorldCoords`'s raycast, and `Player.mm`'s
+physics/collision are unmodified. This file covers the desktop input layer the web
+port adds on top, and two bugs whose fixes span this topic and rendering.
+
+## Desktop input (`src/seam/Input_web.mm`)
+Built from scratch, feeding the same `Input` singleton via synthetic touches: WASD,
+Shift-sprint, Alt-walk, mouse-look under Pointer Lock (`unadjustedMovement`
+requested, separate Y-axis sensitivity), click to mine/build, scroll-wheel + digits
+1–9 for the hotbar, E/C/Esc, F to toggle fly, Space to jump, Ctrl to crouch (held,
+`eden_set_crouch` — a no-op unless the "Crouch mode" setting has turned on `CROUCH_ENABLED`, see
+below), B to toggle a block preview. Pointer-lock edge cases: window blur force-ends a held click; Escape is
+guarded against double-acting with pointer-lock's own forced pointer release.
+
+## The Y-axis coordinate gotcha
+`eden_input_pointer_event(phase, id, x, y)` takes **top-left-origin, Y-down**
+coordinates (the UIKit `-locationInView:` convention `Input.mm` expects) — but
+`Input.mm` flips Y (`scr_height - point.y`) before storing it, so a `Menu.mm`
+`Button` rect's Y range ends up **bottom-left-origin, Y-up**. To synthesize a tap
+inside a rect at flipped-space `[y0, y0+h]`, send raw
+`y = SCREEN_HEIGHT - (y0 + h/2)` — do not pre-divide by `SCALE_WIDTH`/`SCALE_HEIGHT`
+before sending; the engine does that scaling itself.
+
+## Input-mode detection
+Auto/Touch/Keyboard+Mouse mode (a setting, see [ui.md](ui.md)) keys off
+`PointerEvent.pointerType` (`'touch'` vs. `'mouse'`/`'pen'`), not a bare `mousemove` —
+a bare `mousemove` listener used to misfire on a hybrid touch+mouse device mid-touch
+session and yank away the on-screen joystick. The wasm call is de-duped to fire only
+on an actual profile change, not on every pointer move.
+
+## Gamepad (`public/eden-gamepad.js`)
+A **pure translator**, not a third input path: it polls `navigator.getGamepads()` once per frame
+from `eden-st.html`'s existing rAF loop and calls the *same* entry points the keyboard/mouse path
+uses — the keybind action vocabulary (`actionDown`/`actionUp`, so momentary-vs-continuous and
+auto-repeat handling come for free), the mouse's hold-to-act state machine for the triggers, and
+`eden_apply_look_delta` for the right stick. **No new wasm exports and no C-side gamepad code.**
+`Classes/Gamepad.mm` is deliberately untouched: it is 2010-era iOS MFi/attachment plumbing, and
+wiring a browser API into it would be a platform difference living in engine code (web/CLAUDE.md
+rule 2).
+
+- **Ordering is load-bearing.** `EdenGamepad.tick()` must run *before* the loop's
+  `recomputeMove()`. The stick does not call `eden_set_move_input` itself — `recomputeMove()` runs
+  unconditionally every frame (the F1 fix requires it) and would overwrite it one frame later, so
+  the stick axes are exposed via `EdenGamepad.axes()` and **summed and clamped** with the keyboard
+  axes in that one place.
+- Standard mapping only (`pad.mapping === 'standard'`); anything else is logged once and ignored
+  rather than guessed at. Left stick moves, right stick looks (radial deadzone with rescaling, a
+  squared response curve, integrated against real dt and clamped so a stalled tab can't snap the
+  camera), A jump / B crouch / X block picker / Y fly / L3 sprint / R3 fly-down / Start menu /
+  Select settings / D-pad up+down fire+colour tools, LT build and RT mine through hold-to-act
+  (only one trigger owns that slot at a time), LB/RB and D-pad left/right scroll the hotbar.
+- Three settings rows in `Settings_web.mm`'s `kSettings[]` (`gamepad`, `gamepad_look_sensitivity`,
+  `gamepad_deadzone`) — per the port's "add a setting in C, never in JS" rule.
+- `tools/headless-gamepad-test.js` loads the real file into a sandbox with a fake
+  `navigator.getGamepads()` and a recording bridge, and covers deadzone shaping, edge triggering,
+  trigger-slot ownership and every release path. It cannot cover feel, or that a real pad reports
+  this button order.
+
+## Frame-rate-dependent movement (fixed via `--wrap`, not an engine edit)
+See [execution-flow.md](execution-flow.md) for the full walk-speed fix
+(`-Wl,--wrap=_ZN6Player8setSpeedE6Vectorf`, `src/seam/Movement_web.mm`,
+`fps_normalize` setting). The same wrap fixes a sibling bug: both call sites into
+`Player::setSpeed` pass a **unit-length** direction with `walk_speed` used only as a
+ceiling, so the engine's 1.3× sprint multiplier never actually reached the
+acceleration term — Shift-sprint was a no-op. Fixed by folding `walk_speed` into the
+scaled magnitude the wrap passes through.
+
+An opt-in `advanced_movement` setting (default OFF) wraps `Player::preupdate`
+(`_ZN6Player9preupdateEf`) instead, for zero-delay bunny-hop: it captures the
+jump-button transition and writes `vel.y`/`jumping` directly on landing-while-held,
+skipping the engine's one-frame-lagged rejump gate (`lastjump`, a file-static
+otherwise unreachable from outside `Player.mm`).
+
+## Block preview (`B`, opt-in)
+`Player::render` (`Player.mm`) already draws a ghost block for any held touch with a
+latched `previewtype` — on a real touchscreen that's naturally press-and-hold, but a
+mouse click is press+release in one gesture, so without help it only flashes.
+`eden_update_block_preview()` works around this by parking a **persistent synthetic
+touch** at the crosshair: `inuse` is set directly to `Player`'s own `usage_id` (so
+`Hud::update` can never claim the slot for a button), `moved=TRUE`/`movecam=FALSE`
+every frame, and it is never released — only `M_RELEASE` actually edits the world,
+so a touch that's never released can't itself place a block. Known side effect: a
+second live touch trips `Player.mm`'s `num>1` branch and clears `movecam`, disabling
+drag-to-look while the ghost is up — a free tradeoff on desktop, a real one on a
+touchscreen.
+
+Any `hud->` flag more generally is re-derived from touches every frame — never write
+one directly from web-side code (see
+[conventions-and-pitfalls.md](conventions-and-pitfalls.md) #2).
+
+## Mobile touch-offset / picking-viewport fix
+`findWorldCoords`'s raycast reads back whatever `GL_VIEWPORT` currently reports and
+assumes a fixed `SCALE_WIDTH`/`SCALE_HEIGHT` of 2.0. This is really a rendering-side
+fix (a pinned `{0,0,1136,640}` viewport answer for picking purposes only) but it's
+exactly this subsystem's bug — see [gl-shim.md](gl-shim.md) for the full explanation
+of why the drawable becoming dynamically sized broke it and how the fix cancels the
+engine's fixed math regardless of true drawable size.
+
+## FOV
+A `-Wl,--wrap=` on `gluPerspective` (`Classes/Graphics.mm` hard-codes 80°). Picking
+still works correctly at a non-default FOV "for free," because `Util.mm`'s unproject
+reads the resulting projection matrix back rather than assuming 80° anywhere.
+
+## Crouch touch button
+A second HUD button next to Jump (`Hud.h`/`.mm`: `rcrouchrender`/`rcrouchhit`/`m_crouch`) drives
+crouch on touch, following the same touch-derivation pattern as `m_jump` — never written directly,
+re-derived from live touches inside `rcrouchhit` every frame, same as the rule above. It reuses the
+Jump icon texture mirrored top-to-bottom (`Texture2D::drawButton`/`drawText`'s new `flipX` param —
+edited in **both** `Classes/Texture2D.mm` and this port's seam replacement,
+`src/seam/Texture2D_web.mm`, since Texture2D is fully seam-excluded here; missing either half is a
+link-time undefined-symbol error, not a silent bug). `Player::preupdate` wants crouch when
+`CROUCH_ENABLED && (CROUCH_HELD (keyboard) || hud->m_crouch (this button))` — the keyboard and touch
+sources are still ORed at the read site rather than having the button write `CROUCH_HELD`, so they
+can't stomp each other, but both are now gated by the `CROUCH_ENABLED` global.
+
+Crouch is **off by default** (`CROUCH_ENABLED=false`, `Classes/Player.mm:32`) and is a port-exposed
+settings toggle, not a compile-time constant like `FLY_MODE`: the "Crouch mode" row in the new
+"Experiments" settings tab (see [ui.md](ui.md)) calls `eden_set_crouch_enabled()`
+(`src/seam/Input_web.mm`, mirroring `eden_set_fly_mode`/`eden_get_fly_mode`), which is wired through
+`eden_apply_setting()` in `src/seam/Settings_web.mm`. When it's off, `Hud.mm` also hides the crouch
+button entirely — its hit-test loop and its render/draw call are both wrapped in
+`if (CROUCH_ENABLED)` (`extern BOOL CROUCH_ENABLED`) — so there's no dead button sitting on screen,
+matching how `FLY_MODE` already hides its own up/down affordances when off.
+
+## Port-invented UI riding on this input layer
+A curated 9-block hotbar strip and a real DOM crosshair are **port inventions** — the
+original engine has no hotbar concept, only a scrolling block-picker grid. See
+[ui.md](ui.md).

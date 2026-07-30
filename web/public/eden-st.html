@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<!--
+  eden-st.html — SINGLE-THREADED debug launcher for the Eden web port (Stage P2, Task 4).
+
+  This is deliberately NOT the D1 architecture (worker + OffscreenCanvas + PROXY_TO_PTHREAD);
+  that is public/index.html. Per web/docs/RESUME-HERE.md, the single-threaded build is served
+  FIRST to get a frame on screen, because it isolates the ES1->WebGL2 draw path from the
+  OffscreenCanvas/worker-handshake machinery (a second, independently-unverified thing).
+
+  It runs the EDEN_THREADED=OFF build (build-st/) directly on the browser main thread against a
+  normal <canvas>. No SharedArrayBuffer, so NO COOP/COEP headers are required — a plain static
+  server (`python3 -m http.server` from web/) is enough.
+
+  SERVE FROM: the web/ directory (so /build-st/eden.js and /build-st/eden.wasm resolve).
+    cd web && python3 -m http.server 8000
+    open http://localhost:8000/public/eden-st.html
+
+  Q1 (dazzling-munching-bengio.md perf audit): append `?build=rel` to load build-rel/ instead —
+  the Release configuration (-O2 -fno-strict-aliasing, no DWARF, -sASSERTIONS=0; see CMakeLists.txt
+  and web/docs/RESUME-HERE.md) instead of the Debug build (-O0 -g -gsource-map) this file loaded
+  unconditionally in every prior pass. Build it once with:
+    cmake --build build-rel -j8
+  then open http://localhost:8000/public/eden-st.html?build=rel
+
+  WHAT A CORRECT FIRST FRAME LOOKS LIKE (superseded by PORT-STATUS.md "Pass 10"/"Pass 11" — the
+  original "fog-colored screen" framing above was wrong about the MENU specifically, which is
+  the actual first screen: game_mode starts as GAME_MODE_MENU, and Graphics::prepareMenu clears
+  to BLACK, not fog color). As of Pass 11, Texture2D_web.mm is real (stb_image-backed) and the
+  menu's PNGs are preloaded, so success now looks like: the Eden menu background/logo/world-list
+  buttons, TEXTURED. The world itself is still empty (FileManager::loadWorld is inert until P4)
+  — that only matters once GAME_MODE_PLAY is reached, not for this screen.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Eden (web) — single-threaded debug</title>
+<!-- Row #21 (perf-audit): PWA installability. manifest.webmanifest + service-worker.js (registered
+     below, at document root scope so it can also cache build-st/build-rel — see that file's header
+     for why it's network-first, never cache-first, and never touches Eden.eden/Range requests). -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#111111">
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  /* CSS here controls the DISPLAY size only. The backing store is no longer fixed: perf-audit
+     item #6 made it dynamic (applyDrawableSize() = this box x min(devicePixelRatio, dpr_cap) x
+     render_scale), so the buffer now matches the display instead of being a 1136x640 buffer
+     upscaled to a HiDPI monitor. The width/height attributes on the element are just the
+     pre-layout starting size. */
+  #eden-canvas {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 852px; height: 480px;           /* CSS DISPLAY size only (points-ish); backing is 1136x640 */
+    background: #000; touch-action: none;
+    max-width: 100vw; max-height: 100vh;
+  }
+  /* PC controls audit Phase 4 (F9d): every mode sets an INLINE width/height from JS
+     (applyDisplayMode(), below) which overrides the rule above once the runtime is up — the rule
+     here is only the pre-boot placeholder. All three modes compute an ENGINE_ASPECT-preserving
+     box (Fixed capped at 852x480, Fit/Fullscreen capped at the viewport) rather than relying on
+     this rule's plain max-width/max-height, which clamp each axis independently and would
+     distort the aspect ratio on a viewport smaller than 852x480 (touch-input-offset bug, see
+     applyDisplayMode()'s Fixed-mode comment). */
+  /* PC controls audit F3 — crosshair overlay. `left`/`top` are set from JS to the canvas's own
+     center (re-run on resize/fullscreenchange), everything else is fixed here: ~9px arms, 2px
+     gap at centre, ~1.5px stroke, white with a dark outline so it reads against sky and stone
+     alike (see the audit plan's Phase 3 spec). Hidden by default; eden-st.html's rAF loop shows
+     it only when the desktop profile is locked and no menu/picker/panel wants the real cursor.
+     Deliberately NOT scaled by the design system's `--u`: this is an aiming reticle, and it has
+     to stay the same size relative to the SCENE, not to the UI. */
+  #eden-crosshair { position: fixed; width: 0; height: 0; pointer-events: none; z-index: 8; display: none; }
+  #eden-crosshair .arm {
+    position: absolute; background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.85);
+  }
+  #eden-crosshair .arm.top    { width: 1.5px; height: 9px; left: -0.75px; top: -11px; }
+  #eden-crosshair .arm.bottom { width: 1.5px; height: 9px; left: -0.75px; top: 2px; }
+  #eden-crosshair .arm.left   { height: 1.5px; width: 9px; top: -0.75px; left: -11px; }
+  #eden-crosshair .arm.right  { height: 1.5px; width: 9px; top: -0.75px; left: 2px; }
+</style>
+<!-- The design system. Everything below that draws UI (the hotbar strip, the status line, the
+     settings/pause/load-error panels, the rebuilt main menu) styles itself from this one
+     stylesheet — see web/docs/design-system.md. -->
+<link rel="stylesheet" href="eden-ui.css">
+</head>
+<body>
+<!-- width/height ATTRIBUTES = the INITIAL drawing-buffer (backing store) size in PIXELS, read by
+     eden_gl_context_create(0,0) via emscripten_get_canvas_element_size. 1136x640 = retina 2x of
+     the engine's 568x320 points, which is what EAGLView_web::establishScreenMetrics asserts at
+     boot. As of the perf audit's item #6 these are only the pre-layout starting values:
+     applyDrawableSize() (below) takes over as soon as the runtime is up and sizes the buffer from
+     the real CSS box x min(devicePixelRatio, dpr_cap) x render_scale.
+     Keep the id in sync with kCanvasTarget in src/shim/gl/gl_es1_shim.cpp ("#eden-canvas"). -->
+<canvas id="eden-canvas" width="1136" height="640"></canvas>
+<div id="eden-status" class="eden-statusline">Eden web (single-threaded) — loading module…</div>
+
+<!-- The design system's runtime half (public/eden-ui.css is the other half). MUST be first: every
+     UI file below builds its DOM from window.EdenUI's factories, and eden-ui.js also computes the
+     `--u` scale unit that every dimension in the stylesheet is expressed in. eden-icons.js supplies
+     the inline SVG set EdenUI.button() draws from; eden-assets.js hands the menu the engine's own
+     background art out of the preloaded wasm filesystem. See web/docs/design-system.md. -->
+<script src="eden-icons.js"></script>
+<script src="eden-ui.js"></script>
+<script src="eden-assets.js"></script>
+
+<!-- Real loading/progress UI (perf-audit row 11). Loaded FIRST and started at the very top of the
+     inline script below, before Module even exists, so the overlay is up for the whole boot
+     sequence, not just once the runtime is initialised — see eden-loading.js's header. -->
+<script src="eden-loading.js"></script>
+
+<!-- Local persistence + the Storage tab (pass 29). Loaded BEFORE the inline script so
+     window.EdenStorage.mountAndSync exists in time to go into Module.preRun below — see
+     eden-storage.js's header for why the IndexedDB populate has to block main(). -->
+<script src="eden-storage.js"></script>
+
+<!-- The settings panel (pass 28). Self-contained; talks only to the C settings model in
+     web/src/seam/Settings_web.mm. Loaded BEFORE the inline script so window.EdenSettings
+     exists by the time the rAF loop and key handlers below reference it. -->
+<script src="eden-settings.js"></script>
+
+<!-- The in-game pause menu (pass 30), replacing the engine's own 4-icon renderMenuScreen. Loaded
+     AFTER eden-settings.js (reuses its injected stylesheet + injectCSS export) and BEFORE the
+     inline script so window.EdenPauseMenu exists by the time the rAF loop below references it. -->
+<script src="eden-pausemenu.js"></script>
+
+<!-- Corrupt/truncated-save recovery dialog (C4). Same load-order reasoning as eden-pausemenu.js
+     above: reuses eden-settings.js's stylesheet, must exist before the rAF loop below polls it. -->
+<script src="eden-loaderror.js"></script>
+
+<!-- The rebuilt main menu / Load World / New World screens. An opaque overlay ON TOP of the
+     engine's own GL menu, which keeps running underneath — see eden-menu.js's header, and
+     web/src/seam/Menu_web.mm for why this is an overlay rather than a --wrap. The "Legacy menu"
+     setting turns the overlay off, revealing the original. Same load-order reasoning as above. -->
+<script src="eden-menu.js"></script>
+
+<!-- Gamepad API -> the existing keyboard/mouse input entry points (perf-audit row #24). A pure
+     translator: no new wasm exports, no Classes/Gamepad.mm involvement. Must load before the rAF
+     loop below inits and ticks it. -->
+<script src="eden-gamepad.js"></script>
+
+<script>
+  // Q1 (dazzling-munching-bengio.md perf audit): pick which configured build to run.
+  // `?build=rel` -> build-rel/ (Release, -O2 -fno-strict-aliasing, no DWARF — see CMakeLists.txt).
+  // Default (no param, or anything else) -> build-st/ (Debug, -O0 -g -gsource-map), unchanged
+  // behaviour from every prior pass. Kept as a query param rather than a second HTML file so
+  // both builds stay behind one set of DOM/input/settings wiring instead of two copies drifting.
+  // Relative (not root-absolute) so this page still resolves build-rel/build-st correctly when
+  // served under a URL prefix (e.g. a GitHub Pages project site at /<repo>/public/eden-st.html).
+  const EDEN_BUILD_DIR = new URLSearchParams(location.search).get('build') === 'rel'
+    ? '../build-rel/' : '../build-st/';
+
+  const statusEl = document.getElementById('eden-status');
+  const canvasEl = document.getElementById('eden-canvas');
+  let firstFrameNoted = false;
+
+  // Perf-audit row 11: start the progress overlay as early as possible — before Module exists,
+  // let alone before eden.js's own downloads begin — so nothing between page load and the first
+  // real frame shows a bare black canvas. window.EdenLoading is a no-op-safe API (see its own
+  // file) even if this call somehow ran before eden-loading.js finished evaluating.
+  if (window.EdenLoading) window.EdenLoading.start();
+
+  var Module = {
+    // Our GL shim creates the context itself via emscripten_webgl_create_context("#eden-canvas"),
+    // but Emscripten's GL glue still consults Module.canvas in places; point it at the same
+    // element so nothing goes looking for the default "#canvas".
+    canvas: canvasEl,
+    // eden.wasm self-locates against its own <script src> (scriptDirectory), but the generated
+    // --preload-file package loader does NOT use that path — without an explicit locateFile it
+    // fetches "eden.data" resolved against the PAGE's URL (this page lives in public/, the data
+    // file lives in build-st/ or build-rel/), producing a silent 404 that stalls every run
+    // dependency forever (found by loading this page for real — pass 11 never caught it under
+    // `node eden.js`, which doesn't fetch the package this way at all). Route every bare filename
+    // to whichever build directory the <script src> below actually loaded from.
+    locateFile: (path) => EDEN_BUILD_DIR + path,
+    // Mounts /documents on IndexedDB (world saves) and blocks main() on the initial populate —
+    // see eden-storage.js's header. A run dependency, not a callback off onRuntimeInitialized,
+    // because Menu::loadWorlds reads Documents synchronously during World::World(), which runs
+    // inside main() — by the time onRuntimeInitialized fires that read has already happened.
+    preRun: [() => window.EdenStorage.mountAndSync()],
+    print:    (t) => { console.log(t); },
+    printErr: (t) => {
+      console.warn(t);
+      // Surface the shim's own diagnostics in the on-page status line so a headless/failed
+      // context is visible without opening devtools.
+      if (/\[eden-gl\]/.test(t)) statusEl.textContent = t;
+    },
+    onRuntimeInitialized: () => {
+      statusEl.textContent = 'Eden web (single-threaded) — runtime initialised, main() running.';
+      moduleReady = true; // gates the Stage P3 pointer/touch listeners below — see that section
+      window.__edenModuleReady = true; // same gate, for eden-settings.js (a separate file)
+      // Q2 perf audit: applyDisplayMode() used to run every rAF frame (forced layout read +
+      // style write, forever); now it's event-driven (resize/fullscreenchange/display_mode
+      // change), so it needs one explicit call here to size the canvas for the first frame.
+      applyDisplayMode();
+      // ...and once more after main() has run. This callback fires BEFORE main(), and main() ends
+      // up in EAGLView_web's establishScreenMetrics, which asserts the engine's own boot drawable
+      // size (1136x640) — so item #6's dynamic sizing must get the last word, or the canvas stays
+      // at the boot size until the first resize event. A macrotask is the cheapest way to land
+      // after callMain: emscripten_set_main_loop(..., simulate_infinite_loop=true) unwinds out of
+      // main and hands control back to the event loop, so this runs with the engine fully up.
+      setTimeout(applyDisplayMode, 0);
+      // Fly mode defaults OFF (stock behaviour per CLAUDE.md); F toggles it. FLY_MODE is a plain
+      // mutable global set at static-init, so this sticks from here on. Every OTHER preference —
+      // including fly mode from here on — is owned by the C settings model and restored by
+      // eden_settings_init(), which the rAF loop below calls as soon as the World exists.
+      Module._eden_set_fly_mode(0);
+      // Phase 2 (input mode audit): seed Auto-detect from the media-query guess before any real
+      // input has happened. `eden_effective_input_is_touch()` only falls back to this while the
+      // `input_mode` setting is Auto (0) — an explicit Touch/Keyboard+Mouse choice always wins.
+      Module._eden_set_detected_touch(window.matchMedia('(pointer: coarse)').matches ? 1 : 0);
+    },
+  };
+
+  // A cheap "are frames actually being produced?" signal for the first-frame judgement, without
+  // needing the C side to report anything: once rAF has ticked a few times past runtime init,
+  // note it. (The engine drives its own emscripten_set_main_loop; this only observes.)
+  function waitForModuleReadyThenMarkReady() {
+    if (moduleReady) { window.EdenLoading.markReady(); return; }
+    requestAnimationFrame(waitForModuleReadyThenMarkReady);
+  }
+
+  function watchFrames(n) {
+    requestAnimationFrame(() => {
+      if (n <= 0) {
+        if (!firstFrameNoted) {
+          firstFrameNoted = true;
+          const prev = statusEl.textContent;
+          statusEl.textContent = prev + '\nrAF alive — expect the TEXTURED Eden menu (retina) here.';
+        }
+        // watchFrames(120) is called unconditionally at page-load time below, NOT gated on
+        // onRuntimeInitialized despite this function's own comment — ~120 rAF frames (~2s) can
+        // easily elapse before a slow/cold boot (still downloading eden.data/Eden.eden) reaches
+        // moduleReady. Hiding the loading overlay on this timer alone would expose the exact bare
+        // black canvas row 11 exists to prevent, so gate EdenLoading.markReady() on moduleReady
+        // too, polling at rAF granularity until it flips true (near-instant on a warm/fast boot,
+        // the loop that actually protects a slow one). markReady() is idempotent, so no extra
+        // flag is needed here.
+        if (window.EdenLoading) waitForModuleReadyThenMarkReady();
+        return;
+      }
+      watchFrames(n - 1);
+    });
+  }
+  watchFrames(120);
+
+  // --- Stage P3: JS pointer/touch events -> Input::getInput()'s 5-slot touch tracker ----------
+  // The wasm side (src/seam/Input_web.mm) exports `eden_input_pointer_event(phase, identity, x,
+  // y)` (EMSCRIPTEN_KEEPALIVE — no ccall/cwrap needed, this is a plain-numbers wasm export, so
+  // `Module._eden_input_pointer_event` exists as soon as the module has linked). This side's only
+  // job is DOM event -> (phase, identity, x, y) in the engine's POINT space; Input_web.mm/
+  // Classes/Input.mm own everything past that (Y-flip, SCALE_* on other device profiles, etc.)
+  // — see that file's header comment for the coordinate contract.
+  const PHASE_START = 0, PHASE_MOVE = 1, PHASE_END = 2, PHASE_CANCEL = 3;
+  const MOUSE_IDENTITY = -1; // sentinel distinct from any real Touch.identifier (always >= 0)
+  // The engine's fixed point-space profile (CLAUDE.md #3 / EAGLView_web.mm's
+  // establishScreenMetrics — iPhone-5 landscape points, not the canvas's retina PIXEL backing
+  // store or its CSS display size). TODO P3: derive from the canvas's actual size once anything
+  // other than this one pinned device profile exists.
+  const ENGINE_WIDTH = 568, ENGINE_HEIGHT = 320;
+  let moduleReady = false;
+  let mouseDown = false;
+  // Phase 6 wheel-jump pending-end flag (see the wheel handler far below) — declared this early
+  // because trackCursorNeed's rAF loop reads it and runs synchronously once before that handler's
+  // own `let` would otherwise have initialised (temporal dead zone).
+  let jumpPulsePending = false;
+
+  function toEnginePoint(clientX, clientY) {
+    const rect = canvasEl.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (ENGINE_WIDTH / rect.width),
+      y: (clientY - rect.top) * (ENGINE_HEIGHT / rect.height),
+    };
+  }
+
+  function sendTouch(phase, identity, clientX, clientY) {
+    if (!moduleReady) return;
+    const p = toEnginePoint(clientX, clientY);
+    Module._eden_input_pointer_event(phase, identity, p.x, p.y);
+  }
+
+  // pointerLocked is declared further down (Pass 23 section) but assigned before any of these
+  // fire (event callbacks only run after the whole script has executed once) — guard here so a
+  // locked pointer's frozen clientX/clientY (pointer lock stops normal cursor movement/coords)
+  // doesn't ALSO synthesize a stale-position touch alongside the Pass 23 look/click path below.
+  canvasEl.addEventListener('mousedown', (e) => {
+    if (pointerLocked) return;
+    mouseDown = true;
+    sendTouch(PHASE_START, MOUSE_IDENTITY, e.clientX, e.clientY);
+  });
+  canvasEl.addEventListener('mousemove', (e) => {
+    if (pointerLocked || !mouseDown) return;
+    sendTouch(PHASE_MOVE, MOUSE_IDENTITY, e.clientX, e.clientY);
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (pointerLocked || !mouseDown) return;
+    mouseDown = false;
+    sendTouch(PHASE_END, MOUSE_IDENTITY, e.clientX, e.clientY);
+  });
+  // A pointer leaving the window entirely mid-drag (not just the canvas) is the closest DOM
+  // analogue to iOS's -touchesCancelled: — deliver the same signal rather than leaving Input.mm's
+  // touch slot stuck "down" forever.
+  window.addEventListener('blur', () => {
+    if (!mouseDown) return;
+    mouseDown = false;
+    if (moduleReady) Module._eden_input_pointer_event(PHASE_CANCEL, MOUSE_IDENTITY, 0, 0);
+  });
+
+  function forEachChangedTouch(e, fn) {
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      const t = e.changedTouches[i];
+      fn(t.identifier, t.clientX, t.clientY);
+    }
+  }
+  // Phase 2 (input mode audit): a real touch/key/pointer event is unambiguous evidence of which
+  // profile is actually in use, overriding the pre-interaction matchMedia guess. No-ops on the
+  // C side while `input_mode` is not Auto (eden_effective_input_is_touch() ignores this input
+  // once the player has picked one explicitly) — see Settings_web.mm.
+  //
+  // Audit item Q4 (C6 "input-profile flapping"): this used to be a bare `mousemove` listener that
+  // called into wasm on EVERY move, and on a hybrid device (touchscreen laptop, iPad+trackpad,
+  // Android+mouse) the synthetic mouse event that follows a real touch would immediately flip the
+  // profile back to desktop mid-touch-session, killing the on-screen joystick under the player's
+  // thumb. Fix: key off `PointerEvent.pointerType`, which is unambiguous ('touch' vs 'mouse'/
+  // 'pen' — a synthetic mouse event fired after a touch is still reported as pointerType
+  // 'touch'), and only call into wasm when the detected profile actually changes, not on every
+  // event — this also kills the wasm call on every mousemove.
+  let lastDetectedTouch = null;
+  function noteDetectedTouch(isTouch) {
+    if (lastDetectedTouch === isTouch) return;
+    lastDetectedTouch = isTouch;
+    callIfReady(() => Module._eden_set_detected_touch(isTouch ? 1 : 0));
+  }
+  canvasEl.addEventListener('touchstart', () => {
+    noteDetectedTouch(true);
+  }, { passive: true });
+  window.addEventListener('keydown', () => {
+    noteDetectedTouch(false);
+  });
+  // 'pen' is treated as mouse-like (precise pointer, not a touch surface) per the audit's own
+  // wording. pointerType is why this is safe against the hybrid-device flapping bug above.
+  window.addEventListener('pointerdown', (e) => {
+    noteDetectedTouch(e.pointerType === 'touch');
+  });
+  window.addEventListener('pointermove', (e) => {
+    noteDetectedTouch(e.pointerType === 'touch');
+  });
+
+  canvasEl.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    forEachChangedTouch(e, (id, x, y) => sendTouch(PHASE_START, id, x, y));
+  }, { passive: false });
+  canvasEl.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    forEachChangedTouch(e, (id, x, y) => sendTouch(PHASE_MOVE, id, x, y));
+  }, { passive: false });
+  canvasEl.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    forEachChangedTouch(e, (id, x, y) => sendTouch(PHASE_END, id, x, y));
+  }, { passive: false });
+  canvasEl.addEventListener('touchcancel', (e) => {
+    e.preventDefault();
+    forEachChangedTouch(e, (id, x, y) => sendTouch(PHASE_CANCEL, id, x, y));
+  }, { passive: false });
+
+  // --- Pass 23: desktop keyboard/mouse controls -----------------------------------------------
+  // WASD move / Shift sprint / Alt walk / mouse-look / left-click mine / right-click build /
+  // wheel+1-9 hotbar / E blocks / C colors / ESC menu / pointer-lock on canvas click. The C++
+  // side of all of this is web/src/seam/Input_web.mm (see its "Pass 23" comment block) — this is
+  // only DOM event -> those exported functions, same division of labor as the Stage P3 touch code
+  // above. Movement/look/fly-thrust bypass the touch tracker entirely (Input_web.mm explains why);
+  // click and E/C/ESC reuse it (a synthesized tap needs >=1 engine tick between begin and end, see
+  // that file — real DOM mousedown/up and keydown/up naturally straddle a frame, so no extra care
+  // is needed here, unlike the headless driver which has to tick explicitly).
+  function callIfReady(fn) { if (moduleReady) fn(); }
+
+  // Plain pointer lock. F9g originally requested `{unadjustedMovement:true}` here (raw,
+  // OS-acceleration-free mouse movement) — REVERTED after a live playtest reported look
+  // sensitivity as noticeably higher than before: disabling the OS's own pointer-acceleration
+  // curve changes the effective deltas by an amount that depends on the player's own mouse/OS
+  // settings, which is a worse default than "matches what every other control on the page already
+  // did." If raw input is wanted again, it belongs behind its own opt-in setting (with its own
+  // sensitivity recalibration), not as a silent default.
+  function requestLock() {
+    try { canvasEl.requestPointerLock(); } catch (err) {}
+  }
+
+  // requestPointerLock is the "unlock the cursor for click-to-place/break like touch" trigger the
+  // spec asks for — while locked, mousemove reports relative deltas (movementX/Y) instead of an
+  // absolute position, which is what turns the mouse into a look control instead of a drag-to-look
+  // pointer. Only engage it on a plain left click with no modifier (avoids hijacking e.g. a
+  // ctrl-click browser context-menu gesture) and only once the module/world is up.
+  // ...except while a screen that you POINT at is open. The block and colour pickers (and the
+  // menu) are grids of swatches: with the pointer locked the cursor is hidden and mousemove is
+  // consumed as look input, so they cannot be used at all. Minecraft's convention is the one
+  // players expect — opening the inventory releases the mouse, closing it re-grabs — so the lock
+  // follows eden_ui_wants_cursor() rather than being purely click-driven.
+  canvasEl.addEventListener('click', () => {
+    if (document.pointerLockElement === canvasEl) return;
+    callIfReady(() => { if (!Module._eden_ui_wants_cursor()) requestLock(); });
+  });
+
+  // --- PC controls audit F3: crosshair overlay --------------------------------------------
+  const crosshairEl = document.createElement('div');
+  crosshairEl.id = 'eden-crosshair';
+  ['top', 'bottom', 'left', 'right'].forEach((dir) => {
+    const arm = document.createElement('div');
+    arm.className = 'arm ' + dir;
+    crosshairEl.appendChild(arm);
+  });
+  document.body.appendChild(crosshairEl);
+  function updateCrosshairPosition() {
+    const rect = canvasEl.getBoundingClientRect();
+    crosshairEl.style.left = (rect.left + rect.width / 2) + 'px';
+    crosshairEl.style.top = (rect.top + rect.height / 2) + 'px';
+  }
+  window.addEventListener('resize', updateCrosshairPosition);
+  document.addEventListener('fullscreenchange', updateCrosshairPosition);
+  updateCrosshairPosition();
+
+  // --- Perf audit item #5 (C3): WebGL context loss --------------------------------------------
+  // The shim PUSHES both events here (src/shim/gl/gl_es1_shim.cpp's context-loss block calls
+  // window.EdenRenderer.onContextLost/onContextRestored) rather than the page polling for them, and
+  // it has already paused the engine's main loop by the time this runs.
+  //
+  // Why this offers a reload rather than resuming: the shim rebuilds its OWN GL objects on a
+  // restore, but every engine texture was uploaded once during load by Texture2D_web.mm, and
+  // re-uploading them means re-running load code that lives in Classes/ — untouchable. So a resumed
+  // frame would be untextured garbage. Reload is the honest recovery, and world saves survive it
+  // (IDBFS), so the cost is a load screen, not progress.
+  let rendererPanelEl = null;
+  function showRendererPanel(title, detail) {
+    if (!rendererPanelEl) {
+      // Built from the design system rather than hand-styled inline (design-system pass). It is an
+      // alertdialog, so it sits at the same z-layer as the load-failure dialog — both are
+      // "something broke and only you can decide what happens next" surfaces.
+      const UI = window.EdenUI;
+      rendererPanelEl = UI.scrim({ id: 'eden-renderer-lost' });
+      rendererPanelEl.style.zIndex = 'var(--eden-z-alert)';
+      const win = UI.window({ title: 'Renderer lost', variant: 'dialog', scrollbar: false,
+                              role: 'alertdialog' });
+      const stack = UI.el('div', 'eden-stack');
+      const p = UI.el('p', 'eden-stack__text');
+      stack.appendChild(p);
+      stack.appendChild(UI.button({
+        size: 'md', tone: 'positive', icon: 'rotate-ccw', label: 'Reload',
+        onClick: () => location.reload(),
+      }));
+      win.content.appendChild(stack);
+      rendererPanelEl.appendChild(win.root);
+      document.body.appendChild(rendererPanelEl);
+      rendererPanelEl._h = win.title; rendererPanelEl._p = p;
+    }
+    rendererPanelEl._h.textContent = title;
+    rendererPanelEl._p.textContent = detail;
+    rendererPanelEl.style.display = 'flex';
+  }
+  window.EdenRenderer = {
+    onContextLost: function () {
+      // Pointer lock would keep the cursor hidden over a panel the player has to click.
+      if (document.pointerLockElement === canvasEl) document.exitPointerLock();
+      showRendererPanel('Renderer lost',
+        'The browser dropped this page\'s WebGL context — usually memory pressure, a driver ' +
+        'reset, or the tab being backgrounded for a long time. The game is paused. Reload to ' +
+        'continue; your worlds are saved in browser storage and are not affected.');
+    },
+    onContextRestored: function () {
+      showRendererPanel('Renderer restored',
+        'A new WebGL context is available, but the game\'s textures were lost with the old one ' +
+        'and can only be reloaded from scratch. Reload to continue.');
+    },
+  };
+
+  // --- PC controls audit F9d: display mode (Fixed / Fit window / Fullscreen-on-demand) --------
+  // The engine's point space (568x320) and backing store (1136x640) never change — only the
+  // canvas's CSS DISPLAY size does. toEnginePoint() already derives from
+  // getBoundingClientRect(), so this is safe with no coordinate-space work.
+  const ENGINE_ASPECT = ENGINE_WIDTH / ENGINE_HEIGHT;
+
+  // --- Perf audit item #6 (§4c.1-2): the DYNAMIC drawable ------------------------------------
+  // Before this, the backing store was pinned to 1136x640 (retina 2x of the engine's 568x320
+  // points) and devicePixelRatio was never read, so in Fit/Fullscreen mode a 1136x640 buffer was
+  // upscaled to whatever the display was — the game was permanently blurry on any modern screen.
+  //
+  // Now: backing store = the canvas's real CSS box x min(devicePixelRatio, dpr_cap) x render_scale.
+  // The engine keeps projecting in its 568x320 POINT space and SCREEN_WIDTH/HEIGHT/SCALE_* are
+  // NEVER touched (that is the port's most-bitten failure class — see EAGLView_web.mm); only the
+  // pixel buffer and the GL viewport change. toEnginePoint() already derives from
+  // getBoundingClientRect(), so input coordinates need no work at all.
+  //
+  // Uses the measured box rather than the engine aspect on purpose: in real fullscreen the UA
+  // stylesheet owns the element's size, and matching whatever the box actually is keeps the backing
+  // store and the display area in step (the previous fixed buffer was stretched to that same box,
+  // so this introduces no distortion that was not already there).
+  function applyDrawableSize() {
+    if (!moduleReady) return;
+    const rect = canvasEl.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return;   // display:none / not laid out yet
+    const cap = Module._eden_get_dpr_cap_x100() / 100;
+    const scale = Module._eden_get_render_scale_pct() / 100;
+    const factor = Math.min(window.devicePixelRatio || 1, cap) * scale;
+    const w = Math.max(1, Math.round(rect.width * factor));
+    const h = Math.max(1, Math.round(rect.height * factor));
+    // The dedupe compares against the CANVAS's real attributes, not a JS-side memo of what was
+    // last requested. That distinction is load-bearing and cost a debugging round to find:
+    // Module.onRuntimeInitialized fires BEFORE main(), so the first applyDisplayMode() runs before
+    // EAGLView_web's establishScreenMetrics asserts its own 1136x640 boot size — a remembered
+    // "already 1704x960" would then make every later resize a no-op against a drawable the engine
+    // had since overwritten. The canvas attributes cannot lie about that. (The boot race itself is
+    // handled by the deferred applyDisplayMode() in onRuntimeInitialized.)
+    if (canvasEl.width === w && canvasEl.height === h) return;
+    Module._eden_set_drawable_size(w, h);
+  }
+
+  function applyDisplayMode() {
+    if (!moduleReady) return;
+    const mode = Module._eden_get_display_mode(); // 0=Fixed, 1=Fit, 2=Fullscreen-on-demand
+    if (mode === 0 && document.fullscreenElement !== canvasEl) {
+      // "Fixed" means 852x480 (1.5x the engine's 568x320 points) on any viewport big enough to
+      // show that uncropped — but the plain CSS rule's `max-width:100vw`/`max-height:100vh`
+      // clamp each axis INDEPENDENTLY, which does not preserve ENGINE_ASPECT on a viewport
+      // narrower or shorter than 852x480 (i.e. most phones): e.g. a 390-wide viewport clamps
+      // width to 390 but leaves height at the full 480, producing a box the engine's fixed-aspect
+      // (568/320) projection never assumed. Since findWorldCoords's touch raycast (Util.mm) and
+      // the perspective projection (Graphics.mm's gluPerspective(..., P_ASPECT_RATIO, ...)) both
+      // assume the rendered box IS that aspect, a distorted box stretches the rendered scene.
+      // Compute the same aspect-preserving fit the Fit/Fullscreen branch below already does, just
+      // capped at 852x480 instead of the full viewport, so desktop windows big enough for it are
+      // completely unaffected (min(852,vw)===852, min(480,vh)===480 there) and small viewports
+      // degrade to a smaller same-aspect box instead of a distorted one.
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let w = Math.min(852, vw), h = w / ENGINE_ASPECT;
+      if (h > Math.min(480, vh)) { h = Math.min(480, vh); w = h * ENGINE_ASPECT; }
+      canvasEl.style.width = Math.round(w) + 'px';
+      canvasEl.style.height = Math.round(h) + 'px';
+    } else {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let w = vw, h = vw / ENGINE_ASPECT;
+      if (h > vh) { h = vh; w = vh * ENGINE_ASPECT; }
+      canvasEl.style.width = Math.round(w) + 'px';
+      canvasEl.style.height = Math.round(h) + 'px';
+    }
+    updateCrosshairPosition();
+    // The CSS box just changed, so the pixel buffer that backs it has to follow (item #6).
+    applyDrawableSize();
+    fullscreenBtn.style.display = (mode === 2 && document.fullscreenElement !== canvasEl) ? '' : 'none';
+  }
+  window.addEventListener('resize', applyDisplayMode);
+  document.addEventListener('fullscreenchange', applyDisplayMode);
+  // Q2 (dazzling-munching-bengio.md perf audit): the settings panel is the only other place
+  // display_mode can change; react to that write instead of recomputing layout every rAF frame.
+  // Item #6 adds render_scale/dpr_cap on the same hook — they change the backing store only, so
+  // they do not need the full layout pass.
+  window.EdenSettings.onChange(function (key) {
+    if (key === 'display_mode') applyDisplayMode();
+    else if (key === 'render_scale' || key === 'dpr_cap') applyDrawableSize();
+  });
+
+  // requestFullscreen needs a real user gesture, so "Fullscreen-on-demand" mode surfaces a small
+  // button rather than trying to enter fullscreen automatically on selecting the setting.
+  const fullscreenBtn = window.EdenUI.button({
+    size: 'sm', label: 'Fullscreen', icon: 'monitor',
+    onClick: () => { canvasEl.requestFullscreen().catch(() => {}); },
+  });
+  fullscreenBtn.id = 'eden-fullscreen-btn';
+  // Position is page chrome, not a design-system concern — the button itself is a stock
+  // .eden-btn--sm, only where it floats is set here.
+  fullscreenBtn.style.cssText = 'position:fixed;top:10px;right:10px;z-index:12;display:none;';
+  document.body.appendChild(fullscreenBtn);
+
+  // --- PC controls audit Phase 4: DOM hotbar strip (desktop profile only) --------------------
+  // Styled by the shared design system (.eden-hotbar in eden-ui.css) — one of the two surfaces
+  // that INVERTS the palette (dark chrome, light text) because it sits over the rendered world
+  // rather than on a panel. ensureCSS() so the strip is styled even if no panel is ever opened.
+  window.EdenUI.ensureCSS();
+  const HOTBAR_STORAGE_KEY = 'eden.prefs.hotbar';
+  const hotbarEl = document.createElement('div');
+  hotbarEl.id = 'eden-hotbar';
+  hotbarEl.className = 'eden-hotbar';
+  const hotbarSlots = [];
+  for (let i = 0; i < 9; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'eden-hotbar__slot';
+    const num = document.createElement('span');
+    num.className = 'eden-hotbar__num';
+    num.textContent = String(i + 1);
+    const type = document.createElement('span');
+    type.className = 'type';
+    slot.appendChild(num);
+    slot.appendChild(type);
+    slot.addEventListener('click', () => callIfReady(() => Module._eden_select_hotbar_slot(i)));
+    hotbarEl.appendChild(slot);
+    hotbarSlots.push({ el: slot, typeEl: type });
+  }
+  document.body.appendChild(hotbarEl);
+
+  // Classes/Constants.h's BLOCK_TYPES enum: TYPE_NONE=0 (not placeable) through
+  // TYPE_BTSTEEL=111 (the last real type as of this build). A value outside that range reaching
+  // hud->blocktype would ask the atlas/HUD-icon renderer for a block that does not exist —
+  // defended against here so a corrupted/out-of-range localStorage value from a future build
+  // (or a manual localStorage edit) can never do that, rather than trusting the stored JSON blindly.
+  const MIN_BLOCK_TYPE = 1, MAX_BLOCK_TYPE = 111;
+  function restoreHotbar() {
+    let saved;
+    try { saved = JSON.parse(localStorage.getItem(HOTBAR_STORAGE_KEY) || 'null'); } catch (e) { saved = null; }
+    if (!Array.isArray(saved) || saved.length !== 9) return;
+    saved.forEach((t, i) => {
+      if (Number.isInteger(t) && t >= MIN_BLOCK_TYPE && t <= MAX_BLOCK_TYPE) {
+        Module._eden_set_hotbar_slot_type(i, t);
+      }
+    });
+  }
+  function persistHotbar() {
+    const types = [];
+    for (let i = 0; i < 9; i++) types.push(Module._eden_get_hotbar_slot_type(i));
+    try { localStorage.setItem(HOTBAR_STORAGE_KEY, JSON.stringify(types)); } catch (e) {}
+  }
+  let hotbarRestored = false;
+  let lastHotbarTypes = null;
+  // Q2 perf audit: last-rendered (types, active-slot) state, so the 9 textContent writes + 9
+  // classList.toggle calls below only run on an actual change, not every rAF frame — the wasm
+  // reads (_eden_get_hotbar_index/_eden_get_hotbar_slot_type) still happen every frame since
+  // they're what detects the change, but they're cheap compared to the DOM writes.
+  let lastRenderedActive = null;
+  let lastRenderedTypes = null;
+  let lastVisible = null;
+  function updateHotbarStrip(visible) {
+    if (!moduleReady) return;
+    if (!hotbarRestored) { restoreHotbar(); hotbarRestored = true; }
+    if (visible !== lastVisible) { hotbarEl.style.display = visible ? '' : 'none'; lastVisible = visible; }
+    if (!visible) return;
+    const active = Module._eden_get_hotbar_index();
+    const types = [];
+    for (let i = 0; i < 9; i++) types.push(Module._eden_get_hotbar_slot_type(i));
+    const key = types.join(',');
+    if (active !== lastRenderedActive || key !== lastRenderedTypes) {
+      for (let i = 0; i < 9; i++) {
+        const s = hotbarSlots[i];
+        s.el.classList.toggle('is-active', i === active);
+        s.typeEl.textContent = String(types[i]);
+      }
+      lastRenderedActive = active;
+      lastRenderedTypes = key;
+    }
+    // Persist only on an actual change (picker edits are rare; this avoids a localStorage write
+    // every single frame while the strip is visible).
+    if (key !== lastHotbarTypes) { lastHotbarTypes = key; persistHotbar(); }
+  }
+
+  // --- PC controls audit F4: hold-to-mine/build state machine --------------------------------
+  // Driven from the rAF loop (holdActTick, below), NOT setInterval — eden_click_begin/end must
+  // straddle at least one engine tick (Input_web.mm's tap-mine/build fires on M_DOWN then
+  // M_RELEASE), which only a frame-driven state machine guarantees. Per held button: fire
+  // immediately on mousedown, then after an initial ~250ms delay repeat on a ~200ms period, each
+  // repeat spending one frame in "begin" and the next in "end". Falls back to plain click-once
+  // behaviour when the `hold_to_act` setting is off (Module._eden_get_hold_to_act() reads it).
+  const HOLD_INITIAL_DELAY = 250, HOLD_REPEAT_PERIOD = 200;
+  let holdAction = null; // {isBuild, pendingEnd, firstFireDone, nextFireAt}
+  function holdActStart(isBuild) {
+    if (holdAction) return; // a second button pressed while one is already held: ignore it
+    holdAction = { isBuild, pendingEnd: false, firstFireDone: false, nextFireAt: 0 };
+  }
+  function holdActStop() {
+    if (!holdAction) return;
+    if (holdAction.pendingEnd) callIfReady(() => Module._eden_click_end(holdAction.isBuild ? 1 : 0));
+    holdAction = null;
+  }
+  function holdActTick() {
+    if (!holdAction || !moduleReady) return;
+    const now = performance.now();
+    if (holdAction.pendingEnd) {
+      Module._eden_click_end(holdAction.isBuild ? 1 : 0);
+      holdAction.pendingEnd = false;
+      const wasFirst = !holdAction.firstFireDone;
+      holdAction.firstFireDone = true;
+      holdAction.nextFireAt = Module._eden_get_hold_to_act()
+        ? now + (wasFirst ? HOLD_INITIAL_DELAY : HOLD_REPEAT_PERIOD)
+        : Infinity; // hold-to-act off: one shot per press, exactly like a plain click
+      return;
+    }
+    if (!holdAction.firstFireDone || now >= holdAction.nextFireAt) {
+      Module._eden_click_begin(holdAction.isBuild ? 1 : 0);
+      holdAction.pendingEnd = true;
+    }
+  }
+
+  // Poll rather than push: the pickers can also be opened and closed from the engine's own HUD
+  // buttons, which never route through our key handlers. `wantsCursorPrev` makes the re-grab edge
+  // triggered, so a player who deliberately unlocked with Esc is not yanked back into lock.
+  let wantsCursorPrev = true;
+  let lockWasHeldBeforePicker = false;
+  let drawableSeeded = false;   // item #6: see the one-shot inside the loop below
+  (function trackCursorNeed() {
+    requestAnimationFrame(trackCursorNeed);
+    if (!moduleReady) return;
+    if (jumpPulsePending) { Module._eden_set_jump(0); jumpPulsePending = false; }
+    Module._eden_movement_tick();  // PC controls audit F1: feeds Movement_web.mm's dt EMA
+    // Row #24: must run BEFORE recomputeMove() — the Gamepad API is poll-only, and the stick axes
+    // it records are read by recomputeMove() on the very next line.
+    window.EdenGamepad.tick();
+    // F1 fix requires setSpeed to be RE-CALLED each frame so its frame-rate-normalize factor
+    // stays current (the engine itself only stores the resulting walk_force, not a per-frame
+    // hook) — cheap and idempotent while a movement key is held; a no-op the rest of the time.
+    recomputeMove();
+    Module._eden_ui_tick();  // restores the action mode a picker would otherwise have cleared
+    holdActTick();
+    window.EdenSettings.tick();  // seeds the C settings model; mirrors the menu's Options button
+    // Item #6 one-shot: the settings model only loads once the World exists, which is later than
+    // the boot sizing pass in onRuntimeInitialized — so a RESTORED render_scale/dpr_cap has to be
+    // re-applied the first frame it is available. `drawableSeeded` short-circuits before the wasm
+    // call, so this costs nothing after the first few frames (Q2's no-per-frame-work rule).
+    if (!drawableSeeded && Module._eden_settings_loaded()) {
+      drawableSeeded = true;
+      applyDrawableSize();
+    }
+    window.EdenPauseMenu.tick();  // mirrors hud->inmenu — see eden-pausemenu.js
+    window.EdenLoadError.tick();  // shows once eden_load_failed() flips true — see eden-loaderror.js
+    window.EdenMenu.tick();       // mirrors eden_menu_active() — see eden-menu.js
+    // A modal panel is a "you point at it" screen, same as the block/colour pickers. The rebuilt
+    // main menu counts too: it is an opaque overlay you click, so the pointer must be free and the
+    // crosshair/hotbar must be hidden behind it exactly as they are behind the pause menu.
+    const wants = !!Module._eden_ui_wants_cursor() || window.EdenSettings.isOpen() ||
+      window.EdenPauseMenu.isOpen() || window.EdenLoadError.isOpen() || window.EdenMenu.isOpen();
+    if (wants && document.pointerLockElement === canvasEl) {
+      document.exitPointerLock();
+    } else if (!wants && wantsCursorPrev && lockWasHeldBeforePicker &&
+               document.pointerLockElement !== canvasEl) {
+      requestLock();
+    }
+    if (wants && !wantsCursorPrev) lockWasHeldBeforePicker = (document.pointerLockElement === canvasEl);
+    wantsCursorPrev = wants;
+    // F3: crosshair only while genuinely locked (implies desktop profile — the touch profile
+    // never requests a lock) and not on a screen you point at.
+    // NOTE: must be 'block', not '' — clearing the inline style falls back to the #eden-crosshair
+    // stylesheet rule itself (display: none), which never shows the crosshair at all.
+    crosshairEl.style.display = (pointerLocked && !wants && !!Module._eden_get_crosshair()) ? 'block' : 'none';
+    updateHotbarStrip(!Module._eden_effective_input_is_touch() && !wants);
+  })();
+
+  // Small transient overlay for state changes that have no on-screen indicator of their own
+  // (fly mode); the engine's HUD is all custom GL, so there is nowhere to put this in-world.
+  let toastTimer = null;
+  function showToast(text) {
+    let el = document.getElementById('eden-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'eden-toast';
+      el.className = 'eden-toast';   // styled in eden-ui.css
+      // Announced rather than silently painted: these messages (fly mode on/off, block preview)
+      // are the ONLY feedback those toggles give, so a screen-reader user would otherwise get
+      // nothing at all from the keyboard shortcut.
+      el.setAttribute('role', 'status');
+      el.setAttribute('aria-live', 'polite');
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.style.opacity = '1';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.opacity = '0'; }, 1400);
+  }
+
+  // --- PC controls audit Phase 5: keybind remapping -------------------------------------------
+  // Replaces the old hard-coded `switch (e.code)` blocks with an ACTION -> physical-code(s)
+  // lookup, so eden-settings.js's Keys tab can rebind a key without this file knowing about it.
+  // Defaults are exactly the pre-Phase-5 bindings (nothing changes for existing players) plus
+  // arrow keys as a secondary movement binding. Only the PRIMARY (index 0) code per action is
+  // user-rebindable from the panel — the secondary arrow-key bindings are fixed.
+  //
+  // Deliberate exception to "settings live in C, never in the JS" (RESUME-HERE): the C settings
+  // model stores floats only and NSUserDefaults persists NSNumber only (Settings_web.mm), so a
+  // code->action map cannot live there. Keybinds are a JS-owned localStorage blob under the same
+  // `eden.prefs.` prefix eden-storage.js and the hotbar strip use. Don't "fix" this into the C
+  // model — see Settings_web.mm's header for why that would actually be a regression.
+  const KEYBIND_STORAGE_KEY = 'eden.prefs.keybinds';
+  const DEFAULT_KEYMAP = {
+    moveForward: ['KeyW', 'ArrowUp'],
+    moveBack:    ['KeyS', 'ArrowDown'],
+    moveLeft:    ['KeyA', 'ArrowLeft'],
+    moveRight:   ['KeyD', 'ArrowRight'],
+    sprint:      ['ShiftLeft', 'ShiftRight'],
+    walk:        ['AltLeft', 'AltRight'],
+    // Space is jump on foot AND ascend while flying (eden_set_jump ignores it while flying, so
+    // the two never fight over vertical velocity) — one action serves both, matching the engine's
+    // own convention (Input_web.mm's eden_set_jump comment) rather than inventing a second one.
+    jump:        ['Space'],
+    flyDown:     ['ControlLeft', 'ControlRight'],
+    // Same physical key as flyDown deliberately: on foot this crouches (Ctrl doing nothing else
+    // there), while flying it also nudges FLY_DOWN, which is harmless (crouch shrinks the
+    // collision box regardless of fly state, same as noclip+crouch in Source).
+    crouch:      ['ControlLeft', 'ControlRight'],
+    // F = fire/burn tool (rburn), V = fly toggle. Was F/F (fire had no binding at all, and F was
+    // overloaded onto fly) until a live playtest reported no way to reach the fire tool and
+    // accidentally toggling fly mode instead — swapped per that feedback.
+    fireTool:    ['KeyF'],
+    flyToggle:   ['KeyV'],
+    blockPicker: ['KeyE'],
+    colorPicker: ['KeyC'],
+    menu:        ['Escape'],
+    settings:    ['KeyO'],
+    blockPreview:['KeyB'],
+    fullscreen:  ['KeyL'],
+    hotbar1: ['Digit1'], hotbar2: ['Digit2'], hotbar3: ['Digit3'],
+    hotbar4: ['Digit4'], hotbar5: ['Digit5'], hotbar6: ['Digit6'],
+    hotbar7: ['Digit7'], hotbar8: ['Digit8'], hotbar9: ['Digit9'],
+  };
+  const ACTION_LABELS = {
+    moveForward: 'Move forward', moveBack: 'Move back',
+    moveLeft: 'Strafe left', moveRight: 'Strafe right',
+    sprint: 'Sprint', walk: 'Walk (slow)', jump: 'Jump / fly up', flyDown: 'Fly down',
+    crouch: 'Crouch',
+    fireTool: 'Fire tool', flyToggle: 'Toggle fly mode', blockPicker: 'Block picker',
+    colorPicker: 'Colour picker',
+    menu: 'Menu / pause', settings: 'Open settings', blockPreview: 'Toggle block preview',
+    fullscreen: 'Fullscreen',
+    hotbar1: 'Hotbar 1', hotbar2: 'Hotbar 2', hotbar3: 'Hotbar 3', hotbar4: 'Hotbar 4',
+    hotbar5: 'Hotbar 5', hotbar6: 'Hotbar 6', hotbar7: 'Hotbar 7', hotbar8: 'Hotbar 8',
+    hotbar9: 'Hotbar 9',
+  };
+  // Actions whose keydown must not repeat-fire under OS auto-repeat: one-shot toggles (mode
+  // toggles, panel opens) AND the begin/end tap actions (holding the key down past the OS's
+  // repeat-delay must not re-tap the button every ~30ms — a real regression caught in a live
+  // playtest: the original pre-Phase-5 code had one blanket `if(e.repeat) return` covering every
+  // action, and splitting dispatch by action here silently dropped that guard for anything not
+  // listed below). The continuous ones (movement/sprint/walk/fly) are Set membership, so a
+  // repeat keydown is a harmless no-op re-add and are correctly NOT in this set.
+  const MOMENTARY_ACTIONS = new Set([
+    'flyToggle', 'fireTool', 'blockPicker', 'colorPicker', 'menu',
+    'blockPreview', 'settings', 'fullscreen',
+    'hotbar1','hotbar2','hotbar3','hotbar4','hotbar5','hotbar6','hotbar7','hotbar8','hotbar9',
+  ]);
+
+  function loadKeymap() {
+    let stored = null;
+    try { stored = JSON.parse(localStorage.getItem(KEYBIND_STORAGE_KEY) || 'null'); } catch (e) {}
+    const map = {};
+    for (const action in DEFAULT_KEYMAP) {
+      map[action] = (stored && Array.isArray(stored[action]) && stored[action].length)
+        ? stored[action].slice() : DEFAULT_KEYMAP[action].slice();
+    }
+    return map;
+  }
+  let KEYMAP = loadKeymap();
+  function saveKeymap() {
+    try { localStorage.setItem(KEYBIND_STORAGE_KEY, JSON.stringify(KEYMAP)); } catch (e) {}
+  }
+  function codeToActions(code) {
+    const out = [];
+    for (const action in KEYMAP) if (KEYMAP[action].indexOf(code) !== -1) out.push(action);
+    return out;
+  }
+  // Used by eden-settings.js's Keys tab. Only slot 0 (the primary binding) is rebindable from the
+  // panel; secondary bindings (arrow keys) are not exposed there.
+  // Rebind UI support: the Keys tab calls startCapture(cb) after a "Press a key…" prompt; the
+  // NEXT keydown anywhere is consumed here (capture phase + stopPropagation, so it never reaches
+  // the real action-dispatch listener below or types into anything) and handed to `cb` instead of
+  // being interpreted as input.
+  let keyCaptureCallback = null;
+  window.addEventListener('keydown', (e) => {
+    if (!keyCaptureCallback) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const cb = keyCaptureCallback;
+    keyCaptureCallback = null;
+    cb(e.code);
+  }, true);
+
+  window.EdenKeybinds = {
+    actions: Object.keys(DEFAULT_KEYMAP),
+    labelFor: (action) => ACTION_LABELS[action] || action,
+    primaryCode: (action) => (KEYMAP[action] && KEYMAP[action][0]) || '',
+    startCapture: (onCode) => { keyCaptureCallback = onCode; },
+    cancelCapture: () => { keyCaptureCallback = null; },
+    rebind: (action, code) => {
+      if (!KEYMAP[action]) return;
+      KEYMAP[action][0] = code;
+      saveKeymap();
+    },
+    resetDefaults: () => {
+      for (const action in DEFAULT_KEYMAP) KEYMAP[action] = DEFAULT_KEYMAP[action].slice();
+      saveKeymap();
+    },
+  };
+
+  const actionsDown = new Set();
+  function isDown(action) { return actionsDown.has(action); }
+
+  function recomputeMove() {
+    // eden_set_move_input's comment explains why raw -1..1 axes, not per-key calls, are what the
+    // engine side wants.
+    let forward = (isDown('moveForward') ? 1 : 0) - (isDown('moveBack') ? 1 : 0);
+    let strafe = (isDown('moveRight') ? 1 : 0) - (isDown('moveLeft') ? 1 : 0);
+    let speedMul = isDown('sprint') ? 1.3 : (isDown('walk') ? 0.5 : 1.0);
+    // Row #24: the gamepad's left stick composes here rather than calling
+    // _eden_set_move_input itself, because this function runs unconditionally every frame (the F1
+    // frame-rate-normalize fix requires it) and would otherwise stomp the stick one frame later.
+    // Sum-and-clamp rather than "stick wins": holding W while nudging the stick should not
+    // suddenly stop the player, and the clamp keeps the -1..1 contract eden_set_move_input wants.
+    const pad = window.EdenGamepad && window.EdenGamepad.axes();
+    if (pad) {
+      forward = Math.max(-1, Math.min(1, forward + pad.forward));
+      strafe = Math.max(-1, Math.min(1, strafe + pad.strafe));
+      speedMul = Math.max(speedMul, pad.speedMul);
+    }
+    callIfReady(() => Module._eden_set_move_input(forward, strafe, speedMul));
+  }
+  function recomputeFly() {
+    callIfReady(() => Module._eden_set_fly_thrust(isDown('jump') ? 1 : 0, isDown('flyDown') ? 1 : 0));
+  }
+  function recomputeCrouch() {
+    callIfReady(() => Module._eden_set_crouch(isDown('crouch') ? 1 : 0));
+  }
+
+  const CONTINUOUS_ACTIONS = new Set([
+    'moveForward', 'moveBack', 'moveLeft', 'moveRight', 'sprint', 'walk', 'jump', 'flyDown', 'crouch',
+  ]);
+
+  function actionDown(action) {
+    if (CONTINUOUS_ACTIONS.has(action)) {
+      actionsDown.add(action);
+      if (action === 'flyDown' || action === 'jump') recomputeFly();
+      if (action === 'crouch') recomputeCrouch();
+      if (action !== 'flyDown' && action !== 'crouch') recomputeMove(); // 'jump' affects both fly thrust and nothing in recomputeMove; harmless extra call
+    }
+    switch (action) {
+      case 'jump':
+        callIfReady(() => Module._eden_set_jump(1)); break;
+      case 'blockPicker':
+        callIfReady(() => Module._eden_tap_hud_button_begin(1)); break;
+      case 'colorPicker':
+        callIfReady(() => Module._eden_tap_hud_button_begin(2)); break;
+      case 'fireTool':
+        callIfReady(() => Module._eden_tap_hud_button_begin(7)); break;
+      case 'menu':
+        // Panel first: while it is up, the menu action closes the panel, not the engine's own
+        // in-game menu underneath it. F9b: while pointer-locked, the browser force-exits lock on
+        // Escape and this cannot be prevented — so locked, this means ONLY "release the mouse",
+        // not "also open the pause menu". Only tap the menu button when already unlocked. (This
+        // F9b nuance is specific to Escape's browser behaviour, so it still applies even if the
+        // player rebinds the "menu" action to a different key — the pointer-lock release itself
+        // is only ever triggered by the real Escape key regardless of this binding.)
+        if (window.EdenSettings.isOpen()) { window.EdenSettings.close(); break; }
+        if (pointerLocked) break;
+        callIfReady(() => Module._eden_tap_hud_button_begin(0)); break;
+      case 'blockPreview':
+        // Routed through the settings model so the key and the panel share one piece of state.
+        callIfReady(() => {
+          const on = window.EdenSettings.toggleByKey('block_preview');
+          showToast('Block preview ' + (on ? 'ON' : 'OFF'));
+        });
+        break;
+      case 'flyToggle':
+        // Fly mode toggle. The engine hard-codes it ON with no UI switch (Classes/Player.mm:32,
+        // and the HUD's own toggle is commented out at Hud.mm:570), so the port owns the setting.
+        callIfReady(() => {
+          const on = window.EdenSettings.toggleByKey('fly');
+          showToast('Fly mode ' + (on ? 'ON' : 'OFF'));
+        });
+        break;
+      case 'settings':
+        callIfReady(() => window.EdenSettings.open()); break;
+      case 'fullscreen':
+        fullscreenBtn.onclick(); break;
+      default:
+        if (action.indexOf('hotbar') === 0) {
+          const slot = parseInt(action.slice(6), 10) - 1;
+          callIfReady(() => Module._eden_select_hotbar_slot(slot));
+        }
+    }
+  }
+  function actionUp(action) {
+    if (CONTINUOUS_ACTIONS.has(action)) {
+      actionsDown.delete(action);
+      if (action === 'flyDown' || action === 'jump') recomputeFly();
+      if (action === 'crouch') recomputeCrouch();
+      if (action !== 'flyDown' && action !== 'crouch') recomputeMove();
+    }
+    switch (action) {
+      case 'jump':
+        callIfReady(() => Module._eden_set_jump(0)); break;
+      case 'blockPicker':
+        callIfReady(() => Module._eden_tap_hud_button_end(1)); break;
+      case 'colorPicker':
+        callIfReady(() => Module._eden_tap_hud_button_end(2)); break;
+      case 'fireTool':
+        callIfReady(() => Module._eden_tap_hud_button_end(7)); break;
+      case 'menu':
+        callIfReady(() => Module._eden_tap_hud_button_end(0)); break;
+    }
+  }
+
+  // Row #24: hand the gamepad translator the same entry points the keyboard/mouse path uses, so a
+  // controller press is literally indistinguishable from the equivalent key (including the
+  // momentary/continuous and hold-to-act handling those already implement). See eden-gamepad.js.
+  window.EdenGamepad.init({
+    actionDown, actionUp,
+    recomputeMove,
+    applyLook: (dx, dy) => callIfReady(() => Module._eden_apply_look_delta(dx, dy)),
+    holdActStart, holdActStop,
+    hotbarScroll: (dir) => callIfReady(() => Module._eden_hotbar_scroll(dir)),
+    // A DOM panel owns input while it is up — same set the pointer-lock arbitration below uses.
+    isBlocked: () => window.EdenSettings.isOpen() || window.EdenPauseMenu.isOpen() ||
+      window.EdenLoadError.isOpen() || window.EdenMenu.isOpen(),
+    getSetting: (key) => window.EdenSettings.getByKey(key),
+    onConnect: (id, connected) =>
+      showToast(connected ? ('Gamepad connected' + (id ? ': ' + id.split('(')[0].trim() : ''))
+                          : 'Gamepad disconnected'),
+  });
+
+  // A focused text field (e.g. the New World name input) must get its own keystrokes — without
+  // this, typing "Space" or any letter bound to an action (W/A/S/D, E, ...) both moves/jumps the
+  // player AND (for Space/other action keys with preventDefault) never reaches the field at all.
+  function isTypingTarget(el) {
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA';
+  }
+  window.addEventListener('keydown', (e) => {
+    if (isTypingTarget(document.activeElement)) return;
+    const actions = codeToActions(e.code);
+    if (!actions.length) return;
+    // Space must not scroll the page; Alt alone must not blur it. Keyed off the ACTION (not the
+    // physical code) so this still holds after a player rebinds jump/walk to a different key.
+    if (actions.indexOf('jump') !== -1 || actions.indexOf('walk') !== -1) e.preventDefault();
+    for (const action of actions) {
+      if (e.repeat && MOMENTARY_ACTIONS.has(action)) continue;
+      actionDown(action);
+    }
+  });
+  window.addEventListener('keyup', (e) => {
+    if (isTypingTarget(document.activeElement)) return;
+    for (const action of codeToActions(e.code)) actionUp(action);
+  });
+  // Releasing focus (alt-tab, clicking outside) mid-keypress must not leave a movement/fly key
+  // latched down forever — there is no guaranteed keyup for that. F9a: also force-end a held
+  // mine/build (holdActStop composes into eden_click_end itself if one was pending) — otherwise
+  // alt-tabbing away mid-hold leaves that touch slot stuck down, same class of bug as the mouse
+  // one this shares a blur handler with.
+  //
+  // The jump key needs its OWN explicit release, not just the recompute calls below: `jump` is a
+  // synthetic TOUCH (Input_web.mm's eden_set_jump, held on hud->rjumphit for as long as it's
+  // "down"), separate from the actionsDown bookkeeping recomputeMove/Fly read — clearing
+  // actionsDown alone does not tell the engine to release that touch, so a held jump surviving a
+  // lost-focus moment (alt-tab, or a modal grabbing focus) would otherwise leave the player
+  // jumping/flying forever with no key actually held anymore.
+  window.addEventListener('blur', () => {
+    const wasJumping = isDown('jump');
+    actionsDown.clear();
+    recomputeMove(); recomputeFly(); recomputeCrouch();
+    if (wasJumping) callIfReady(() => Module._eden_set_jump(0));
+    holdActStop();
+  });
+
+  // Phase 6: wheel-up/-down as jump (the Source bhop convention), while `advanced_movement` is
+  // on. eden_set_jump is a synthetic touch (Input_web.mm) whose begin/end must straddle >=1
+  // engine tick, same rule as click/HUD taps — so this only sets the "begin" here and lets the
+  // rAF loop (trackCursorNeed) deliver "end" one frame later, never a same-call pulse.
+  function wheelJumpPulse() {
+    callIfReady(() => Module._eden_set_jump(1));
+    jumpPulsePending = true;
+  }
+
+  // F9c: accumulate the wheel's actual magnitude rather than treating every event as one step —
+  // trackpads and high-resolution mice emit many small deltaY events per physical notch, which
+  // used to race the hotbar (one step per DOM event, not per intended scroll click). Also
+  // normalizes `deltaMode` (0=pixel, 1=line, 2=page) to a common pixel-equivalent scale first.
+  let wheelAccum = 0;
+  const WHEEL_STEP_PX = 50;
+  canvasEl.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    let px = e.deltaY;
+    if (e.deltaMode === 1) px *= 16;                          // DOM_DELTA_LINE
+    else if (e.deltaMode === 2) px *= (window.innerHeight || 800); // DOM_DELTA_PAGE
+    wheelAccum += px;
+    const advanced = moduleReady && !!Module._eden_get_advanced_movement();
+    while (wheelAccum >= WHEEL_STEP_PX) {
+      advanced ? wheelJumpPulse() : callIfReady(() => Module._eden_hotbar_scroll(1));
+      wheelAccum -= WHEEL_STEP_PX;
+    }
+    while (wheelAccum <= -WHEEL_STEP_PX) {
+      advanced ? wheelJumpPulse() : callIfReady(() => Module._eden_hotbar_scroll(-1));
+      wheelAccum += WHEEL_STEP_PX;
+    }
+  }, { passive: false });
+
+  let pointerLocked = false;
+  document.addEventListener('pointerlockchange', () => {
+    pointerLocked = (document.pointerLockElement === canvasEl);
+  });
+
+  canvasEl.addEventListener('mousemove', (e) => {
+    if (!pointerLocked) return;
+    callIfReady(() => Module._eden_apply_look_delta(e.movementX, e.movementY));
+  });
+  // Only while locked do mousedown/up mean mine/build-at-crosshair (routed through the F4
+  // hold-to-act state machine above, not a direct eden_click_begin/end pulse); when NOT locked,
+  // the existing Stage P3 mousedown/move/up block above still owns the mouse (that's how you
+  // click menu/HUD buttons before ever locking the pointer).
+  canvasEl.addEventListener('mousedown', (e) => {
+    if (!pointerLocked) return;
+    e.preventDefault();
+    callIfReady(() => holdActStart(e.button === 2 ? 1 : 0));
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (!pointerLocked) return;
+    callIfReady(() => holdActStop());
+  });
+  // Right-click while locked is "build", not the browser context menu.
+  canvasEl.addEventListener('contextmenu', (e) => { if (pointerLocked) e.preventDefault(); });
+
+  // Q1: load whichever build EDEN_BUILD_DIR picked (see the top of this file's inline script).
+  // eden.js locates eden.wasm relative to its own URL, so this resolves <dir>/eden.wasm
+  // automatically; `async` on a dynamically-inserted script is the default, set explicitly to
+  // match the previous static tag's behaviour.
+  const edenScript = document.createElement('script');
+  edenScript.async = true;
+  edenScript.src = EDEN_BUILD_DIR + 'eden.js';
+  document.body.appendChild(edenScript);
+
+  // Row #21 (perf-audit): register the app-shell service worker, root-scoped so it can also see
+  // build-st/build-rel requests (see service-worker.js's header for the network-first strategy and
+  // why it never touches Eden.eden/Range requests). Best-effort and silent on failure — some dev
+  // setups (file://, an http-only origin) can't register a SW at all, and that must never block
+  // boot. `../service-worker.js` from this file's own /public/ URL resolves to the server root.
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('../service-worker.js').catch((err) => {
+        console.warn('[eden] service worker registration failed (non-fatal):', err);
+      });
+    });
+  }
+</script>
+</body>
+</html>

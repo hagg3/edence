@@ -1,0 +1,105 @@
+#import "NSData.h"
+#import "NSString.h"
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
+
+@implementation NSData
+
++ (NSData *)data { return [[[NSData alloc] init] autorelease]; }
+
++ (NSData *)dataWithBytes:(const void *)bytes length:(NSUInteger)len {
+    return [[[NSData alloc] initWithBytes:bytes length:len] autorelease];
+}
+
++ (NSData *)dataWithBytesNoCopy:(void *)bytes length:(NSUInteger)len freeWhenDone:(BOOL)freeWhenDone {
+    NSData *d = [[[NSData alloc] initWithBytes:bytes length:len] autorelease];  // copies
+    if (freeWhenDone && bytes) free(bytes);  // honor the ownership transfer the caller intends
+    return d;
+}
+
++ (NSData *)dataWithContentsOfFile:(NSString *)path {
+    return [[[NSData alloc] initWithContentsOfFile:path] autorelease];
+}
+
+- (id)initWithBytes:(const void *)bytes length:(NSUInteger)len {
+    self = [super init];
+    _bytes.resize(len);
+    if (bytes && len) memcpy(_bytes.data(), bytes, len);
+    return self;
+}
+
+- (id)initWithBytesNoCopy:(void *)bytes length:(NSUInteger)len {
+    return [self initWithBytes:bytes length:len];
+}
+
+- (id)initWithContentsOfFile:(NSString *)path {
+    self = [super init];
+    // TODO P4: OPFS-backed read (see FileManager seam). P1-adequate direct read for headless
+    // link/smoke-test.
+    std::ifstream f(path ? [path UTF8String] : "", std::ios::binary | std::ios::ate);
+    if (!f) { return self; }
+    std::streamsize size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    _bytes.resize((size_t)size);
+    if (size > 0) f.read((char *)_bytes.data(), size);
+    return self;
+}
+
+- (id)initWithData:(NSData *)other {
+    self = [super init];
+    _bytes = other ? other->_bytes : std::vector<uint8_t>();
+    return self;
+}
+
+- (const void *)bytes { return _bytes.data(); }
+- (NSUInteger)length { return (NSUInteger)_bytes.size(); }
+
+- (void)getBytes:(void *)buffer length:(NSUInteger)len {
+    memcpy(buffer, _bytes.data(), len < _bytes.size() ? len : _bytes.size());
+}
+
+- (void)getBytes:(void *)buffer range:(NSRange)range {
+    memcpy(buffer, _bytes.data() + range.location, range.length);
+}
+
+- (NSData *)subdataWithRange:(NSRange)range {
+    return [NSData dataWithBytes:_bytes.data() + range.location length:range.length];
+}
+
+- (BOOL)writeToFile:(NSString *)path atomically:(BOOL)atomically {
+    (void)atomically; // TODO P4: real atomic temp-file+rename (N3 audit finding) — this
+                       // shim's job is the class, not the save-path policy; FileManager owns
+                       // atomicity.
+    std::ofstream f(path ? [path UTF8String] : "", std::ios::binary | std::ios::trunc);
+    if (!f) return NO;
+    if (!_bytes.empty()) f.write((const char *)_bytes.data(), (std::streamsize)_bytes.size());
+    return f.good() ? YES : NO;
+}
+
+@end
+
+@implementation NSMutableData
+
++ (NSMutableData *)data { return [[[NSMutableData alloc] init] autorelease]; }
++ (NSMutableData *)dataWithCapacity:(NSUInteger)capacity {
+    NSMutableData *d = [[NSMutableData alloc] init];
+    d->_bytes.reserve(capacity);
+    return [d autorelease];
+}
+
+- (void *)mutableBytes { return _bytes.data(); }
+
+- (void)appendBytes:(const void *)bytes length:(NSUInteger)len {
+    size_t old = _bytes.size();
+    _bytes.resize(old + len);
+    if (bytes && len) memcpy(_bytes.data() + old, bytes, len);
+}
+
+- (void)appendData:(NSData *)other {
+    if (other) [self appendBytes:other->_bytes.data() length:(NSUInteger)other->_bytes.size()];
+}
+
+- (void)setLength:(NSUInteger)len { _bytes.resize(len); }
+
+@end
