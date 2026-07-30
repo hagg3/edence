@@ -69,6 +69,51 @@ Three properties are load-bearing and must survive any change here:
   falls back to the pass-30 whole-file fetch. `python3 -m http.server` has **no** byte
   serving, so **the win only materialises behind `node tools/serve.js`** (which grew real
   206 support in the same pass). `?worldfs=eager` forces the fallback by hand.
+  **GitHub Pages is also in the no-byte-serving bucket** — confirmed with `curl -H "Range:
+  bytes=0-0"` against a live deployment: it answers `200` with the full body and a
+  `content-length` equal to the whole file, despite advertising `accept-ranges: bytes` in
+  every response. So **the public/production deployment always takes the eager fallback
+  path**, not just local testing under the wrong dev server. See "The eager fallback is
+  the production path" below — this is not a rare edge case to shrug off.
+
+### The eager fallback is the production path, not a rare edge case (pass 50)
+Because GitHub Pages never answers `206`, `hagg3.github.io/edence` (and any other GitHub
+Pages deployment of this port) downloads the **whole 52 MB `Eden.eden`** on every cold
+boot, synchronously blocking the `eden-default-world-fetch` run dependency until it
+finishes. That used to also **double-buffer** the file in memory: the streaming
+`fetch()` reader accumulated a `chunks[]` array and concatenated it into a second buffer
+(`eagerFetch`), which `populateEager` then copied a *third* time via `FS.writeFile`
+(MEMFS allocates and `memcpy`s its own backing buffer). Transient peak residency for one
+52 MB file could reach ~150 MB.
+
+Desktop Chrome/Safari tolerated this; **iOS/iPadOS Safari did not** — it failed silently
+(no console error, no crash dialog) with the loading screen never dismissing, or — if
+boot got just far enough to release the run dependency before the tab was killed — a
+live WebGL2 context with a permanently black canvas at frame 0 (`World::update` never
+ticking because `main()` was still blocked). This is exactly the "iOS Safari will
+terminate the tab well before desktop does" risk `WORKING/project-audit-2026-07-30.md`
+flags generally (D2) — this was a concrete, now-fixed instance of it, not the same bug
+as A2's per-frame autorelease-pool ramp (that's a slow climb over a session; this was a
+single large spike during boot).
+
+**Fix:** `eagerFetch` now pre-sizes one destination `Uint8Array` from the response's
+`Content-Length` (falling back to the old `chunks[]`+concat path only if a chunk would
+overflow it — i.e. the header under-reported the real size) and fills it in place while
+streaming, instead of accumulating-then-concatenating. `populateEager` now installs a
+read-only FS node backed directly by that buffer (same shape as the lazy node's
+`stream_ops.read`, just serving from an already-fully-resident array instead of
+fetching blocks over the network) instead of `FS.writeFile`. One 52 MB buffer, not two
+or three. Verified via `tools/headless-lazy-world-test.js`'s existing `--eager` A/B leg
+(mode/settling behavior unchanged) and confirmed fixed live on iPhone/iPad Safari.
+
+**Why not just fix the hosting instead?** Investigated first: GitHub Release assets
+support `Range` (206) but not CORS (no `Access-Control-Allow-Origin`, preflight 405s);
+`raw.githubusercontent.com` supports CORS but not `Range` (same as Pages); jsDelivr's
+GitHub CDN supports both but caps individual files at 20 MB, well under 52 MB. None of
+GitHub's own free hosting surfaces give both properties for a file this size — a real
+fix there needs third-party object storage (Cloudflare R2, S3, Backblaze B2 + a CDN),
+which is a deliberate infra decision, not something to bolt on unasked. The memory fix
+above is host-agnostic and was the right scope for this pass.
 
 Measured on the real file (`tools/headless-lazy-world-test.js`): cold boot reads 596 KB in
 10 requests (vs. 52.5 MB), and creating + loading a normal world costs another ~2.4 MB in
