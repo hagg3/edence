@@ -63,6 +63,23 @@ std::unordered_map<int, UITouch*> &activeTouches() {
     return touches;
 }
 
+// Audit row B4: `eden_input_pointer_event` used to allocate a fresh NSSet + UIEvent per call
+// (~120 allocations/sec during a drag, each through the shim's ObjC allocator and this frame's
+// autorelease pool). Safe to pool globally because Classes/Input.mm's touchesBegan/Moved/Ended/
+// Cancelled only ever enumerate the set and take the event as an opaque marker WITHIN the call —
+// grep-confirmed neither is retained or read past return, and the engine's own touches[] table
+// keys on the individual UITouch*'s pointer identity instead (that one still must NOT be pooled —
+// see activeTouches() above and the stuck-jump bug this file's header warns about). Main thread
+// only (CLAUDE.md #4), so no synchronization needed for reuse between calls.
+NSSet* pooledTouchSet() {
+    static NSSet* set = [[NSSet alloc] init]; // never released: lives for the process
+    return set;
+}
+UIEvent* pooledEvent() {
+    static UIEvent* event = [[UIEvent alloc] init]; // stateless marker type, reused as-is
+    return event;
+}
+
 } // namespace
 
 extern "C" {
@@ -94,9 +111,9 @@ void eden_input_pointer_event(int phase, int identity, float x, float y) {
             // enough to make the player jump forever, one extra phantom slot per repeat keydown.
             // touchesEnded (not Cancelled, which is Input::clearAll() — wipes every live touch,
             // collateral damage to unrelated ones like movement) frees just this one slot.
-            NSSet* staleSet = [NSSet setWithObject:it->second];
-            UIEvent* staleEvent = [[[UIEvent alloc] init] autorelease];
-            Input::getInput()->touchesEnded(staleSet, staleEvent);
+            pooledTouchSet()->_items.clear();
+            pooledTouchSet()->_items.push_back(it->second);
+            Input::getInput()->touchesEnded(pooledTouchSet(), pooledEvent());
             [it->second release];
             touches.erase(it);
         }
@@ -120,8 +137,10 @@ void eden_input_pointer_event(int phase, int identity, float x, float y) {
                   : (phase == 2) ? UITouchPhaseEnded
                                  : UITouchPhaseCancelled;
 
-    NSSet* set = [NSSet setWithObject:touch];
-    UIEvent* event = [[[UIEvent alloc] init] autorelease];
+    pooledTouchSet()->_items.clear();
+    pooledTouchSet()->_items.push_back(touch);
+    NSSet* set = pooledTouchSet();
+    UIEvent* event = pooledEvent();
 
     Input* input = Input::getInput();
     switch (phase) {
@@ -443,6 +462,11 @@ int eden_pick_block_at_crosshair(void) {
     // not just the initial palette) — and switches to build mode so a follow-up click places it.
     eden_set_hotbar_slot_type(hotbarIndex, type);
     World::getWorld->hud->blocktype = type;
+    // The 35-cell picker only ever sets a fixed color (0, or 20 for doors) since it picks from a
+    // fixed palette, not a placed block. This eyedropper picks a real in-world block, so carry its
+    // actual paint color along too — otherwise middle-click-picking a painted block silently drops
+    // the color and the next placed block comes out unpainted.
+    World::getWorld->hud->block_paintcolor = World::getWorld->terrain->getColor(point.x, point.z, point.y);
     World::getWorld->hud->mode = MODE_BUILD;
     return type;
 }

@@ -221,6 +221,31 @@ field at all. Both listeners now bail out via `isTypingTarget(document.activeEle
 when an `<input>`/`<textarea>`/`contentEditable` element has focus. Any future DOM
 text field inherits this for free; no per-field opt-in needed.
 
+## The engine's retina/quality swap is ignored on purpose (audit row 22 / B7)
+`World::update()` returns a bool meaning "swap graphics quality"; on iOS
+`EdenViewController.mm` answered it by flipping `IS_IPAD`/`IS_RETINA`/`SCALE_WIDTH`/
+`SCALE_HEIGHT` and recreating the framebuffer at the new density. **This port
+deliberately does neither**, and `EdenViewController_web::drawFrame()` carries the full
+reasoning. The short version, because it is the thing to understand before touching any
+UI layout here:
+
+> **`IS_IPAD`/`IS_RETINA`/`SCALE_*` are this port's layout coordinate system, not its
+> resolution.** `EAGLView_web`'s `establishScreenMetrics` pins a 568×320 point space at
+> 2× and the engine lays every HUD and menu element out in it; the real drawable is
+> decoupled entirely, via `applyDrawableSize()` (CSS box × `min(devicePixelRatio,
+> dpr_cap)` × `render_scale`). Flipping those globals does not make pixels cheaper — it
+> halves the UI's own layout math underneath an unchanged surface.
+
+The port already exposes the *intent* ("cheaper pixels") as two real settings,
+`render_scale` and `dpr_cap`. The branch used to flip the globals without recreating
+anything, which was the worst of both worlds; it is now an explicit no-op that announces
+itself once under `EDEN_DIAGNOSTICS` if it ever becomes reachable. It is unreachable
+today — `World::update` only requests a swap when `!bestGraphics`, and nothing in this
+port ever sets `LOW_MEM_DEVICE`/`LOW_GRAPHICS`, while `IS_WIDESCREEN` (pinned `TRUE` in
+the seam) forces `bestGraphics` back on regardless. Revisit only as part of audit row 18
+(D1, unpin the display constants) / row 22's successor D4 profiles, where it becomes a
+profile field rather than a per-frame branch.
+
 ## Known gaps
 - **World name display**: `Menu.mm` draws the "EDEN" wordmark, not the selected
   world's name — the actual name is drawn through a `statusbar` (custom-GL text, see
@@ -239,6 +264,59 @@ text field inherits this for free; no per-field opt-in needed.
   JS-owned keybind blob. (Corrupt-save recovery UI now exists — see "Load-failure
   recovery dialog" above and [save-load.md](save-load.md); first paint is now the boot
   progress screen, not a bare status line.)
+
+## `public/*.js` dependency graph (audit row I2)
+Twelve files, ~2.5 kLOC, loaded as plain `<script>` tags (no bundler, no `MODULARIZE`) sharing
+`window` globals — deliberate, not an oversight: the non-`MODULARIZE` `eden.js` output and the
+`vm.runInThisContext`-based headless harnesses (`tools/headless-*.js`) both depend on everything
+living in global scope, so a module system would need its own headless-compatible shim before it
+earned its keep. Load order in `eden-st.html` is therefore significant and is the actual dependency
+order — a file may only assume an earlier `<script>`'s global already exists:
+
+```
+eden-icons.js  →  eden-ui.js  →  eden-assets.js  →  eden-loading.js  →  eden-storage.js
+   →  eden-settings.js  →  eden-pausemenu.js  →  eden-loaderror.js  →  eden-menu.js
+   →  eden-gamepad.js  →  eden-console.js
+```
+
+Each file publishes exactly one `window.Eden*` namespace object (assigned once, at the bottom of an
+IIFE) and reads only the namespaces of files that loaded before it, plus the wasm boundary
+(`Module.*`/`FS.*`) and the engine-owned `window.EdenKeybinds` blob `eden-st.html` itself installs.
+`eden-ui.js`/`eden-icons.js`/`eden-assets.js` are the base layer every screen is built from and have
+no dependency on each other in that order (icons/assets are pure data; `eden-ui.js` is the factory
+library). `eden-gamepad.js` is the one leaf with no `Eden*` dependency at all — it only touches
+`navigator.getGamepads()` and the bridge object `eden-st.html` hands it.
+
+| File | Publishes | Reads (`Eden*`) | Reads (wasm/DOM boundary) |
+|---|---|---|---|
+| `eden-icons.js` | `EdenIcons` | — | — |
+| `eden-ui.js` | `EdenUI` | `EdenAssets`, `EdenIcons` | — |
+| `eden-assets.js` | `EdenAssets` | — | `Module.FS` |
+| `eden-loading.js` | `EdenLoading` | `EdenUI` | `Module.dataFileDownloads` |
+| `eden-storage.js` | `EdenStorage` | `EdenLoadError` (only inside a callback fired well after boot — see below) | `Module.preRun`, `FS.mount`/`mkdir`/`readFile`/`writeFile`/`syncfs`, `Module._eden_storage_list_worlds` |
+| `eden-settings.js` | `EdenSettings` | `EdenUI`, `EdenStorage`, `EdenConsole` (feature-detect only), `EdenKeybinds` | `Module._eden_settings_schema` |
+| `eden-pausemenu.js` | `EdenPauseMenu` | `EdenUI`, `EdenSettings`, `EdenAssets` | — |
+| `eden-loaderror.js` | `EdenLoadError` | `EdenUI`, `EdenPauseMenu.tick` (to suspend it while the dialog is up) | `FS.syncfs` |
+| `eden-menu.js` | `EdenMenu` | `EdenUI`, `EdenStorage`, `EdenAssets`, `EdenPauseMenu.tick` | — |
+| `eden-gamepad.js` | `EdenGamepad` | — | — (Gamepad API + a bridge object passed in by `eden-st.html`) |
+| `eden-console.js` | `EdenConsole` | `EdenUI` | — |
+| `eden-st.html` | `EdenRenderer`, `EdenKeybinds` | all of the above | `Module`, `FS`, everything else |
+
+**The one forward reference:** `eden-storage.js` (loaded 5th) calls `EdenLoadError.showStorageWarning`
+(defined 8th) from inside `checkQuotaAndWarn()`/`flushNow()`'s error callbacks. This is safe *only*
+because those callbacks fire asynchronously (a `syncfs` completion, a quota check after boot), by
+which point every `<script>` tag on the page has already run — load order guarantees definition
+order, not callback-firing order. Anything that instead calls a later file's global **synchronously**
+during its own top-level IIFE execution would break. If you add a new cross-file call, check whether
+it's reachable from the calling file's own script-execution time (breaks) or only from a later
+callback/event (safe).
+
+**What each file requires on `window` beyond `Eden*`:** every screen file also assumes
+`document`/`window` exist — none of the eleven `public/*.js` files are reachable from the headless
+harnesses (there is no `document` under `node eden.js`), which is exactly why `A8`'s
+`Module.__edenFramePost` hook and every headless suite in `tools/` test the *engine* side of a
+feature and leave the DOM layer for a live-browser pass. See audit rows G2/B8's "needs a live
+browser" notes for the concrete instances this has already blocked.
 
 ## Design notes
 Every DOM surface shares one visual language — chunky beveled "arcade cabinet"

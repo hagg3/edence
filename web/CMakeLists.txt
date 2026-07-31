@@ -38,8 +38,10 @@ set(EDEN_CLASSES_DIR "${EDEN_PARENT_DIR}/Classes")
 # thread-agnostic so this stays a build flag, not a rewrite."
 #
 # Audit row A1 (project-audit-2026-07-30.md): this option defaulted ON despite there being no
-# working host page for it — worker-bootstrap.js is a 38-line sketch, index.html is scaffolding,
-# and the OffscreenCanvas handshake in eden_main.cpp is still TODO D1. Every build anyone actually
+# working host page for it — worker-bootstrap.js was a 38-line sketch and index.html was
+# scaffolding, both deleted per audit row I5 (never ran against a real build; re-sketch when C1
+# actually starts), and the OffscreenCanvas handshake in eden_main.cpp is still TODO D1. Every
+# build anyone actually
 # runs (build-st, build-rel) passes -DEDEN_THREADED=OFF explicitly; a fresh clone running the
 # obvious `cmake ..`/`emcmake cmake -B build` got a target that links but cannot be played. The ON
 # path is real, in-development work (audit row C1, Opus 5 xhigh, 3-6 weeks) — it is not what a
@@ -143,9 +145,10 @@ set(EDEN_SEAM_EXCLUDE
   # (`[G_EAGL_VIEW insertSubview:atIndex:]`, Classes/VKeyboard.mm:85) to overlay a native
   # UITextField for world-renaming text entry — there is no such native-overlay concept on web
   # without a real DOM, so it's reclassified here as excluded/seam-replaced. TODO P3: a real
-  # HTML <input> positioned over the canvas (postMessage'd from src/entry, see
-  # public/worker-bootstrap.js sketch) is the natural web equivalent, matching the ORIGINAL's
-  # own "real native text field over the GL view" approach in spirit. NOT YET REPLACED this
+  # HTML <input> positioned over the canvas is the natural web equivalent, matching the
+  # ORIGINAL's own "real native text field over the GL view" approach in spirit (the D1 worker
+  # sketch this comment used to point at was deleted per audit row I5 — it never ran and predates
+  # the eventual D1 host page, which doesn't exist yet either). NOT YET REPLACED this
   # pass — no VKeyboard_web stub exists yet (out of this pass's scope, tracked as a P3 TODO).
   "Classes/VKeyboard.mm"
 )
@@ -646,15 +649,44 @@ if(EMSCRIPTEN)
     # silhouettes and nothing errors: Model.mm binds `getTex(SKIN_MOOF)->name`, which is 0 when
     # the PNG never loaded, and sampling an unbound texture unit yields (0,0,0,1). Measured, not
     # guessed — the shim's [eden-skin] probe reported boundTex=0 with every other uniform healthy.
-    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models@/bundle/media/models"
+    #
+    # Audit row B2: this used to be one `--preload-file media/models@/bundle/media/models` rule,
+    # which packaged the .pod files below a *second* time (file_packager has no per-rule exclude —
+    # `--exclude-file` patterns are matched against the same srcpath used by the flat .pod rules
+    # below, so a glob can't tell "this .pod via the directory walk" from "this .pod via its own
+    # explicit rule" apart; the only fix is to not hand the .pod files to the directory rule at
+    # all). Named individually here instead of via the directory so only the skin PNGs + MASKS/
+    # get packaged under /bundle/media/models — the .pod files are packaged exactly once, by their
+    # own flat rules just below.
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Moof_Default.png@/bundle/media/models/Moof_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Moof_Blink.png@/bundle/media/models/Moof_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Moof_Rage.png@/bundle/media/models/Moof_Rage.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Batty_Default.png@/bundle/media/models/Batty_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Batty_Blink.png@/bundle/media/models/Batty_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Batty_Rage.png@/bundle/media/models/Batty_Rage.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Green_Default.png@/bundle/media/models/Green_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Green_Blink.png@/bundle/media/models/Green_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Green_Rage.png@/bundle/media/models/Green_Rage.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Nergle_Default.png@/bundle/media/models/Nergle_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Nergle_Blink.png@/bundle/media/models/Nergle_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Nergle_Rage.png@/bundle/media/models/Nergle_Rage.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Stumpy_Default.png@/bundle/media/models/Stumpy_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Stumpy_Blink.png@/bundle/media/models/Stumpy_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Stumpy_Rage.png@/bundle/media/models/Stumpy_Rage.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Charger_Default.png@/bundle/media/models/Charger_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Charger_Blink.png@/bundle/media/models/Charger_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Charger_Rage.png@/bundle/media/models/Charger_Rage.png"
+    # Stalker has no *_Rage.png on disk (only Default/Blink) — not a gap this change introduces.
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Stalker_Default.png@/bundle/media/models/Stalker_Default.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Stalker_Blink.png@/bundle/media/models/Stalker_Blink.png"
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/MASKS@/bundle/media/models/MASKS"
     # Creature models (pass 27). Classes/World.mm:389 calls LoadModels([[NSBundle mainBundle]
     # resourcePath] + "/"), and CPVRTResourceFile fopen()s <readPath><basename> — so these must
     # land at /bundle/<Name>.pod, FLAT, not under /bundle/media/models. That is also what Xcode's
     # Copy-Bundle-Resources phase does on device (it flattens the whole media/ tree), so naming
     # each file individually here reproduces the real bundle layout rather than inventing one.
-    # ~1.6 MB total, hence preloaded rather than lazily fetched. (The .pod files are therefore
-    # packaged twice — once here, once inside the media/models preload above, which is there for
-    # the skin PNGs. Trading 1.5 MB for two one-line rules beats a per-file PNG list.)
+    # ~1.6 MB total, hence preloaded rather than lazily fetched. Packaged exactly once now (B2) —
+    # the skin-PNG rules above no longer pull these in a second time via their parent directory.
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Moof.pod@/bundle/Moof.pod"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Batty.pod@/bundle/Batty.pod"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/models/Green.pod@/bundle/Green.pod"

@@ -44,33 +44,51 @@
 // a smaller power saving is not.
 extern "C" int eden_get_fps_cap(void);
 
-static void eden_frame_tick() {
-    eden_web::EdenAppDelegate* app = eden_web::eden_seam_get_app_delegate();
-    if (!app) return;
-    if (!app->viewController.isAnimating()) return;
-
-    bool renderThisFrame = true;
-
 #ifdef __EMSCRIPTEN__
-    int capFps = eden_get_fps_cap();
-    if (capFps > 0) {
-        static double lastRenderMs = 0.0;
-        double now = emscripten_get_now();
-        double minInterval = 1000.0 / (double)capFps;
-        if (lastRenderMs != 0.0 && now - lastRenderMs < minInterval) {
-            renderThisFrame = false;
-        } else {
-            lastRenderMs = now;
-        }
-    }
+// Audit row A8: public/eden-st.html's trackCursorNeed used to be a SECOND, independent rAF chain
+// reading/writing pointer-lock state, crosshair visibility and drawable size — registered
+// separately from emscripten_set_main_loop, so its ordering relative to the engine's own tick
+// within a frame was whatever registration order happened to land on, producing one-frame-latency
+// cursor/lock quirks. Calling this at the tail of every eden_frame_tick() instead means the page's
+// per-frame DOM work always runs in the SAME callback, right after whatever this tick did to the
+// engine, with no second scheduler in the loop. `Module.__edenFramePost` is optional so headless
+// runs (no `window`/no hook installed) are a plain no-op.
+EM_JS(void, eden_frame_post_hook, (), {
+    if (Module.__edenFramePost) Module.__edenFramePost();
+});
 #endif
 
-    app->viewController.drawFrame(renderThisFrame);
-    // TODO P2: react to a true return (retina/graphics-quality swap requested) by actually
-    // recreating the WebGL2 context at the new pixel density via EAGLView_web's
-    // create/deleteFramebuffer — EdenViewController_web::drawFrame() already flips the
-    // IS_RETINA/SCALE_WIDTH/SCALE_HEIGHT globals (CLAUDE.md convention #3), this loop just
-    // doesn't act on the flip yet.
+static void eden_frame_tick() {
+    eden_web::EdenAppDelegate* app = eden_web::eden_seam_get_app_delegate();
+    if (app && app->viewController.isAnimating()) {
+        bool renderThisFrame = true;
+
+#ifdef __EMSCRIPTEN__
+        int capFps = eden_get_fps_cap();
+        if (capFps > 0) {
+            static double lastRenderMs = 0.0;
+            double now = emscripten_get_now();
+            double minInterval = 1000.0 / (double)capFps;
+            if (lastRenderMs != 0.0 && now - lastRenderMs < minInterval) {
+                renderThisFrame = false;
+            } else {
+                lastRenderMs = now;
+            }
+        }
+#endif
+
+        app->viewController.drawFrame(renderThisFrame);
+        // The bool it returns is the engine's retina/graphics-quality swap request. Deliberately
+        // not acted on — audit row 22 (B7), resolved as an explicit no-op; the full reasoning is
+        // at the matching block in EdenViewController_web::drawFrame(). Short version: this port's
+        // IS_IPAD/SCALE_* globals are its LAYOUT point space, not its resolution (that is
+        // applyDrawableSize + render_scale + dpr_cap), so honouring the swap would move the HUD's
+        // coordinate system out from under an unchanged drawable. Revisit only with row 18 (D1).
+    }
+
+#ifdef __EMSCRIPTEN__
+    eden_frame_post_hook();
+#endif
 }
 
 #if defined(__EMSCRIPTEN__) && defined(EDEN_DIAGNOSTICS)

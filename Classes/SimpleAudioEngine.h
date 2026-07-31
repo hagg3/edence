@@ -177,6 +177,21 @@ public:
     */
     void setEffectsVolume(float volume);
 
+    // Web port only (src/seam/SimpleAudioEngine_web.mm): four independent ambience layers, each on
+    // its own playback channel, separate from background music. layer: 0=bed (underwater/sky-high/
+    // cave/open/biome/night — mutually exclusive), 1=proximity (water/lava adjacency, independent
+    // fade), 2=portal proximity, 3=treasure-cube proximity (2 and 3 are single-file on/off fades,
+    // see Resources::soundEventPortalProximity/soundEventTreasureProximity).
+    // No iOS implementation — Classes/SimpleAudioEngine.mm is excluded from the web build.
+    void playAmbience(int layer, const char* pszFilePath, bool bLoop);
+    void stopAmbience(int layer);
+    bool isAmbiencePlaying(int layer);
+    // engine-driven, per-frame distance/crossfade value; multiplied with the user's slider.
+    void setAmbienceFade(int layer, float fade);
+    // user-facing slider (Settings), 0.0~1.0, shared by all four ambience layers.
+    float getAmbienceVolume();
+    void setAmbienceVolume(float volume);
+
     // for sound effects
     /**
     @brief Play sound effect

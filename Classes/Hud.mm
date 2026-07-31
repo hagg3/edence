@@ -526,8 +526,11 @@ BOOL Hud::update(float etime){
 
         
 		if(delayedaction==6){
-			World::getWorld->terrain->warpToHome();
+            // Play before warpToHome(): it calls loadTerrain(), which sets firstframe=TRUE for the
+            // rest of this frame, and Resources::playSound drops everything while firstframe is set
+            // -- called after, this sound was silently discarded every time.
             Resources::getResources->playSound(S_WARP_HOME_ACTIVATED);
+			World::getWorld->terrain->warpToHome();
 			sb->clear();
 		}else if(delayedaction==5){
             mode=MODE_NONE;
@@ -794,7 +797,17 @@ BOOL Hud::update(float etime){
     
 	/*
      */
+    // m_jump is re-derived from touches every frame (level, not edge -- it stays TRUE every frame
+    // the button is held), so the press/release sounds below need their own prev-frame latch.
+    // touchControlsSoundEnabled (Settings) gates both this and the joystick begin/release sounds,
+    // default off; jumpIsRealTouch additionally makes sure the sounds only fire for an actual
+    // touchscreen tap on the button, never a keyboard-synthesized press (isRealTouch is FALSE for
+    // Input_web.mm's synthetic kJumpTouchIdentity touch that drives Space, same for mouse/HUD-tap
+    // identities) -- so e.g. Space-to-jump on desktop stays silent even with the setting on.
+    BOOL wasJumpPressed=m_jump;
+    static BOOL jumpIsRealTouch=FALSE;
 	m_jump=FALSE;
+    BOOL jumpTouchReal=FALSE;
 	for(int i=0;i<MAX_TOUCHES;i++){
 		if((touches[i].inuse==0||touches[i].inuse==usage_id)&&touches[i].down==M_DOWN){
 			if(inbox2(touches[i].mx,touches[i].my,&rjumphit)){
@@ -805,11 +818,21 @@ BOOL Hud::update(float etime){
 				NSLog(@"attenuation: %f",test_a);
 				touches[i].inuse=usage_id;
 				NSLog(@"set touch %d to uid %d",touches[i].touch_id,usage_id);
+                if(touches[i].touch_id&&[touches[i].touch_id isRealTouch])jumpTouchReal=TRUE;
 			}
 
 		}
 
 	}
+    extern BOOL touchControlsSoundEnabled;
+    if(m_jump&&!wasJumpPressed){
+        jumpIsRealTouch=jumpTouchReal;
+        if(jumpIsRealTouch&&touchControlsSoundEnabled)
+            Resources::getResources->playSound(S_JUMP_BUTTON_PRESS);
+    }else if(!m_jump&&wasJumpPressed){
+        if(jumpIsRealTouch&&touchControlsSoundEnabled)
+            Resources::getResources->playSound(S_JUMP_BUTTON_RELEASE);
+    }
 
 	m_crouch=FALSE;
 	extern BOOL CROUCH_ENABLED;

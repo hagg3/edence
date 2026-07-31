@@ -1,5 +1,7 @@
 // eden-pausemenu.js — the in-game pause menu (pass 30; restyled onto the Eden: Community Edition
 // design system).
+// Requires: window.EdenUI, window.EdenSettings, window.EdenAssets. Publishes: window.EdenPauseMenu.
+// See docs/ui.md's dependency graph (audit I2).
 //
 // Replaces the engine's own tiny 4-icon in-game menu (Hud::renderMenuScreen — Save/Warp
 // home/Take photo/Save & exit, opened by tapping the corner icon while playing,
@@ -57,7 +59,7 @@
   function takePhoto() { tapHudButton(5); close(); }
   function quitToMenu() { tapHudButton(6); close(); }
 
-  function openSettingsFromHere() {
+  function openSettingsFromHere(group) {
     if (!window.EdenSettings) return;
     // Unlike Resume/Save/Warp Home/Take Photo/Quit above (all real taps on an engine HUD rect,
     // which already got S_MENU_BUTTON_PRESS/RELEASE in pass 39 — Classes/Hud.mm), this button has
@@ -66,8 +68,14 @@
     S.settingsWasOpenedFromHere = true;
     hide();
     S.open = false;   // so tick()'s (engineWants && !S.open) re-opens us once Settings closes
-    window.EdenSettings.open();
+    window.EdenSettings.open(group);
   }
+
+  // Audit row G1 (control discoverability): jumps straight to the Keys tab instead of whatever
+  // tab Settings last had open, and — since that tab lists key->action only, nothing about mouse
+  // look or touch chrome — the panel's Keys tab already carries the keybind list; this button just
+  // gets the player there in one click instead of Settings -> tab-click.
+  function openControls() { openSettingsFromHere('Keys'); }
 
   function build() {
     var UI = window.EdenUI;
@@ -99,7 +107,8 @@
     stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconSave, label: 'Save Game', onClick: saveGame }));
     stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconHome, label: 'Warp Home', onClick: warpHome }));
     stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconCamera, label: 'Take Photo', onClick: takePhoto }));
-    stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconSettings, label: 'Settings', onClick: openSettingsFromHere }));
+    stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconSettings, label: 'Settings', onClick: function () { openSettingsFromHere(); } }));
+    stack.appendChild(UI.button({ size: 'md', icon: 'keyboard', label: 'Controls', onClick: openControls }));
     stack.appendChild(UI.button({ size: 'md', tone: 'danger', iconImg: A.NAMES.iconQuit, label: 'Quit to Menu', onClick: quitToMenu }));
     win.content.appendChild(stack);
 

@@ -66,6 +66,22 @@ void Portal::removePortal(int x,int y,int z){
 void Portal::removeAllPortals(){
     n_portal=0;
 }
+BOOL Portal::nearestPortal(Vector pos,Vector* outPos){
+    if(n_portal==0)return FALSE;
+    int best=-1;
+    float bestd2=0;
+    for(int i=0;i<n_portal;i++){
+        float dx=portals[i].x+.5f-pos.x;
+        float dy=portals[i].y+.5f-pos.y;
+        float dz=portals[i].z+.5f-pos.z;
+        float d2=dx*dx+dy*dy+dz*dz;
+        if(best==-1||d2<bestd2){best=i;bestd2=d2;}
+    }
+    outPos->x=portals[best].x+.5f;
+    outPos->y=portals[best].y+.5f;
+    outPos->z=portals[best].z+.5f;
+    return TRUE;
+}
 extern float yawanimation;
 Vector2 Portal::enterPortal(int x,int y,int z,Vector vel){
     Vector2 vec;

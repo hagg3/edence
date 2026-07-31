@@ -5,6 +5,9 @@
 // reading garbage. This file just polls the resulting flag and shows a DOM panel, same shape as
 // eden-pausemenu.js: no engine state of its own, built from the shared design system.
 //
+// Requires: window.EdenUI, window.EdenPauseMenu (its .tick is suspended while this dialog is up),
+// FS.syncfs. Publishes: window.EdenLoadError. See docs/ui.md's dependency graph (audit I2).
+//
 // There is no "resume" out of this dialog — by the time eden_load_failed() is true, loadWorld()
 // has already bailed out with the terrain cleared and no valid world loaded, so the only sane
 // actions are: restore the `.bak` backup slot and retry, or go back to the menu and pick something
@@ -129,8 +132,62 @@
     }
   }
 
+  // Audit row A7: a second, lighter-weight dialog for "your save may not have persisted" (quota
+  // exceeded / any other syncfs error), called from eden-storage.js. Unlike the load-failure
+  // dialog above this is a warning, not a fatal state — the game keeps running underneath, so it
+  // gets its own non-alertdialog role and a dismiss button instead of forcing a reload.
+  var Q = { open: false, root: null, releaseFocus: null };
+
+  function dismissStorageWarning() {
+    if (!Q.root) return;
+    if (Q.releaseFocus) Q.releaseFocus();
+    Q.root.remove();
+    Q.root = null;
+    Q.open = false;
+  }
+
+  function showStorageWarning(message) {
+    if (Q.root) return; // one at a time; reportSyncError/checkQuotaAndWarn already dedupe upstream
+    var UI = window.EdenUI;
+    UI.ensureCSS();
+
+    var scrim = UI.scrim({ id: 'eden-storagewarn-backdrop' });
+    scrim.style.zIndex = 'var(--eden-z-alert)';
+    // Dismissible (unlike the load-failure dialog): this is a warning the player can act on later,
+    // not a state the engine is stuck in.
+    scrim.addEventListener('mousedown', function (e) {
+      if (e.target === scrim) dismissStorageWarning();
+    });
+
+    var win = UI.window({
+      title: 'Storage warning',
+      variant: 'dialog',
+      scrollbar: false,
+      role: 'alertdialog',
+    });
+    var warn = UI.icon('alert-triangle', { title: 'Warning' });
+    warn.style.width = 'calc(24 * var(--u))';
+    warn.style.height = 'calc(24 * var(--u))';
+    win.actions.appendChild(warn);
+
+    var stack = UI.el('div', 'eden-stack');
+    stack.appendChild(UI.el('p', 'eden-stack__text', message));
+    stack.appendChild(UI.button({
+      size: 'md', tone: 'positive', label: 'Dismiss', onClick: dismissStorageWarning,
+    }));
+    win.content.appendChild(stack);
+
+    scrim.appendChild(win.root);
+    UI.bindButtonSounds(scrim);
+    document.body.appendChild(scrim);
+    Q.root = scrim;
+    Q.open = true;
+    Q.releaseFocus = window.EdenUI.trapFocus(scrim);
+  }
+
   window.EdenLoadError = {
     tick: tick,
-    isOpen: function () { return S.open; }
+    isOpen: function () { return S.open; },
+    showStorageWarning: showStorageWarning
   };
 })();

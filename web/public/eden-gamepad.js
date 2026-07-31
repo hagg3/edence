@@ -1,4 +1,7 @@
 // eden-gamepad.js — Gamepad API support for the Eden web port.
+// Requires: nothing from window.Eden* (the one dependency-free leaf) — only navigator.getGamepads()
+// and the bridge object eden-st.html passes at init. Publishes: window.EdenGamepad. See docs/ui.md's
+// dependency graph (audit I2).
 //
 // Perf-audit row #24 ("Gamepad, VKeyboard, networking"): the audit's own note was that
 // `Classes/Gamepad.mm` already compiles and "the Gamepad API maps cleanly onto the same

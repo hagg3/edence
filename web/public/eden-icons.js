@@ -1,4 +1,5 @@
 // eden-icons.js — the port's icon set, as inline SVG.
+// Requires: nothing. Publishes: window.EdenIcons. See docs/ui.md's dependency graph (audit I2).
 //
 // WHY INLINE SVG AND NOT PNGs: the source Figma types its sidebar icons as literal Apple SF
 // Symbols private-use characters ("喇" et al) in the "SF Pro" font — an iOS-only, closed-

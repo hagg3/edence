@@ -40,6 +40,7 @@ public:
     Texture2D* getMenuTex(int idx);
     int getSkin(int model_type,int color,int state);
     int playSound(int soundid);
+    int playLoopedSound(int soundid);
     int startedBurn(float length);
     void endBurnId(int idx);
     void stopSound(int soundId);
@@ -52,8 +53,16 @@ public:
     void update(float etime);
     void playMenuTune();
     void stopMenuTune();
-    void soundEvent(int actionid);
-    void soundEvent(int actionid,Vector location);
+    void soundEventBed(int actionid);
+    void soundEventBed(int actionid,Vector location);
+    void soundEventProximity(int actionid);
+    void soundEventProximity(int actionid,Vector location);
+    // Two more independent point-source proximity ambiences, each its own channel (see
+    // docs/resources-and-audio.md) so they never fight the bed/water-lava-proximity layers or each
+    // other. Unlike soundEventProximity these aren't part of the AMBIENT_* enum/ambientFiles table --
+    // just an on/off + a location, since each is always the same single file.
+    void soundEventPortalProximity(BOOL active,Vector location);
+    void soundEventTreasureProximity(BOOL active,Vector location);
     int getDoorTex(int color);
     Texture2D* getPaintTex(int color);
     Texture2D* getPaintedTex(int type,int color);
@@ -103,7 +112,7 @@ private:
 #define VO_EXCITED 8
 #define VO_ANGRY 0
 
-#define NUM_SOUNDS 64
+#define NUM_SOUNDS 73
 
 enum SOUND_TYPES{
     S_LADDER=0,
@@ -176,6 +185,22 @@ enum SOUND_TYPES{
     // IDs instead, so ordinary button clicks never roll them.
     S_SWITCH_TOGGLE_ON=62,
     S_SWITCH_TOGGLE_OFF=63,
+    // Wired up from previously-unused media/sound/game + media/new_sound files (see
+    // docs/resources-and-audio.md). S_ICE_LOOP_* are picked by Player::move based on the player's
+    // current ice-sliding speed (see the [S_ICE_LOOP_SLOW..FAST] comment in Resources.mm); S_ICE_TURN
+    // fires on the existing 45-degree auto-turn detection at ice wedges/ramps.
+    S_ICE_LOOP_SLOW=64,
+    S_ICE_LOOP_MEDIUM=65,
+    S_ICE_LOOP_FAST=66,
+    S_ICE_TURN=67,
+    // Touch-only on-screen controls (Joystick.mm / Hud.mm's jump button) — no equivalent for
+    // keyboard/gamepad input, which never had press/release sounds to begin with.
+    S_JOYSTICK_BEGIN=68,
+    S_JOYSTICK_RELEASE=69,
+    S_JUMP_BUTTON_PRESS=70,
+    S_JUMP_BUTTON_RELEASE=71,
+    // Played once, randomly, when a new world is successfully created (Hud::handlePickMenu).
+    S_MODE_SELECTION=72,
 };
 enum MENU_TYPES{
 	MENU_AUTOJUMP=0,

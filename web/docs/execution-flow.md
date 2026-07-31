@@ -31,9 +31,30 @@ otherwise never runs the routine at all (this used to freeze "click to load a wo
 forever — `doneLoading` never advanced past 1). Two constraints on this file: it must
 not link into the threaded build (`if(NOT EDEN_THREADED)`, `CMakeLists.txt:331-333`,
 would collide with real pthreads), and it must stay plain C, not `.mm` — a
-`prefix-header`/`-x objective-c++` treatment would break it. Consequence: in
-`build-st`, world load **freezes the main thread synchronously** for its duration —
-no progress UI, a real risk of a mobile browser tab-killing an unresponsive page.
+`prefix-header`/`-x objective-c++` treatment would break it. Consequence: world load
+blocks the main thread for its whole duration, with no progress UI.
+
+**How long, measured (2026-07-31, `tools/headless-load-timing.js`, 3 runs each):**
+
+| build | contiguous main-thread block during a world load |
+|---|---|
+| `build-rel` (what players run) | **20–27 ms** |
+| `build-st` (debug, ~2.5× slower) | **51–62 ms** |
+
+That is one dropped frame in release — not the tab-killing freeze this paragraph used
+to claim, and not what project-audit row 9 (A6) assumed when it rated the fix Opus 5
+(high) and gated the whole threaded build behind it. The load is **bounded by
+construction**: it is always the same 324 columns of the toroidal window (18×18 at
+32 KB), whatever the size of the save file, so it does not grow with playtime. Re-run
+the tool before acting on any claim to the contrary — including this one.
+
+The part that *can* still get slow is not CPU: on a host that honours HTTP `Range`,
+the lazy `Eden.eden` FS node issues **18 synchronous XHRs during the load**, i.e. 18
+round trips of dead main thread. Invisible under node (`fs.readSync`) and on
+localhost, and the deployed site never takes that path at all (GitHub Pages ignores
+`Range`, so it uses the eager whole-file fallback — audit row A11). If this port is
+ever hosted somewhere that does serve ranges, attack it with read-ahead in the FS
+node, not by restructuring the engine's load.
 
 ## Boot order (the gotcha that matters)
 `Module.onRuntimeInitialized` fires **before** `main()` runs. `main()` asserts screen

@@ -8,6 +8,9 @@
 // system, self-contained. Unlike the pause menu/settings panel, nothing here mirrors a per-frame
 // engine flag, so there is no tick() to wire into eden-st.html's rAF loop — this is purely a
 // keypress-toggled overlay.
+//
+// Requires: window.EdenUI. Publishes: window.EdenConsole. See docs/ui.md's dependency graph
+// (audit I2).
 (function () {
   'use strict';
 
@@ -45,9 +48,10 @@
     var parts = line.split(/\s+/);
     var cmd = parts[0].toLowerCase();
     if (cmd === 'help') {
-      appendLine('tp <x> <y> <z>   teleport (y is up)');
-      appendLine('spawn <type>     spawn a creature at your position (numeric TYPE_*/M_* id)');
-      appendLine('stats            world/player snapshot');
+      appendLine('tp <x> <y> <z>          teleport (y is up)');
+      appendLine('spawn <type>            spawn a creature at your position (numeric TYPE_*/M_* id)');
+      appendLine('setblock <x> <z> <y> <t> set a block (Terrain arg order — y is still up, but last)');
+      appendLine('stats                   world/player snapshot');
       return;
     }
     if (cmd === 'tp') {
@@ -65,6 +69,17 @@
       if (!isFinite(type)) { appendLine('usage: spawn <type>', true); return; }
       var ok = M()._eden_console_spawn(type) !== 0;
       appendLine(ok ? ('spawned type ' + type) : 'spawn failed (bad type, or no free creature slot)', !ok);
+      return;
+    }
+    if (cmd === 'setblock') {
+      var bx = parseInt(parts[1], 10), bz = parseInt(parts[2], 10),
+          by = parseInt(parts[3], 10), bt = parseInt(parts[4], 10);
+      if ([bx, bz, by, bt].some(function (n) { return !isFinite(n); })) {
+        appendLine('usage: setblock <x> <z> <y> <type>', true);
+        return;
+      }
+      var setOk = M()._eden_console_setblock(bx, bz, by, bt) !== 0;
+      appendLine(setOk ? ('set (' + bx + ',' + bz + ',' + by + ') = type ' + bt) : 'setblock failed', !setOk);
       return;
     }
     if (cmd === 'stats') {
@@ -89,7 +104,7 @@
 
     var input = UI.el('input', 'eden-field');
     input.type = 'text';
-    input.placeholder = 'help / tp x y z / spawn <type> / stats';
+    input.placeholder = 'help / tp x y z / spawn <type> / setblock x z y t / stats';
     input.autocomplete = 'off';
     input.spellcheck = false;
     input.addEventListener('keydown', function (e) {
@@ -141,5 +156,5 @@
     show();
   });
 
-  window.EdenConsole = { show: show, hide: hide, isOpen: function () { return S.open; } };
+  window.EdenConsole = { show: show, hide: hide, isOpen: function () { return S.open; }, available: available };
 })();

@@ -1,5 +1,8 @@
 // eden-settings.js — the port's settings panel (pass 28; restyled onto the Eden: Community
 // Edition design system).
+// Requires: window.EdenUI, window.EdenStorage, window.EdenKeybinds, window.EdenConsole
+// (feature-detected only), Module._eden_settings_schema. Publishes: window.EdenSettings. See
+// docs/ui.md's dependency graph (audit I2).
 //
 // Replaces the engine's GL settings screen (Classes/SettingsMenu.mm, whose update()/render() are
 // --wrap'd to no-ops — see web/src/seam/Settings_web.mm for why the data half of that class is
@@ -269,6 +272,17 @@
       pad.appendChild(UI.listRow({ title: 'Keybinds unavailable' }));
       return;
     }
+    // Audit row G1: this tab is the only controls reference in the game, and pointer lock has no
+    // other affordance telling a first-time desktop player it exists.
+    pad.appendChild(UI.el('div', 'eden-section__desc',
+      'Click the game world to look around with the mouse. Press Esc to release it.'));
+    // Audit row F5 follow-up: the dev console has no other discoverability affordance — it's a
+    // hardcoded key, not part of the KB.actions rebind table below, and its own feature-detect
+    // means it's silently absent on a non-diagnostics build, so only mention it when it's real.
+    if (window.EdenConsole && window.EdenConsole.available()) {
+      pad.appendChild(UI.el('div', 'eden-section__desc',
+        'Press ` (backtick) to open the dev console.'));
+    }
     KB.actions.forEach(function (action) {
       var btn = UI.button({ size: 'sm', label: keyLabel(KB.primaryCode(action)) });
       btn.addEventListener('click', function () {
@@ -446,11 +460,15 @@
     return scrim;
   }
 
-  function open() {
+  // group: optional — jump straight to a tab (e.g. 'Keys') instead of remembering the last one
+  // open. Added for the pause menu's "Controls" shortcut (audit row G1); every other caller keeps
+  // passing nothing, which preserves the old "reopens on whatever tab you left" behaviour.
+  function open(group) {
     if (S.open || !ready()) return;
     injectCSS();
     if (!ensureSchema()) return;
-    if (!S.group) S.group = S.schema.length ? S.schema[0].group : null;
+    if (group) S.group = group;
+    else if (!S.group) S.group = S.schema.length ? S.schema[0].group : null;
     document.body.appendChild(buildShell());
     renderTabs();
     renderBody();

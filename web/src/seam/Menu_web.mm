@@ -246,6 +246,7 @@ int eden_menu_create_world(void) {
     m->selected_world = nw;
     m->refreshfn();
     g_name_buf[0] = 0;
+    Resources::getResources->playSound(S_MODE_SELECTION);
     return eden_menu_selected_index();
 }
 

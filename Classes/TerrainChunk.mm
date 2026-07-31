@@ -552,15 +552,38 @@ int TerrainChunk::rebuild2(){   //here be dragons//
                             objects[objidx].type=TYPE_DOOR_TOP;
                             objects[objidx].dir=getLandc(x+pbounds[0],z+pbounds[2],y+pbounds[1]-1)-TYPE_DOOR1;
                             objects[objidx].dir=ABS(objects[objidx].dir)%4;
-                            objects[objidx].rot=M_PI/2;
-                            objects[objidx].ani=0;
                             objects[objidx].pos.x=x+pbounds[0];
                             objects[objidx].pos.y=y-1+pbounds[1];
                             objects[objidx].pos.z=z+pbounds[2];
-                            
+                            {
+                                // This StaticObject is rebuilt from scratch on every remesh of this
+                                // chunk (initial streaming in AND any nearby block edit dirtying
+                                // it, not just an actual door open/close) -- ani/rot used to be
+                                // hardcoded to 0/M_PI/2 regardless of the player's actual position,
+                                // a value distinct from both real states (-1 open, 1 closed), so
+                                // Terrain::render's prev_ani!=ani transition check always fired a
+                                // door sound once per remesh. Seed both to match render()'s own
+                                // distance test instead, so a remesh near an already-open (or
+                                // already-closed) door doesn't sound like it just opened/closed.
+                                Vector ppos=World::getWorld->player->pos;
+                                Vector v1;
+                                v1.x=objects[objidx].pos.x+.5f;
+                                v1.z=objects[objidx].pos.z+.5f;
+                                v1.y=ppos.y;
+                                Vector vdist=v_sub(ppos,v1);
+                                int ddist=v_length2(vdist);
+                                if(ppos.y>=objects[objidx].pos.y&&ppos.y<=objects[objidx].pos.y+2&&ddist<2*2){
+                                    objects[objidx].ani=-1;
+                                    objects[objidx].rot=0;
+                                }else{
+                                    objects[objidx].ani=1;
+                                    objects[objidx].rot=M_PI/2;
+                                }
+                            }
+
                           // printg("door[%d] %f, %f, %f \n", objidx, objects[objidx].pos.x,  objects[objidx].pos.y,  objects[objidx].pos.z);
 
-                            
+
                             objidx++;
                         }else if(type==TYPE_GOLDEN_CUBE){
                             // printg("got cube\n");

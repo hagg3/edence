@@ -32,6 +32,9 @@ public:
     void removePortal(int x,int y,int z);
     void removeAllPortals();
     Vector2 enterPortal(int x,int y,int z,Vector vel);
+    // Nearest portal to `pos` (block centers), for the proximity-ambience distance fade -- returns
+    // FALSE (leaving *outPos untouched) when the world has no portals at all.
+    BOOL nearestPortal(Vector pos,Vector* outPos);
 private:
    int n_portal;
    sportal portals[MAX_PORTAL];

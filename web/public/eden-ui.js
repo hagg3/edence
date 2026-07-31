@@ -1,4 +1,6 @@
 // eden-ui.js — the runtime half of the Eden design system (public/eden-ui.css is the other half).
+// Requires: window.EdenAssets, window.EdenIcons (loaded before this in eden-st.html). Publishes:
+// window.EdenUI. See docs/ui.md's dependency graph (audit I2).
 //
 // Every DOM surface in the port builds itself from the factories here rather than hand-assembling
 // elements and class strings, so a change to what a "button" or a "window" is happens in exactly

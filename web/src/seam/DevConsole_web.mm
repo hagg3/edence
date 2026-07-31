@@ -44,6 +44,23 @@ int eden_console_spawn(int type) {
     return SpawnCreatureAt(type, World::getWorld->player->pos) ? 1 : 0;
 }
 
+// setblock x z y type — Terrain's own (x,z,y) argument order (CLAUDE.md #1), NOT Vector's.
+// Calls Terrain::updateChunks, the same dirty-marking entry point Player::processInput's
+// buildBlock eventually reaches (CLAUDE.md's "Trace a block edit"), skipping only buildBlock's
+// own HUD-coupled side effects (golden-cube inventory, liquid sources, ramp/door orientation
+// inference) that a console-driven edit has no HUD state to draw from. This is what makes a
+// block edit possible from a script with no camera/raycast — added alongside the other three
+// console commands to give tools/headless-save-roundtrip-test.js (audit row I6) something
+// deterministic to edit before it saves, since a pristine unedited world has NO block data of
+// its own to round-trip (unmodified terrain streams from the bundled Eden.eden by seed, per
+// docs/eden-file-format.md — only touched columns are ever appended to a save file).
+EMSCRIPTEN_KEEPALIVE
+int eden_console_setblock(int x, int z, int y, int type) {
+    if (!World::getWorld || !World::getWorld->terrain) return 0;
+    World::getWorld->terrain->updateChunks(x, z, y, type);
+    return 1;
+}
+
 // stats — read-only snapshot for the console's "stats" command. Static buffer, JSON, same
 // convention as DebugState_web.mm's probes and Settings_web.mm's schema export.
 EMSCRIPTEN_KEEPALIVE

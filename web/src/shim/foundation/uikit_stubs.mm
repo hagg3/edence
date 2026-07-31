@@ -1,9 +1,12 @@
 #import "uikit_stubs.h"
 
+#include <stdlib.h>   // malloc/free — CGImage's own storage (audit row 11 / A5)
+
 @implementation UITouch
 - (CGPoint)locationInView:(UIView *)view { (void)view; return _location; }
 - (UITouchPhase)phase { return _phase; }
 - (double)timestamp { return _timestamp; }
+- (BOOL)isRealTouch { return ((long)_identity) >= 0; }
 // Explicit getter rather than @synthesize: the `view` property exists only so Input.mm's
 // `touch.view` dot syntax parses (see uikit_stubs.h), and it feeds straight back into
 // -locationInView:, which ignores it. Writing the getter by hand also avoids depending on
@@ -15,17 +18,38 @@
 @end
 
 @implementation UIImage
-// TODO P2 — every one of these needs the Canvas2D/OffscreenCanvas raster path (Texture2D_web.mm).
-// Returning nil/zero rather than aborting is deliberate: the engine's texture setup runs during
-// world load, and a hard failure here would stop P1's headless tick from ever being reached.
-// Missing textures are visible and diagnosable; an abort at load is not.
+// Real since audit row 11 (A5) — see uikit_stubs.h for the representation and why the ivars are
+// POD. The two remaining stubs have no engine call site on any live path; they still return nil
+// rather than aborting, for the reason the original comment gave: texture setup runs during world
+// load, and a hard failure there stops the port from ever reaching a first frame. A missing
+// texture is visible and diagnosable; an abort at load is not.
 + (UIImage *)imageNamed:(NSString *)name { (void)name; return nil; }
 + (UIImage *)imageWithContentsOfFile:(NSString *)path { (void)path; return nil; } // P4: dead-code link stub
-+ (UIImage *)imageWithCGImage:(CGImageRef)cgImage { (void)cgImage; return nil; }
-- (CGImageRef)CGImage { return 0; }
-- (UIImageOrientation)imageOrientation { return (UIImageOrientation)0; }
-- (CGSize)size { CGSize z; z.width = 0; z.height = 0; return z; }
-- (void)drawInRect:(CGRect)rect { (void)rect; }
+- (id)initWithCGImage:(CGImageRef)cgImage {
+    self = [super init];
+    if (self) {
+        _cgImage = cgImage;                  // ownership transfers; -dealloc releases it
+        _orientation = UIImageOrientationUp;
+    }
+    return self;
+}
++ (UIImage *)imageWithCGImage:(CGImageRef)cgImage {
+    return [[[UIImage alloc] initWithCGImage:cgImage] autorelease];
+}
+- (CGImageRef)CGImage { return _cgImage; }
+- (UIImageOrientation)imageOrientation { return _orientation; }
+- (CGSize)size {
+    CGSize z;
+    z.width = _cgImage ? (float)_cgImage->width : 0.0f;
+    z.height = _cgImage ? (float)_cgImage->height : 0.0f;
+    return z;
+}
+- (void)drawInRect:(CGRect)rect { (void)rect; }   // TODO P2 — no engine call site
+- (void)dealloc {
+    CGImageRelease(_cgImage);
+    _cgImage = 0;
+    [super dealloc];
+}
 @end
 
 @implementation UIFont
@@ -103,11 +127,37 @@ CGImageRef CGImageCreate(size_t width, size_t height, size_t bitsPerComponent,
   return 0;
 }
 
-void CGImageRelease(CGImageRef image) { (void)image; }
+// Real since audit row 11 (A5). Note this is the ONLY deallocator for a CGImage in the port, and
+// it is reached two ways: UIImage's -dealloc (the normal path) and a direct call from a failure
+// branch that never got as far as wrapping the image. CGImageCreate above still returns 0, so a
+// null here is expected, not defensive noise.
+void CGImageRelease(CGImageRef image) {
+  if (!image) return;
+  free(image->rgba);
+  free(image);
+}
 
-// P4: link-only stubs for FileManager::loadGenFromDisk (JUST_TERRAIN_GEN path, dead in this build).
-size_t CGImageGetWidth(CGImageRef image) { (void)image; return 0; }
-size_t CGImageGetHeight(CGImageRef image) { (void)image; return 0; }
+// Real since audit row 11 (A5): ManipulateImagePixelData sizes its work from these.
+size_t CGImageGetWidth(CGImageRef image) { return image ? (size_t)image->width : 0; }
+size_t CGImageGetHeight(CGImageRef image) { return image ? (size_t)image->height : 0; }
+
+CGImageRef EdenCGImageCreateWithRGBA(unsigned char *rgbaOwned, int width, int height,
+                                     BOOL hasAlpha) {
+  if (!rgbaOwned || width <= 0 || height <= 0) {
+    free(rgbaOwned);
+    return 0;
+  }
+  CGImageRef img = (CGImageRef)malloc(sizeof(struct CGImage));
+  if (!img) {
+    free(rgbaOwned);
+    return 0;
+  }
+  img->width = width;
+  img->height = height;
+  img->hasAlpha = hasAlpha;
+  img->rgba = rgbaOwned;
+  return img;
+}
 CGContextRef CGBitmapContextCreate(void *data, size_t width, size_t height,
                                    size_t bitsPerComponent, size_t bytesPerRow,
                                    CGColorSpaceRef space, CGBitmapInfo bitmapInfo) {

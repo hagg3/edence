@@ -173,7 +173,16 @@ useless, now just iterates through chunk list" (`Terrain.mm:2430`).
 - `Terrain()` constructed at app start; `allocateMemory()` only when entering a world;
   `deallocateMemory()` on exit to menu (frees blockarray/lightarray/chunk objects).
 - `loadTerrain(name, fromArchive)` → `FileManager::loadWorld` does the real work.
-- `unloadTerrain` clears portals/fireworks; chunk objects persist for reuse.
+- `unloadTerrain(exitToMenu)` only clears portals/fireworks and resets the mesh cache
+  (`troot`) when `exitToMenu==TRUE` — i.e. when actually leaving the world, not on the
+  internal `unloadTerrain(FALSE)` calls (`warpToHome` among them) that keep chunk
+  objects around for reuse. It used to clear the portal registry unconditionally, which
+  silently broke both portal teleportation (`Portal::enterPortal`) and portal proximity
+  ambience ([resources-and-audio.md](resources-and-audio.md)) for any portal whose
+  chunk wasn't freshly remeshed afterward — `Portal::addPortal` only runs from a mesh
+  rebuild (`TerrainChunk.mm`), which most portals never get again once meshed unless
+  their chunk is dirtied or streams back in fresh. Fixed by gating the registry wipe on
+  the same `exitToMenu` flag as the mesh-cache reset right next to it.
 
 ## Common pitfalls
 - **Argument order is `(x, z, y)` with y vertical** in nearly every terrain API, but

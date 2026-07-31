@@ -43,6 +43,11 @@ BOOL Joystick::update(float etime){
 		
 		if((touches[i].inuse==0||touches[i].inuse==usage_id)&&touches[i].down==M_DOWN){
 			if(inbox(touches[i].mx,touches[i].my,padbounds)||touches[i].inuse==usage_id){
+				if(touches[i].inuse==0){
+					extern BOOL touchControlsSoundEnabled;
+					if(touchControlsSoundEnabled&&touches[i].touch_id&&[touches[i].touch_id isRealTouch])
+						Resources::getResources->playSound(S_JOYSTICK_BEGIN);
+				}
 				if(touches[i].mx>padbounds.origin.x+padbounds.size.width){
 					//touches[i].mx=padbounds.origin.x+padbounds.size.width;
 				}
@@ -83,9 +88,12 @@ BOOL Joystick::update(float etime){
 			World::getWorld->player->setSpeed(pos,0);
 		}
 		
-		if(touches[i].inuse==usage_id&&touches[i].down==M_RELEASE){			
+		if(touches[i].inuse==usage_id&&touches[i].down==M_RELEASE){
+			extern BOOL touchControlsSoundEnabled;
+			if(touchControlsSoundEnabled&&touches[i].touch_id&&[touches[i].touch_id isRealTouch])
+				Resources::getResources->playSound(S_JOYSTICK_RELEASE);
 			touches[i].down=M_NONE;
-		}	
+		}
 		
 	}
 	//[World::getWorld->player setSpeed:MakeVector(0,1,0),40];

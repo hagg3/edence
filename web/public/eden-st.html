@@ -1,34 +1,30 @@
 <!DOCTYPE html>
 <!--
-  eden-st.html — SINGLE-THREADED debug launcher for the Eden web port (Stage P2, Task 4).
+  eden-st.html — the Eden web port's one and only host page, for players and developers alike.
+  Not a debug launcher: this is the real page real players hit, on both build configurations.
 
-  This is deliberately NOT the D1 architecture (worker + OffscreenCanvas + PROXY_TO_PTHREAD);
-  that is public/index.html. Per web/docs/RESUME-HERE.md, the single-threaded build is served
-  FIRST to get a frame on screen, because it isolates the ES1->WebGL2 draw path from the
-  OffscreenCanvas/worker-handshake machinery (a second, independently-unverified thing).
+  Loads whichever build EDEN_BUILD_DIR (below) picks, directly on the browser main thread against
+  a normal <canvas> — EDEN_THREADED is OFF by default (audit row A1) and no threaded host page
+  exists yet (that's audit row 36/C1, unbuilt; the old worker+OffscreenCanvas sketch, index.html +
+  worker-bootstrap.js, was deleted per audit row I5 since it never ran against a real build). No
+  SharedArrayBuffer, so no COOP/COEP headers are required.
 
-  It runs the EDEN_THREADED=OFF build (build-st/) directly on the browser main thread against a
-  normal <canvas>. No SharedArrayBuffer, so NO COOP/COEP headers are required — a plain static
-  server (`python3 -m http.server` from web/) is enough.
+  SERVE FROM: the web/ directory (so /build-st/eden.js and /build-st/eden.wasm resolve), with
+  tools/serve.js — NOT `python3 -m http.server`, which has neither HTTP byte-range serving (needed
+  by the lazy Eden.eden FS node, docs/save-load.md) nor compression:
+    cd web && node tools/serve.js 8123
+    open http://localhost:8123/public/eden-st.html
 
-  SERVE FROM: the web/ directory (so /build-st/eden.js and /build-st/eden.wasm resolve).
-    cd web && python3 -m http.server 8000
-    open http://localhost:8000/public/eden-st.html
-
-  Q1 (dazzling-munching-bengio.md perf audit): append `?build=rel` to load build-rel/ instead —
-  the Release configuration (-O2 -fno-strict-aliasing, no DWARF, -sASSERTIONS=0; see CMakeLists.txt
-  and web/docs/RESUME-HERE.md) instead of the Debug build (-O0 -g -gsource-map) this file loaded
-  unconditionally in every prior pass. Build it once with:
+  Append `?build=rel` to load build-rel/ (Release: -O2, no DWARF, -sASSERTIONS=0) instead of the
+  default build-st/ (Debug: -O0 -g -gsource-map, EDEN_DIAGNOSTICS=ON). Build it once with:
     cmake --build build-rel -j8
-  then open http://localhost:8000/public/eden-st.html?build=rel
+  then open http://localhost:8123/public/eden-st.html?build=rel
 
-  WHAT A CORRECT FIRST FRAME LOOKS LIKE (superseded by PORT-STATUS.md "Pass 10"/"Pass 11" — the
-  original "fog-colored screen" framing above was wrong about the MENU specifically, which is
-  the actual first screen: game_mode starts as GAME_MODE_MENU, and Graphics::prepareMenu clears
-  to BLACK, not fog color). As of Pass 11, Texture2D_web.mm is real (stb_image-backed) and the
-  menu's PNGs are preloaded, so success now looks like: the Eden menu background/logo/world-list
-  buttons, TEXTURED. The world itself is still empty (FileManager::loadWorld is inert until P4)
-  — that only matters once GAME_MODE_PLAY is reached, not for this screen.
+  WHAT A CORRECT FIRST FRAME LOOKS LIKE: the Eden main menu, fully textured (background art, logo,
+  world-list buttons) — game_mode starts as GAME_MODE_MENU, Graphics::prepareMenu clears to black
+  before the first draw. Selecting or creating a world reaches GAME_MODE_PLAY with a real, saved,
+  streamed voxel world (FileManager/save-load has been real since early porting passes — see
+  ../docs/save-load.md, not a placeholder).
 -->
 <html lang="en">
 <head>
@@ -263,8 +259,9 @@
   let moduleReady = false;
   let mouseDown = false;
   // Phase 6 wheel-jump pending-end flag (see the wheel handler far below) — declared this early
-  // because trackCursorNeed's rAF loop reads it and runs synchronously once before that handler's
-  // own `let` would otherwise have initialised (temporal dead zone).
+  // because trackCursorNeed (audit row A8: now driven by the engine's own frame loop, see below)
+  // reads it and runs synchronously once before that handler's own `let` would otherwise have
+  // initialised (temporal dead zone).
   let jumpPulsePending = false;
 
   function toEnginePoint(clientX, clientY) {
@@ -285,10 +282,42 @@
   // fire (event callbacks only run after the whole script has executed once) — guard here so a
   // locked pointer's frozen clientX/clientY (pointer lock stops normal cursor movement/coords)
   // doesn't ALSO synthesize a stale-position touch alongside the Pass 23 look/click path below.
+  // A picker/menu selection made through these listeners can close the picker as a side effect of
+  // the very click that made it (e.g. tapping a swatch) — reacquireLockIfJustClosed() re-requests
+  // pointer lock synchronously, still inside this real DOM event's call stack, so the browser still
+  // credits it as gesture-backed. trackCursorNeed's own reacquire (below, in the per-frame poll)
+  // fires a tick later from a non-gesture rAF context and is liable to be silently rejected — this
+  // is what used to cost the player one extra "regain focus" click after every picker use.
+  //
+  // Second bug on top of the first (still reproduced after the above landed): this must NOT check
+  // Module._eden_ui_wants_cursor() to decide whether the picker just closed. sendTouch() above only
+  // enqueues the touch into Input::getInput()'s slot table (Input_web.mm's eden_input_pointer_event
+  // calls touchesBegan/Ended synchronously) — but the thing that actually reads a picker-swatch
+  // touch and flips hud->mode back out of MODE_PICK_BLOCK/MODE_PICK_COLOR is Hud::update()
+  // (Classes/Hud.mm), which only runs on the ENGINE's next tick (World::update(), driven by
+  // emscripten_set_main_loop's rAF). So eden_ui_wants_cursor(), called synchronously right after
+  // sendTouch() in this same handler, still reports the picker as open on the exact click that
+  // closes it — the guard below used to bail out on that stale read every time, silently falling
+  // back to trackCursorNeed's non-gesture reacquire (and the extra click). Trust wantedCursorBefore
+  // (an accurate READ from before this gesture, past the engine's last tick) instead: if a picker
+  // was open, attempt the relock unconditionally. If the click didn't actually close it (e.g. it
+  // missed every swatch), trackCursorNeed's per-frame poll re-exits the lock next frame — a one-
+  // frame flicker, not a stuck cursor. The JS-owned overlays (settings/pause/load-error/main menu)
+  // are still checked here because their isOpen() is plain synchronous JS state, not engine-tick-
+  // delayed, so it's accurate to read immediately.
+  function reacquireLockIfJustClosed(wantedCursorBefore) {
+    if (!moduleReady || !wantedCursorBefore) return;
+    if (window.EdenSettings.isOpen() || window.EdenPauseMenu.isOpen() ||
+        window.EdenLoadError.isOpen() || window.EdenMenu.isOpen()) return;
+    if (document.pointerLockElement === canvasEl) return;
+    wantLock();
+  }
   canvasEl.addEventListener('mousedown', (e) => {
     if (pointerLocked) return;
     mouseDown = true;
+    const wantedCursorBefore = moduleReady && !!Module._eden_ui_wants_cursor();
     sendTouch(PHASE_START, MOUSE_IDENTITY, e.clientX, e.clientY);
+    reacquireLockIfJustClosed(wantedCursorBefore);
   });
   canvasEl.addEventListener('mousemove', (e) => {
     if (pointerLocked || !mouseDown) return;
@@ -297,7 +326,9 @@
   window.addEventListener('mouseup', (e) => {
     if (pointerLocked || !mouseDown) return;
     mouseDown = false;
+    const wantedCursorBefore = moduleReady && !!Module._eden_ui_wants_cursor();
     sendTouch(PHASE_END, MOUSE_IDENTITY, e.clientX, e.clientY);
+    reacquireLockIfJustClosed(wantedCursorBefore);
   });
   // A pointer leaving the window entirely mid-drag (not just the canvas) is the closest DOM
   // analogue to iOS's -touchesCancelled: — deliver the same signal rather than leaving Input.mm's
@@ -387,6 +418,38 @@
     try { canvasEl.requestPointerLock(); } catch (err) {}
   }
 
+  // PC-controls bug: Chromium enforces a real ~1.2s cooldown on requestPointerLock() shortly after
+  // any pointer-lock exit (e.g. the Escape that closes a menu/picker), and silently rejects calls
+  // made inside it — no exception (the try/catch above never sees it), just a 'pointerlockerror'
+  // event. Both call sites below used to be one-shot: a request made inside that window just failed
+  // and nothing retried it, so the player had to keep clicking blind and racing the cooldown, which
+  // is exactly the "randomly takes 3-6 clicks to mine/build" symptom (root-caused 2026-07-30, no
+  // separate bug in Player/Hud's touch consumption). Fix: track "a lock is wanted" and retry on
+  // 'pointerlockerror' with a short backoff until it succeeds, the cooldown clears, or the player
+  // stops wanting one (a picker/menu opened).
+  let lockWanted = false;
+  let lockRetryTimer = null;
+  let lockRetryCount = 0;
+  const LOCK_RETRY_MS = 250;
+  const LOCK_RETRY_MAX = 6;   // 6 * 250ms comfortably covers the ~1.2s cooldown
+  function wantLock() {
+    lockWanted = true;
+    lockRetryCount = 0;
+    requestLock();
+  }
+  function stopWantingLock() {
+    lockWanted = false;
+    if (lockRetryTimer) { clearTimeout(lockRetryTimer); lockRetryTimer = null; }
+  }
+  document.addEventListener('pointerlockerror', () => {
+    if (!lockWanted || lockRetryTimer || lockRetryCount >= LOCK_RETRY_MAX) return;
+    lockRetryCount++;
+    lockRetryTimer = setTimeout(() => {
+      lockRetryTimer = null;
+      if (lockWanted && document.pointerLockElement !== canvasEl) requestLock();
+    }, LOCK_RETRY_MS);
+  });
+
   // requestPointerLock is the "unlock the cursor for click-to-place/break like touch" trigger the
   // spec asks for — while locked, mousemove reports relative deltas (movementX/Y) instead of an
   // absolute position, which is what turns the mouse into a look control instead of a drag-to-look
@@ -399,7 +462,7 @@
   // follows eden_ui_wants_cursor() rather than being purely click-driven.
   canvasEl.addEventListener('click', () => {
     if (document.pointerLockElement === canvasEl) return;
-    callIfReady(() => { if (!Module._eden_ui_wants_cursor()) requestLock(); });
+    callIfReady(() => { if (!Module._eden_ui_wants_cursor()) wantLock(); });
   });
 
   // --- PC controls audit F3: crosshair overlay --------------------------------------------
@@ -494,13 +557,62 @@
   // stylesheet owns the element's size, and matching whatever the box actually is keeps the backing
   // store and the display area in step (the previous fixed buffer was stretched to that same box,
   // so this introduces no distortion that was not already there).
+  // --- Audit row F1: adaptive resolution scaling ---------------------------------------------
+  // The plumbing this row asked for a controller on top of (applyDrawableSize, render_scale)
+  // already existed; this is that controller. Frame time is sampled from the cadence of
+  // Module.__edenFramePost itself (see below) — the same per-frame hook audit row A8 already
+  // unified everything onto, so this adds no second timer. A rolling window smooths out one-off
+  // hitches (a GC pause, a texture decode) so the controller reacts to a sustained trend, not a
+  // single frame, and a cooldown plus a gap between the down/up thresholds (hysteresis) is what
+  // keeps it from oscillating once it settles near a boundary.
+  //
+  // Deliberately layered ON TOP of render_scale rather than driving that setting directly:
+  // render_scale is a persisted preference (Settings_web.mm's kSettings[]), and writing to it
+  // every time the frame rate dips would both spam IndexedDB/localStorage and silently overwrite
+  // a choice the player made on purpose. adaptiveScaleFactor is pure runtime state — never
+  // persisted, always <= 1.0 (it only ever makes frames CHEAPER than the user's own setting, never
+  // more expensive), and resets to 1.0 on reload, so the worst case of it misbehaving is "back to
+  // what render_scale alone would have produced," not a corrupted preference.
+  let adaptiveScaleFactor = 1.0;      // multiplies into the factor below; always in [MIN, 1.0]
+  const ADAPTIVE_MIN_SCALE = 0.5;     // matches render_scale's own lowest enum step (50%) — floor
+  const ADAPTIVE_STEP = 0.1;
+  const ADAPTIVE_WINDOW = 30;         // frame samples averaged before a decision (~0.5s at 60Hz)
+  const ADAPTIVE_COOLDOWN_MS = 2000;  // minimum time between adjustments, either direction
+  const ADAPTIVE_FPS_LOW = 45;        // sustained average below this -> scale down
+  const ADAPTIVE_FPS_HIGH = 55;       // sustained average above this -> scale up (hysteresis gap)
+  let adaptiveFrameTimes = [];
+  let adaptiveLastFrameAt = 0;
+  let adaptiveLastAdjustAt = 0;
+  function adaptiveResolutionTick() {
+    const now = performance.now();
+    if (adaptiveLastFrameAt) {
+      adaptiveFrameTimes.push(now - adaptiveLastFrameAt);
+      if (adaptiveFrameTimes.length > ADAPTIVE_WINDOW) adaptiveFrameTimes.shift();
+    }
+    adaptiveLastFrameAt = now;
+    if (adaptiveFrameTimes.length < ADAPTIVE_WINDOW) return;         // not enough samples yet
+    if (now - adaptiveLastAdjustAt < ADAPTIVE_COOLDOWN_MS) return;   // cooldown
+
+    const avgMs = adaptiveFrameTimes.reduce((a, b) => a + b, 0) / adaptiveFrameTimes.length;
+    const avgFps = 1000 / avgMs;
+    if (avgFps < ADAPTIVE_FPS_LOW && adaptiveScaleFactor > ADAPTIVE_MIN_SCALE) {
+      adaptiveScaleFactor = Math.max(ADAPTIVE_MIN_SCALE, adaptiveScaleFactor - ADAPTIVE_STEP);
+      adaptiveLastAdjustAt = now;
+      applyDrawableSize();
+    } else if (avgFps > ADAPTIVE_FPS_HIGH && adaptiveScaleFactor < 1.0) {
+      adaptiveScaleFactor = Math.min(1.0, adaptiveScaleFactor + ADAPTIVE_STEP);
+      adaptiveLastAdjustAt = now;
+      applyDrawableSize();
+    }
+  }
+
   function applyDrawableSize() {
     if (!moduleReady) return;
     const rect = canvasEl.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1) return;   // display:none / not laid out yet
     const cap = Module._eden_get_dpr_cap_x100() / 100;
     const scale = Module._eden_get_render_scale_pct() / 100;
-    const factor = Math.min(window.devicePixelRatio || 1, cap) * scale;
+    const factor = Math.min(window.devicePixelRatio || 1, cap) * scale * adaptiveScaleFactor;
     const w = Math.max(1, Math.round(rect.width * factor));
     const h = Math.max(1, Math.round(rect.height * factor));
     // The dedupe compares against the CANVAS's real attributes, not a JS-side memo of what was
@@ -692,9 +804,20 @@
   let wantsCursorPrev = true;
   let lockWasHeldBeforePicker = false;
   let drawableSeeded = false;   // item #6: see the one-shot inside the loop below
-  (function trackCursorNeed() {
-    requestAnimationFrame(trackCursorNeed);
+  let crosshairVisible = null;  // audit row E5: null forces the first frame's write through
+  // Audit row A8: this used to be a SECOND, independent requestAnimationFrame chain
+  // (`(function trackCursorNeed(){ requestAnimationFrame(trackCursorNeed); ... })()`), racing the
+  // engine's own emscripten_set_main_loop-driven rAF with no defined ordering between the two —
+  // a lock-state change from one loop could land before or after the engine tick that reacts to
+  // it, in either order depending on registration order alone. Now it is a plain function invoked
+  // from `Module.__edenFramePost`, called by eden_main.cpp's eden_frame_tick() (via the
+  // eden_frame_post_hook EM_JS export) at the tail of every real engine frame — one scheduler,
+  // deterministic order, same per-frame body as before. The name stays: everything below is still
+  // reasoned about as "does the pointer need to be locked/free/crosshaired this frame", the
+  // movement/UI-tick calls just rode along in the same rAF chain historically.
+  function trackCursorNeed() {
     if (!moduleReady) return;
+    adaptiveResolutionTick();  // audit row F1: cheap, sample-and-maybe-resize
     if (jumpPulsePending) { Module._eden_set_jump(0); jumpPulsePending = false; }
     Module._eden_movement_tick();  // PC controls audit F1: feeds Movement_web.mm's dt EMA
     // Row #24: must run BEFORE recomputeMove() — the Gamepad API is poll-only, and the stick axes
@@ -725,9 +848,11 @@
       window.EdenPauseMenu.isOpen() || window.EdenLoadError.isOpen() || window.EdenMenu.isOpen();
     if (wants && document.pointerLockElement === canvasEl) {
       document.exitPointerLock();
+    } else if (wants) {
+      stopWantingLock();   // a picker/menu opened — give up on any in-flight retry
     } else if (!wants && wantsCursorPrev && lockWasHeldBeforePicker &&
                document.pointerLockElement !== canvasEl) {
-      requestLock();
+      wantLock();
     }
     if (wants && !wantsCursorPrev) lockWasHeldBeforePicker = (document.pointerLockElement === canvasEl);
     wantsCursorPrev = wants;
@@ -735,9 +860,16 @@
     // never requests a lock) and not on a screen you point at.
     // NOTE: must be 'block', not '' — clearing the inline style falls back to the #eden-crosshair
     // stylesheet rule itself (display: none), which never shows the crosshair at all.
-    crosshairEl.style.display = (pointerLocked && !wants && !!Module._eden_get_crosshair()) ? 'block' : 'none';
+    // Audit row E5: this ran unconditionally every frame — a per-frame layout-invalidating style
+    // write even on the (overwhelming majority of) frames where nothing changed. Guard on change.
+    const wantsCrosshair = pointerLocked && !wants && !!Module._eden_get_crosshair();
+    if (wantsCrosshair !== crosshairVisible) {
+      crosshairVisible = wantsCrosshair;
+      crosshairEl.style.display = wantsCrosshair ? 'block' : 'none';
+    }
     updateHotbarStrip(!Module._eden_effective_input_is_touch() && !wants);
-  })();
+  }
+  Module.__edenFramePost = trackCursorNeed;
 
   // Small transient overlay for state changes that have no on-screen indicator of their own
   // (fly mode); the engine's HUD is all custom GL, so there is nowhere to put this in-world.
@@ -1056,7 +1188,7 @@
   // Phase 6: wheel-up/-down as jump (the Source bhop convention), while `advanced_movement` is
   // on. eden_set_jump is a synthetic touch (Input_web.mm) whose begin/end must straddle >=1
   // engine tick, same rule as click/HUD taps — so this only sets the "begin" here and lets the
-  // rAF loop (trackCursorNeed) deliver "end" one frame later, never a same-call pulse.
+  // per-frame `trackCursorNeed` call deliver "end" one frame later, never a same-call pulse.
   function wheelJumpPulse() {
     callIfReady(() => Module._eden_set_jump(1));
     jumpPulsePending = true;
@@ -1088,6 +1220,7 @@
   let pointerLocked = false;
   document.addEventListener('pointerlockchange', () => {
     pointerLocked = (document.pointerLockElement === canvasEl);
+    if (pointerLocked) stopWantingLock();
   });
 
   canvasEl.addEventListener('mousemove', (e) => {

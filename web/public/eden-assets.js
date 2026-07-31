@@ -1,4 +1,6 @@
 // eden-assets.js — hands the DOM UI the engine's own art, with zero extra bundle weight.
+// Requires: Module.FS (the wasm module must already be booted/preloaded). Publishes:
+// window.EdenAssets. See docs/ui.md's dependency graph (audit I2).
 //
 // THE PROBLEM: the main-menu mockup's background is the painted voxel landscape, the sunburst and
 // the "EDEN" wordmark. Those already ship — CMakeLists.txt --preload-file's media/ipad_menu into

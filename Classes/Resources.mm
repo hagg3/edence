@@ -97,7 +97,7 @@ S_FLAMELOOP=33,
 S_CAMERA=34,
 S_JUMP=35,*/
 
-#define MAX_VARIATIONS2 6
+#define MAX_VARIATIONS2 8
 
 int lasteffectplayed=-1;;
 static int sfxNumVariations[NUM_SOUNDS]={  
@@ -109,7 +109,7 @@ static int sfxNumVariations[NUM_SOUNDS]={
     [S_PAINT_BLOCK ]=3,
     [ S_LAVA_BURN]=4,
     [ S_ICE_LOOP]=1,
-    [ S_EXPLODE]=1,
+    [ S_EXPLODE]=8,
     [ S_BUILD_WOOD]=4,
     [ S_BUILD_WATER]=4,
     [ S_BUILD_STONE]=4,
@@ -126,7 +126,7 @@ static int sfxNumVariations[NUM_SOUNDS]={
     [  S_BREAK_LAVA]=4,
     [  S_BREAK_DIRT]=4,
      [ S_BREAK_GLASS]=4,
-    [  S_ATTEMPT_FIRE]=1,
+    [  S_ATTEMPT_FIRE]=3,
     [  S_SPLASH_BIG]=4,
     [S_SPLASH_SMALL ]=4,
     [   S_FOOTSTEPS_HARD]=6,
@@ -167,6 +167,15 @@ static int sfxNumVariations[NUM_SOUNDS]={
     [S_EXIT_WORLD]=1,
     [S_SWITCH_TOGGLE_ON]=1,
     [S_SWITCH_TOGGLE_OFF]=1,
+    [S_ICE_LOOP_SLOW]=2,
+    [S_ICE_LOOP_MEDIUM]=2,
+    [S_ICE_LOOP_FAST]=2,
+    [S_ICE_TURN]=2,
+    [S_JOYSTICK_BEGIN]=1,
+    [S_JOYSTICK_RELEASE]=1,
+    [S_JUMP_BUTTON_PRESS]=1,
+    [S_JUMP_BUTTON_RELEASE]=1,
+    [S_MODE_SELECTION]=3,
 
 };
 static const char* soundFiles[NUM_SOUNDS][MAX_VARIATIONS2]={
@@ -177,7 +186,7 @@ static const char* soundFiles[NUM_SOUNDS][MAX_VARIATIONS2]={
     [S_LAND_HARD]={"player_land_hard_1.caf","player_land_hard_2_v2.caf","player_land_hard_3_v2.caf","land_hard_4_v2.caf"},
     [S_PAINT_BLOCK]={"paint_block_1.caf","paint_block_2_v2.caf","paint_block_3.caf","paint_block_4.caf"},
      [S_LAVA_BURN]={"lava_burn_1_v2.caf","lava_burn_2_v2.caf","lava_burn_3_v2.caf","lava_burn_4_v2.caf"},
-    [S_EXPLODE]={"explosion.caf","explosion_2.caf","explosion_3.caf","explosion_4.caf"},
+    [S_EXPLODE]={"explosion.caf","explosion_2.caf","explosion_3.caf","explosion_4.caf","explosion_1_v2.caf","explosion_2_v2.caf","explosion_3_v2.caf","explosion_4_v2.caf"},
     [S_BREAK_WOOD]={"block_break_wood_1_v2.caf","block_break_wood_2_v2.caf","block_break_wood_3_v2.caf","block_break_wood_4_v2.caf"},
     [S_BREAK_WATER]={"block_break_water_1_v2.caf","block_break_water_2_v2.caf","block_break_water_3_v2.caf","block_break_water_4_v2.caf"},
     [S_BREAK_STONE]={"block_break_stone_1.caf","block_break_stone_2.caf","block_break_stone_3.caf","block_break_stone_4.caf"},
@@ -194,7 +203,7 @@ static const char* soundFiles[NUM_SOUNDS][MAX_VARIATIONS2]={
     [S_BUILD_GLASS]={"block_build_glass_1.caf","block_build_glass_2.caf","block_build_glass_3.caf","block_build_glass_4.caf"},
     [S_BUILD_DIRT]={"block_build_dirt_1.caf","block_build_dirt_2.caf","block_build_dirt_3.caf","block_build_dirt_4.caf"},
     [S_BUILD_GENERIC]={"block_build_generic_1.caf","block_build_generic_2.caf","block_build_generic_3.caf","block_build_generic_4.caf"},
-    [S_ATTEMPT_FIRE]={"matchlight.caf","attempt_fire_2.caf","attempt_fire_3.caf","attempt_fire_4.caf"},
+    [S_ATTEMPT_FIRE]={"matchlight.caf","attempt_fire.caf","attempt_fire_v2.caf"},
     [S_SPLASH_SMALL]={"water_splash_small_1.caf","water_splash_small_2.caf","water_splash_small_3.caf","water_splash_small_4.caf"},
     [S_SPLASH_BIG]={"water_splash_big_1.caf","water_splash_big_2.caf","water_splash_big_3.caf","water_splash_big_4.caf"},
     [S_FOOTSTEPS_HARD]={"player_footsteps_hard_1.caf","player_footsteps_hard_2.caf","player_footsteps_hard_3.caf","player_footsteps_hard_4.caf","player_footsteps_hard_5.caf","player_footsteps_hard_6.caf"},
@@ -235,6 +244,15 @@ static const char* soundFiles[NUM_SOUNDS][MAX_VARIATIONS2]={
     [S_EXIT_WORLD]={"exit_world.mp3"},
     [S_SWITCH_TOGGLE_ON]={"menu_button_press_01.mp3"},
     [S_SWITCH_TOGGLE_OFF]={"menu_button_release_01.mp3"},
+    [S_ICE_LOOP_SLOW]={"ice_slide_loop_slow.caf","ice_slide_loop_slow_v2.caf"},
+    [S_ICE_LOOP_MEDIUM]={"ice_slide_loop_medium.caf","ice_slide_loop_medium_v2.caf"},
+    [S_ICE_LOOP_FAST]={"ice_slide_loop_fast.caf","ice_slide_loop_fast_v2.caf"},
+    [S_ICE_TURN]={"ice_slide_turn_1.caf","ice_slide_turn_2.caf"},
+    [S_JOYSTICK_BEGIN]={"joystick_begin.mp3"},
+    [S_JOYSTICK_RELEASE]={"joystick_release.mp3"},
+    [S_JUMP_BUTTON_PRESS]={"jump_button_press.mp3"},
+    [S_JUMP_BUTTON_RELEASE]={"jump_button_release.mp3"},
+    [S_MODE_SELECTION]={"mode_selection_1.caf","mode_selection_2.caf","mode_selection_3.caf"},
 
 };
 
@@ -739,63 +757,159 @@ int Resources::playSound(int soundid){
         return audio->playEffect(soundFiles[soundid][variation], FALSE);
        // return [[SimpleAudioEngine sharedEngine] playEffect:soundFiles[soundid][variation] loop:FALSE];
 	}
-    
-	
+
+
 	return 0;
 }
+// For continuous effects that need a real looping voice (bLoop=TRUE) rather than playSound's
+// one-shot dedup/landing-timer machinery — used by the ice-slide loop, which is retriggered only
+// on entering/leaving ice rather than every frame (see Player::move).
+int Resources::playLoopedSound(int soundid){
+    if(!playsound)return 0;
+    int variation=arc4random()%sfxNumVariations[soundid];
+    return audio->playEffect(soundFiles[soundid][variation], TRUE);
+}
 extern int flamecount;
-void Resources::soundEvent(int actionid){
+void Resources::soundEventBed(int actionid){
    /* if(actionid==AMBIENT_OPEN){
         actionid+=flamecount;
         if(actionid>=NUM_AMBIENT){actionid=AMBIENT_OPEN;
             flamecount=0;
         }
     }*/
-    soundEvent(actionid,World::getWorld->player->pos);
+    soundEventBed(actionid,World::getWorld->player->pos);
 }
-static int target_ambient;
+// Bed layer: exactly one of {underwater, sky-high, cave, open, the 11 biome ambiences} at a time,
+// crossfading between them — this is the original soundEvent's priority-chain logic, moved onto
+// its own channel (audio->playAmbience(0,...)) so it no longer fights the proximity layer or music.
+static int target_bed;
 static BOOL songisplaying=FALSE;
-static int current_ambient=TYPE_NONE;
+static int current_bed=TYPE_NONE;
+static float bedvolume=2.0f;
+static float bedtargetvolume=0;
+// Music (channel 0) keeps its own separate fade pair, untouched by this split — still stepped
+// and pushed via setBackgroundMusicVolume in Resources::update, same as before.
 static float bkgvolume=2.0f;
 static float bkgtargetvolume=0;
 
-void Resources::soundEvent(int actionid,Vector location){
-    if(!playmusic||songisplaying||World::getWorld->game_mode!=GAME_MODE_PLAY)return;
+void Resources::soundEventBed(int actionid,Vector location){
+    if(!playmusic||World::getWorld->game_mode!=GAME_MODE_PLAY)return;
     if(actionid>=-1&&actionid<NUM_AMBIENT){
-        target_ambient=actionid;
+        target_bed=actionid;
     }
-    if(target_ambient!=current_ambient){
-        bkgtargetvolume=0.0f;
+    if(target_bed!=current_bed){
+        bedtargetvolume=0.0f;
     }
-    if(target_ambient!=current_ambient&&(bkgvolume==0||target_ambient==AMBIENT_UNDERWATER)){
+    if(target_bed!=current_bed&&(bedvolume==0||target_bed==AMBIENT_UNDERWATER)){
         float distance=sqrtf(v_length2(v_sub(location,World::getWorld->player->pos)));
         float distance_fade=12.0f;
-        
+
         if(distance>distance_fade)distance=distance_fade;
-        bkgtargetvolume=2.0f*(distance_fade-distance)/distance_fade;
-        if(target_ambient!=AMBIENT_RIVER&&target_ambient!=AMBIENT_OPEN)
-            bkgtargetvolume*=2;
-        //printg("ambient triggered:%d\n",target_ambient);
-        current_ambient=target_ambient;
-        audio->stopBackgroundMusic();
-        if(target_ambient!=AMBIENT_NONE)
-    audio->playBackgroundMusic(ambientFiles[target_ambient],TRUE);
-    }else if(target_ambient==current_ambient){
+        bedtargetvolume=2.0f*(distance_fade-distance)/distance_fade;
+        if(target_bed!=AMBIENT_RIVER&&target_bed!=AMBIENT_OPEN)
+            bedtargetvolume*=2;
+        //printg("ambient triggered:%d\n",target_bed);
+        current_bed=target_bed;
+        audio->stopAmbience(0);
+        if(target_bed!=AMBIENT_NONE)
+    audio->playAmbience(0,ambientFiles[target_bed],TRUE);
+    }else if(target_bed==current_bed){
         float distance=sqrtf(v_length2(v_sub(location,World::getWorld->player->pos)));
         float distance_fade=12.0f;
          if(distance>distance_fade)distance=distance_fade;
-        bkgtargetvolume=2.0f*(distance_fade-distance)/distance_fade;
-        if(target_ambient!=AMBIENT_RIVER&&target_ambient!=AMBIENT_OPEN&&target_ambient<6)
-            bkgtargetvolume*=2;
-        if(target_ambient>=6||target_ambient==AMBIENT_OPEN){
-            bkgtargetvolume*=.35f;
-            if(target_ambient==AMBIENT_OASIS){
-                bkgtargetvolume*=.2f;
+        bedtargetvolume=2.0f*(distance_fade-distance)/distance_fade;
+        if(target_bed!=AMBIENT_RIVER&&target_bed!=AMBIENT_OPEN&&target_bed<6)
+            bedtargetvolume*=2;
+        if(target_bed>=6||target_bed==AMBIENT_OPEN){
+            bedtargetvolume*=.35f;
+            if(target_bed==AMBIENT_OASIS){
+                bedtargetvolume*=.2f;
 
             }
         }
     }
-    
+
+}
+
+void Resources::soundEventProximity(int actionid){
+    soundEventProximity(actionid,World::getWorld->player->pos);
+}
+// Proximity layer: water/lava adjacency only (AMBIENT_RIVER/AMBIENT_LAVA/AMBIENT_NONE), same
+// distance-fade math as the bed layer but independent of it — fades in near a water/lava block
+// and out when not, regardless of what the bed layer is doing.
+static int target_prox;
+static int current_prox=TYPE_NONE;
+static float proxvolume=2.0f;
+static float proxtargetvolume=0;
+
+void Resources::soundEventProximity(int actionid,Vector location){
+    if(!playmusic||World::getWorld->game_mode!=GAME_MODE_PLAY)return;
+    if(actionid>=-1&&actionid<NUM_AMBIENT){
+        target_prox=actionid;
+    }
+    if(target_prox!=current_prox){
+        proxtargetvolume=0.0f;
+    }
+    if(target_prox!=current_prox&&proxvolume==0){
+        float distance=sqrtf(v_length2(v_sub(location,World::getWorld->player->pos)));
+        float distance_fade=12.0f;
+
+        if(distance>distance_fade)distance=distance_fade;
+        proxtargetvolume=2.0f*(distance_fade-distance)/distance_fade;
+        if(target_prox!=AMBIENT_RIVER&&target_prox!=AMBIENT_OPEN)
+            proxtargetvolume*=2;
+        current_prox=target_prox;
+        audio->stopAmbience(1);
+        if(target_prox!=AMBIENT_NONE)
+    audio->playAmbience(1,ambientFiles[target_prox],TRUE);
+    }else if(target_prox==current_prox){
+        float distance=sqrtf(v_length2(v_sub(location,World::getWorld->player->pos)));
+        float distance_fade=12.0f;
+         if(distance>distance_fade)distance=distance_fade;
+        proxtargetvolume=2.0f*(distance_fade-distance)/distance_fade;
+        if(target_prox!=AMBIENT_RIVER&&target_prox!=AMBIENT_OPEN&&target_prox<6)
+            proxtargetvolume*=2;
+    }
+
+}
+// Two more independent proximity channels (2=portal, 3=treasure cube), same distance-fade shape as
+// the water/lava proximity layer above but simpler: always the same single file, so there's no
+// target-vs-current index to track, just an on/off plus a fade in Resources::update.
+static float portalvolume=0,portaltargetvolume=0;
+static BOOL portalplaying=FALSE,portalwanted=FALSE;
+void Resources::soundEventPortalProximity(BOOL active,Vector location){
+    if(!playmusic||World::getWorld->game_mode!=GAME_MODE_PLAY){active=FALSE;}
+    portalwanted=active;
+    if(active){
+        float distance=sqrtf(v_length2(v_sub(location,World::getWorld->player->pos)));
+        float distance_fade=15.0f;
+        if(distance>distance_fade)distance=distance_fade;
+        portaltargetvolume=(distance_fade-distance)/distance_fade;
+        if(!portalplaying){
+            audio->playAmbience(2,"ambience_nearby_portal.mp3",TRUE);
+            portalplaying=TRUE;
+        }
+    }else{
+        portaltargetvolume=0;
+    }
+}
+static float treasurevolume=0,treasuretargetvolume=0;
+static BOOL treasureplaying=FALSE,treasurewanted=FALSE;
+void Resources::soundEventTreasureProximity(BOOL active,Vector location){
+    if(!playmusic||World::getWorld->game_mode!=GAME_MODE_PLAY){active=FALSE;}
+    treasurewanted=active;
+    if(active){
+        float distance=sqrtf(v_length2(v_sub(location,World::getWorld->player->pos)));
+        float distance_fade=15.0f;
+        if(distance>distance_fade)distance=distance_fade;
+        treasuretargetvolume=(distance_fade-distance)/distance_fade;
+        if(!treasureplaying){
+            audio->playAmbience(3,"ambience_nearby_treasure_cube.mp3",TRUE);
+            treasureplaying=TRUE;
+        }
+    }else{
+        treasuretargetvolume=0;
+    }
 }
 #define NS_BURN 1000
 static float burnin[NS_BURN]={};
@@ -878,8 +992,23 @@ void Resources::stopMenuTune(){
      bkgtargetvolume=0.0f;
     audio->stopBackgroundMusic();
 
-     current_ambient=target_ambient=AMBIENT_NONE;
+     // Hard-stop rather than just resetting the target/current state ints: Resources::update's
+     // game_mode!=GAME_MODE_PLAY fade-to-silence-then-stop only fires stopAmbience once a channel's
+     // volume has actually reached 0, which may not have happened yet by the time a new game starts
+     // (stopMenuTune runs once, immediately, not spread across frames) -- resetting current_bed to
+     // AMBIENT_NONE first would make that check never fire, leaving the channel playing forever.
+     if(current_bed!=AMBIENT_NONE)audio->stopAmbience(0);
+     current_bed=target_bed=AMBIENT_NONE;
+     bedvolume=bedtargetvolume=0;
+     if(current_prox!=AMBIENT_NONE)audio->stopAmbience(1);
+     current_prox=target_prox=AMBIENT_NONE;
+     proxvolume=proxtargetvolume=0;
      titlesongisplaying=FALSE;
+
+     if(portalplaying){audio->stopAmbience(2);portalplaying=FALSE;}
+     portalwanted=FALSE;portalvolume=portaltargetvolume=0;
+     if(treasureplaying){audio->stopAmbience(3);treasureplaying=FALSE;}
+     treasurewanted=FALSE;treasurevolume=treasuretargetvolume=0;
 
 }
 void Resources::loadMenuTextures(){
@@ -1527,7 +1656,6 @@ void Resources::update(float etime){
             if(!audio->isBackgroundMusicPlaying()){
                 songisplaying=FALSE;
                 cuetimer=0;
-                current_ambient=target_ambient=AMBIENT_NONE;
             }
         }else{
             cuetimer+=etime;
@@ -1546,7 +1674,89 @@ void Resources::update(float etime){
         }
         if(audio->getBackgroundMusicVolume()!=bkgvolume)  //crash tally: 1
           audio->setBackgroundMusicVolume(bkgvolume);
-        
+
+        // All four ambience layers' triggers (soundEventBed/Proximity/Portal/TreasureProximity)
+        // early-return without stopping anything once game_mode leaves GAME_MODE_PLAY -- there's no
+        // call site left to un-set them once Player::update stops running (world unloaded on the
+        // way to the menu), so without this, whatever was last playing (e.g. night ambience) kept
+        // looping forever into the menu. Force every target to 0 here instead, and once a channel
+        // has actually faded to silence, stop it and clear its "still playing" state so a later
+        // return to play mode starts clean.
+        if(World::getWorld->game_mode!=GAME_MODE_PLAY){
+            bedtargetvolume=0;
+            proxtargetvolume=0;
+            portaltargetvolume=0;
+            treasuretargetvolume=0;
+            if(bedvolume==0&&current_bed!=AMBIENT_NONE){
+                audio->stopAmbience(0);
+                current_bed=target_bed=AMBIENT_NONE;
+            }
+            if(proxvolume==0&&current_prox!=AMBIENT_NONE){
+                audio->stopAmbience(1);
+                current_prox=target_prox=AMBIENT_NONE;
+            }
+            if(portalvolume==0&&portalplaying){
+                audio->stopAmbience(2);
+                portalplaying=FALSE;
+            }
+            if(treasurevolume==0&&treasureplaying){
+                audio->stopAmbience(3);
+                treasureplaying=FALSE;
+            }
+        }
+
+        if(bedvolume<bedtargetvolume){
+            bedvolume+=FADE_SPEED;
+            if(bedvolume>bedtargetvolume)
+                bedvolume=bedtargetvolume;
+        }else if(bedvolume>bedtargetvolume){
+            bedvolume-=FADE_SPEED;
+            if(bedvolume<bedtargetvolume)
+                bedvolume=bedtargetvolume;
+        }
+        audio->setAmbienceFade(0,bedvolume);
+
+        if(proxvolume<proxtargetvolume){
+            proxvolume+=FADE_SPEED;
+            if(proxvolume>proxtargetvolume)
+                proxvolume=proxtargetvolume;
+        }else if(proxvolume>proxtargetvolume){
+            proxvolume-=FADE_SPEED;
+            if(proxvolume<proxtargetvolume)
+                proxvolume=proxtargetvolume;
+        }
+        audio->setAmbienceFade(1,proxvolume);
+
+        if(portalvolume<portaltargetvolume){
+            portalvolume+=FADE_SPEED;
+            if(portalvolume>portaltargetvolume)
+                portalvolume=portaltargetvolume;
+        }else if(portalvolume>portaltargetvolume){
+            portalvolume-=FADE_SPEED;
+            if(portalvolume<portaltargetvolume)
+                portalvolume=portaltargetvolume;
+        }
+        audio->setAmbienceFade(2,portalvolume);
+        if(portalvolume==0&&portalplaying&&!portalwanted){
+            audio->stopAmbience(2);
+            portalplaying=FALSE;
+        }
+
+        if(treasurevolume<treasuretargetvolume){
+            treasurevolume+=FADE_SPEED;
+            if(treasurevolume>treasuretargetvolume)
+                treasurevolume=treasuretargetvolume;
+        }else if(treasurevolume>treasuretargetvolume){
+            treasurevolume-=FADE_SPEED;
+            if(treasurevolume<treasuretargetvolume)
+                treasurevolume=treasuretargetvolume;
+        }
+        audio->setAmbienceFade(3,treasurevolume);
+        if(treasurevolume==0&&treasureplaying&&!treasurewanted){
+            audio->stopAmbience(3);
+            treasureplaying=FALSE;
+        }
+
     }
     // printg("volume:%f\n",[[SimpleAudioEngine sharedEngine] backgroundMusicVolume]);
     //fadetimer+=etime;
@@ -1624,7 +1834,7 @@ Resources::~Resources(){
 
 	
 	//[sound release];
-	
+
 }
 
 

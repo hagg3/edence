@@ -39,6 +39,11 @@ bool CROUCH_HELD=false;
 // Gates both the keyboard path (CROUCH_HELD) and the HUD button's m_crouch below, and Hud.mm hides
 // the on-screen button entirely while this is false.
 bool CROUCH_ENABLED=false;
+// Settings toggle (Settings_web.mm's "touch_controls_sound" row) -- off by default. Gates the
+// joystick begin/release and jump-button press/release sounds (Joystick.mm, Hud.mm); those also
+// separately require the touch to be a real one (UITouch's isRealTouch), so this setting can never
+// make Space/mouse trigger them even if turned on.
+bool touchControlsSoundEnabled=false;
 #define STAND_BOX_HEIGHT (BLOCK_SIZE*1.85f)
 #define CROUCH_BOX_HEIGHT (BLOCK_SIZE*0.925f)
 // Full stand<->crouch transition takes this long, eased by Player::preupdate rate-limiting
@@ -1145,21 +1150,22 @@ BOOL Player::update(float etime){
 		
 	}
     if(World::getWorld->hud->underLiquid){
-        Resources::getResources->soundEvent(AMBIENT_UNDERWATER);
+        Resources::getResources->soundEventBed(AMBIENT_UNDERWATER);
     }else if(pos.y>T_HEIGHT-9){
         Vector v=pos;
         v.y=T_HEIGHT-1;
-        Resources::getResources->soundEvent(AMBIENT_SKYHIGH,v);
+        Resources::getResources->soundEventBed(AMBIENT_SKYHIGH,v);
     }else{
         int x=pos.x;
-        int z=pos.z;    
+        int z=pos.z;
         int y=pos.y;
         Vector spos;
-        for(int h=-1;h<=2;h++){
-            for(int size=0;size<5;size++){
-                for(int xx=x-size;xx<=x+size;xx++){
-                    for(int zz=z-size;zz<=z+size;zz++){
-                        
+        BOOL foundProx=FALSE;
+        for(int h=-1;h<=2&&!foundProx;h++){
+            for(int size=0;size<5&&!foundProx;size++){
+                for(int xx=x-size;xx<=x+size&&!foundProx;xx++){
+                    for(int zz=z-size;zz<=z+size&&!foundProx;zz++){
+
                         int type=getLandc2(xx,zz,y+h);
                         if(type>=0&&((blockinfo[type]&IS_WATER)||blockinfo[type]&IS_LAVA)){
                             //  foundWater=TRUE;
@@ -1167,21 +1173,76 @@ BOOL Player::update(float etime){
                             spos.y=y+h+.5f;
                             spos.z=zz+.5f;
                             if(blockinfo[type]&IS_WATER){
-                                 Resources::getResources->soundEvent(AMBIENT_RIVER,spos);
+                                 Resources::getResources->soundEventProximity(AMBIENT_RIVER,spos);
                             }else{
-                                Resources::getResources->soundEvent(AMBIENT_LAVA,spos);
+                                Resources::getResources->soundEventProximity(AMBIENT_LAVA,spos);
                             }
-                            goto found;
-                        }//else 
+                            foundProx=TRUE;
+                        }//else
                         // World::getWorld->terrain setColor:x,z,y+h)
                     }
                 }
             }
         }
+        if(!foundProx){
+            // Proximity layer independent "off" call — with the bed chain's mutual exclusion no
+            // longer skipping this block when water/lava is near, the proximity layer needs its
+            // own explicit fade-out when the player moves away.
+            Resources::getResources->soundEventProximity(AMBIENT_NONE,pos);
+        }
+        {
+            // Portal proximity: Portal keeps its own position registry (world's portals are rare
+            // and paired for teleport, so a linear scan of it is cheap), unlike the water/lava/
+            // treasure-cube proximity checks which have to scan voxels directly.
+            Vector portalPos=pos;
+            BOOL foundPortal=World::getWorld->terrain->portals->nearestPortal(pos,&portalPos);
+            if(foundPortal&&v_length2(v_sub(portalPos,pos))>15.0f*15.0f)foundPortal=FALSE;
+            Resources::getResources->soundEventPortalProximity(foundPortal,portalPos);
+        }
+        {
+            // Treasure cubes are plain voxels (TYPE_GOLDEN_CUBE) with no position registry, so this
+            // needs a real block scan -- a single flat pass over the 15-block box (not the
+            // expanding-ring style above) so it can track the true nearest match in one go, and
+            // throttled to 4/sec since a ~31x31x4 scan every frame would be needlessly expensive
+            // when nothing is nearby (the ambience fade is slow enough that this cadence reads as
+            // continuous). h range matches the water/lava proximity scan above (-1..2 relative to
+            // pos.y, i.e. from just below the player's feet to just above head height) rather than
+            // a narrower +-1 -- a cube sitting on the ground while the player stands a block or two
+            // above it (stairs, slopes, standing on an adjacent block) needs that full window.
+            static float treasureScanTimer=0;
+            static BOOL foundTreasure=FALSE;
+            static Vector treasurePos;
+            treasureScanTimer-=etime;
+            if(treasureScanTimer<=0){
+                treasureScanTimer=.25f;
+                int tx=pos.x,tz=pos.z,ty=pos.y;
+                float bestd2=-1;
+                foundTreasure=FALSE;
+                for(int h=-1;h<=2;h++){
+                    for(int xx=tx-15;xx<=tx+15;xx++){
+                        for(int zz=tz-15;zz<=tz+15;zz++){
+                            if(getLandc2(xx,zz,ty+h)==TYPE_GOLDEN_CUBE){
+                                Vector cand;
+                                cand.x=xx+.5f;cand.y=ty+h+.5f;cand.z=zz+.5f;
+                                float d2=v_length2(v_sub(cand,pos));
+                                if(!foundTreasure||d2<bestd2){
+                                    bestd2=d2;
+                                    treasurePos=cand;
+                                    foundTreasure=TRUE;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Resources::getResources->soundEventTreasureProximity(foundTreasure,treasurePos);
+        }
+        // Bed-layer check always runs regardless of proximity, so volcano/lava proximity ambience
+        // can coexist with cave/biome bed ambience instead of one preempting the other.
         if(pos.y<15){
             Vector v=pos;
             v.y=6;
-            Resources::getResources->soundEvent(AMBIENT_CAVE,v);
+            Resources::getResources->soundEventBed(AMBIENT_CAVE,v);
         }else{
             int ppx=pos.x-4096*CHUNK_SIZE+GSIZE/2;
             int ppz=pos.z-4096*CHUNK_SIZE+GSIZE/2;
@@ -1203,31 +1264,36 @@ BOOL Player::update(float etime){
 #define AMBIENT_LAVABADLANDS 15
 #define AMBIENT_SNOWMOUNTAIN 16
             */
+            extern Vector colorTable[256];
+            // AMBIENT_NIGHT already has a file mapped (night_time_ambience.mp3) but nothing ever
+            // triggered it -- it now replaces the plain AMBIENT_OPEN ambience at night, on the same
+            // bed channel, so it only ever plays in place of (never alongside) the default overworld
+            // soundscape, and any of the specific biome/cave/underwater/skyhigh ambiences below
+            // still take priority over it exactly as they do over AMBIENT_OPEN.
+            BOOL isNight=v_equals(World::getWorld->terrain->final_skycolor,colorTable[54]);
             if(World::getWorld->terrain->tgen->LEVEL_SEED!=DEFAULT_LEVEL_SEED){
-                 Resources::getResources->soundEvent(AMBIENT_OPEN,pos);
+                 Resources::getResources->soundEventBed(isNight?AMBIENT_NIGHT:AMBIENT_OPEN,pos);
             }else
             if(ppx==0&&ppz==0){
-                Resources::getResources->soundEvent(AMBIENT_SNOWMOUNTAIN,pos);
+                Resources::getResources->soundEventBed(AMBIENT_SNOWMOUNTAIN,pos);
             }else if(ppx==0&&ppz==1){
-                Resources::getResources->soundEvent(AMBIENT_PYRAMID,pos);
+                Resources::getResources->soundEventBed(AMBIENT_PYRAMID,pos);
             }else if(ppx==0&&ppz==2){
-                Resources::getResources->soundEvent(AMBIENT_OASIS,pos);
+                Resources::getResources->soundEventBed(AMBIENT_OASIS,pos);
             }else if((ppx==1||ppx==2)&&ppz==3){
-                Resources::getResources->soundEvent(AMBIENT_BEACH,pos);
+                Resources::getResources->soundEventBed(AMBIENT_BEACH,pos);
             }else if(ppx==3&&ppz==3){
-                 Resources::getResources->soundEvent(AMBIENT_LAVABADLANDS,pos);
+                 Resources::getResources->soundEventBed(AMBIENT_LAVABADLANDS,pos);
             }else if(ppx==3&&ppz==2){
-                Resources::getResources->soundEvent(AMBIENT_MARSHBADLANDS,pos);
+                Resources::getResources->soundEventBed(AMBIENT_MARSHBADLANDS,pos);
             }else if(ppx==3&&ppz==1){
-                Resources::getResources->soundEvent(AMBIENT_GRASSBADLANDS,pos);
+                Resources::getResources->soundEventBed(AMBIENT_GRASSBADLANDS,pos);
             }else if((ppx==3||ppx==2||ppx==1)&&ppz==0){
-                Resources::getResources->soundEvent(AMBIENT_GRASSBADLANDS,pos);
+                Resources::getResources->soundEventBed(AMBIENT_GRASSBADLANDS,pos);
             }else
            // printg("region: %d,%d\n",ppx,ppz);
-         Resources::getResources->soundEvent(AMBIENT_OPEN,pos);
+         Resources::getResources->soundEventBed(isNight?AMBIENT_NIGHT:AMBIENT_OPEN,pos);
         }
-    found:
-        ;
     }
 	return FALSE;
 }
@@ -1987,22 +2053,46 @@ void Player::move(float etime){
         NormalizeVector(&vdir);
         NormalizeVector(&volddir);
         Vector crossp=crossProduct(vdir,volddir);
-        
+
         if(absf(absf(crossp.y)-.707107f)<.00003f){
             if(crossp.y>0)yawanimation+=45;
             else yawanimation-=45;
-            
+            // This is the wedge/sideways-ramp auto-turn on ice: vdir/volddir realign within a
+            // frame or two of a genuine turn, so this branch only fires once per turn event.
+            Resources::getResources->playSound(S_ICE_TURN);
+
         }
         if(yawanimation>360)yawanimation-=360;
         if(yawanimation<-360)yawanimation+=360;
-        
-        
+
+
     }
     if(mag!=0&&onIce){
-        if(!lastOnIce){
-           // Resources::getResources->stopSound:icesound];
-            if(icesound==0)
-            icesound=Resources::getResources->playSound(S_ICE_LOOP);
+        // Speed buckets for which ice_slide_loop_*.caf plays -- thresholds are a heuristic off
+        // max_walk_speed's ~5.85 (SPEED_M*1.3) baseline, since ice sliding has no speed cap and can
+        // run well past it on long slopes.
+        int iceBucket=(mag<4.0f)?S_ICE_LOOP_SLOW:((mag<8.0f)?S_ICE_LOOP_MEDIUM:S_ICE_LOOP_FAST);
+        static int lastIceBucket=-1;
+        static float iceBucketHoldTimer=0;
+        if(iceBucketHoldTimer>0)iceBucketHoldTimer-=etime;
+        if(!lastOnIce||(iceBucket!=lastIceBucket&&iceBucketHoldTimer<=0)){
+            if(icesound!=0){
+                Resources::getResources->stopSound(icesound);
+                icesound=0;
+            }
+            icesound=Resources::getResources->playLoopedSound(iceBucket);
+            lastIceBucket=iceBucket;
+            // Debounce, not just a bucket check: the web port's playEffect (SimpleAudioEngine_
+            // web.mm) fetches+decodes asynchronously before actually calling start(), so a
+            // stop+restart within the same frame or two (mag hovering right on a threshold,
+            // re-evaluated every frame) cancels the new voice before its fetch even resolves --
+            // its id is already deleted from A.voices by the time the promise lands, so it never
+            // audibly starts. That's why only whichever bucket mag stayed in longest (medium, in
+            // practice) was ever actually heard, and why an occasional fast-bucket switch that
+            // *did* survive long enough to start sounded like a brief, quiet blip before flicking
+            // back. Holding each bucket for at least .4s gives a freshly started voice time to
+            // actually load and play before another switch can cancel it.
+            iceBucketHoldTimer=.4f;
             iceTimer=.15f;
             lastOnIce=TRUE;
         }

@@ -59,6 +59,14 @@ typedef enum {
 - (CGPoint)locationInView:(UIView *)view;
 - (UITouchPhase)phase;
 - (double)timestamp;
+// Answers "did this come from an actual touchscreen/pointer gesture, as opposed to a synthetic
+// touch the web seam manufactures to drive a HUD button from the keyboard (Input_web.mm's
+// kJumpTouchIdentity/kHudTapIdentity/kClickIdentity, all negative) or the mouse (MOUSE_IDENTITY,
+// also negative)?" Real `Touch.identifier` values from the browser are always >= 0 (Input_web.mm's
+// own comment on this). Exists so engine code (Classes/Hud.mm, Joystick.mm) can ask a semantic
+// question without knowing about identity numbering — keeps that scheme, a platform detail, in
+// this shim rather than in Classes/.
+- (BOOL)isRealTouch;
 // Classes/Input.mm calls `[touch locationInView:touch.view]` (3 sites), so `view` has to be
 // readable as a PROPERTY, not just as a method — dot syntax on a plain method is an error.
 // It always resolves to the one GL view, and -locationInView: ignores its argument anyway
@@ -72,12 +80,29 @@ typedef enum {
 @interface UIEvent : NSObject
 @end
 
-// ---- CGImageRef / UIImageOrientation / UITextAlignment — opaque, P2 territory. Needed only
-// because Classes/Texture2D.h (unmodified engine header, quote-included by Terrain.h and thus
-// forced per the pass-2 grep test) declares methods taking these in its class interface —
-// Texture2D.mm itself is seam-excluded, so nothing here needs to actually decode/rasterize
-// anything yet, just let the (unimplemented, seam-excluded) declarations parse.
-// TODO P2: real CGImageRef-equivalent backed by decoded pixel data once Texture2D_web.mm exists.
+// ---- CGImageRef / UIImageOrientation / UITextAlignment.
+//
+// CGImage is REAL as of the audit-row-11 (A5) recolor work — no longer the opaque P2 placeholder
+// this comment used to describe. It is the port's decoded-pixel handle, and the ONLY thing that
+// makes `Resources::getPaintTex`/`getPaintedTex`/`getDoorTex`/`getSkin` work: those four read
+// pixels back out of one image, tint them through a mask, and hand the result to Texture2D's
+// `Texture2D(CGImageRef, ...)` constructor. With CGImage opaque they were handed a null and the
+// paint/door/creature-tint art drew as nothing (`name` stayed 0).
+//
+// The representation is deliberately NOT CoreGraphics-shaped: one tightly-packed RGBA8 buffer,
+// row 0 = TOP (matching this port's no-V-flip convention, see Texture2D_web.mm initFromImage),
+// STRAIGHT (non-premultiplied) alpha — because stb_image never premultiplies, so every other
+// texture in this port is straight too, and mixing the two conventions is how you get dark
+// fringes on exactly one subset of the UI. The real CoreGraphics path premultiplies inside
+// CGBitmapContext; where that mattered (the recolored region) the source art is alpha==255, so
+// the two agree there — measured on ipad~palette.png/ipad~paint_mask.png: 487/490 masked pixels
+// are alpha 255 and the other three are 252-254.
+struct CGImage {
+    int width;
+    int height;
+    BOOL hasAlpha;          // was the SOURCE 4-channel? drives kTexture2DPixelFormat_Automatic
+    unsigned char *rgba;    // width*height*4, owned by this struct, freed by CGImageRelease
+};
 typedef struct CGImage *CGImageRef;
 typedef enum {
     UIImageOrientationUp, UIImageOrientationDown, UIImageOrientationLeft,
@@ -166,10 +191,16 @@ CGImageRef CGImageCreate(size_t width, size_t height, size_t bitsPerComponent,
                          CGColorRenderingIntent intent);                               // TODO P2
 void CGImageRelease(CGImageRef image);                                                 // TODO P2
 
-// P4: link-only for the DEAD (JUST_TERRAIN_GEN) FileManager::loadGenFromDisk path. Not on any
-// runtime path in this build — never actually invoked, so the bodies are inert.
+// Real since audit row 11 (A5): ManipulateImagePixelData sizes its work from these, exactly as
+// the engine's own CreateARGBBitmapContext(inImage) does.
 size_t CGImageGetWidth(CGImageRef image);
 size_t CGImageGetHeight(CGImageRef image);
+// Creates a CGImage that TAKES OWNERSHIP of `rgbaOwned` (width*height*4, straight alpha, row 0 =
+// top). The buffer must come from malloc/calloc — CGImageRelease free()s it.
+CGImageRef EdenCGImageCreateWithRGBA(unsigned char *rgbaOwned, int width, int height,
+                                     BOOL hasAlpha);
+// P4: link-only for the DEAD (JUST_TERRAIN_GEN) FileManager::loadGenFromDisk path. Not on any
+// runtime path in this build — never actually invoked, so the bodies are inert.
 CGContextRef CGBitmapContextCreate(void *data, size_t width, size_t height,
                                    size_t bitsPerComponent, size_t bytesPerRow,
                                    CGColorSpaceRef space, CGBitmapInfo bitmapInfo);
@@ -185,26 +216,46 @@ NSData *UIImagePNGRepresentation(UIImage *image);                               
 }
 #endif
 
-// ---- UIImage / UIFont / UIColor / UIView / UIAccelerometer — P2 territory (Texture2D/
-// statusbar raster + the (now seam-excluded) VKeyboard's UIView use). Opaque classes only:
-// enough for Resources.h's `UIImage* storedSkins[5][2]` field declarations and statusbar.mm's
-// `[UIFont systemFontOfSize:]` call to PARSE and LINK, not to actually rasterize anything.
-// TODO P2: replace with real Canvas2D/OffscreenCanvas-backed raster per docs/resources-and-audio.md.
-// UIImage is the engine's image handle everywhere it loads a texture or builds one procedurally
-// (Resources.mm recolors door/HUD art by reading pixels out of one image and writing another).
-// All of it is TODO P2 — Texture2D_web.mm plus a Canvas2D/OffscreenCanvas raster path — but the
-// SIGNATURES have to be exact even now, because Resources.mm feeds the results straight into
+// ---- UIImage — REAL as of audit row 11 (A5). It is the engine's image handle everywhere it
+// loads a texture or builds one procedurally: Resources.mm keeps a dozen `UIImage*` globals
+// (`storedPaint`, `storedPaintMask`, `storedSkins[5][2]`, …) that Texture2D::initFromPath fills
+// in as the art loads, then recolors pixels out of one into another. That whole pipeline used to
+// be dead here — `imageNamed:`/`imageWithCGImage:` returned nil and `-CGImage` returned 0 — which
+// is precisely why the paint/door icons and creature tints drew as nothing.
+//
+// A UIImage is now a thin retain-counted owner of one CGImage. Both ivars are POD, deliberately:
+// `class_createInstance()` is a bare `calloc` and this port's hand-written ObjC runtime emits no
+// `.cxx_construct`/`.cxx_destruct`, so a non-POD C++ ivar in an @implementation is never
+// constructed and never destroyed (pass 56 / audit row A12 — the write-up is at the top of
+// NSUserDefaults.mm). A zeroed pointer pair is a valid empty image; an `std::vector` would not be.
+//
+// The signatures have to stay exact, because Resources.mm feeds the results straight into
 // Texture2D's C++ constructor: `new Texture2D([uiImage2 CGImage], [uiImage2 imageOrientation], …)`.
 // Declaring -CGImage as returning `id` (the default for an undeclared selector) makes that
 // constructor call fail to match, which is how these methods were found.
-@interface UIImage : NSObject
-+ (UIImage *)imageNamed:(NSString *)name;                    // TODO P2
+@interface UIImage : NSObject {
+@public
+    CGImageRef _cgImage;                 // owned; released in -dealloc
+    UIImageOrientation _orientation;
+}
++ (UIImage *)imageNamed:(NSString *)name;                    // TODO P2 (no engine call site)
 + (UIImage *)imageWithContentsOfFile:(NSString *)path;       // P4: link-only (loadGenFromDisk, dead)
-+ (UIImage *)imageWithCGImage:(CGImageRef)cgImage;           // TODO P2
-- (CGImageRef)CGImage;                                       // TODO P2
-- (UIImageOrientation)imageOrientation;                      // TODO P2
-- (CGSize)size;                                              // TODO P2
-- (void)drawInRect:(CGRect)rect;                             // TODO P2
+// Both take ownership of `cgImage` (they do NOT copy).
+//
+// USE -initWithCGImage: ON THE TEXTURE-LOAD PATH, NOT THE AUTORELEASED CONVENIENCE. Resources::
+// loadResources runs during World construction, i.e. before the frame loop and therefore before
+// any NSAutoreleasePool exists — +[NSAutoreleasePool currentPool] answers that by lazily creating
+// a fallback root pool that is *never drained by design*, so an autoreleased image created there
+// keeps its decoded pixels resident for the life of the tab. With ~120 textures loading through
+// this path that is tens of MB, on the platform (iOS Safari, see audit row A11/D2) least able to
+// spare it. The convenience form is correct for the RECOLOR path, which only ever runs inside a
+// frame, where audit row A2's per-frame pool drains it.
++ (UIImage *)imageWithCGImage:(CGImageRef)cgImage;
+- (id)initWithCGImage:(CGImageRef)cgImage;
+- (CGImageRef)CGImage;
+- (UIImageOrientation)imageOrientation;
+- (CGSize)size;
+- (void)drawInRect:(CGRect)rect;                             // TODO P2 (no engine call site)
 @end
 
 @interface UIFont : NSObject {

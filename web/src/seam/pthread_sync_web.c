@@ -15,9 +15,33 @@
 // FIX: run the start routine synchronously on the calling (main) thread and return success. The
 // world-load routine touches no GL and is fire-and-forget (the engine never joins/detaches it),
 // so inline execution is behaviorally correct here — the only observable difference is that the
-// progress bar jumps straight to done in one frame instead of animating, which is fine for the
-// debug build. The CMakeLists.txt EDEN_THREADED=OFF branch already documented this as the
-// intended single-thread behavior ("load runs synchronously") but never implemented it.
+// progress bar jumps straight to done in one frame instead of animating. The CMakeLists.txt
+// EDEN_THREADED=OFF branch already documented this as the intended single-thread behavior
+// ("load runs synchronously") but never implemented it.
+//
+// HOW EXPENSIVE IS THAT, ACTUALLY — MEASURED 2026-07-31, and it settles project-audit row 9 (A6).
+// That row asserted this "freezes the whole tab … on a slow phone with a large world this reads as
+// a crash", rated the fix Opus 5 (high) / M, and gated the entire threaded build (row 36) behind
+// fixing it first. None of that was measured. `tools/headless-load-timing.js` measures it, and the
+// answer is:
+//
+//     build-rel:  20-27 ms of contiguous main-thread block, 3 runs      <- what players run
+//     build-st:   51-62 ms                                              <- debug, ~2.5x slower
+//
+// i.e. ONE DROPPED FRAME in release, and ~100-270 ms even at a generous 5-10x mobile penalty. The
+// load is bounded by construction — it is always the same 324 columns of the toroidal window (18x18
+// at 32 KB each), whatever the size of the save file — so this does not grow with playtime, which
+// is what "a large world" assumed. Do not spend an Asyncify/slicing project on this without a NEW
+// measurement that contradicts the above; re-run the tool first.
+//
+// THE ONE PART THAT CAN STILL GET SLOW, and it is not the CPU: on a host that honors HTTP Range,
+// the lazy Eden.eden FS node (src/seam/js/eden_default_world.pre.js) issues 18 SYNCHRONOUS XHRs
+// during the load itself — 18 full round trips of dead main thread, invisible under node (the
+// backend there is fs.readSync) and invisible on localhost. The deployed site does not take that
+// path at all (GitHub Pages ignores Range, so it uses the eager whole-file fallback — audit row
+// A11), so this is a local-dev and future-host concern rather than a player-facing one. If this
+// port is ever deployed somewhere that DOES serve ranges, that is the number to attack, and the
+// cheap attack is prefetching/read-ahead in the FS node, not restructuring the engine's load.
 //
 // This is a user-object-file definition, so it takes precedence over Emscripten libc's archive
 // stub at link time (no --allow-multiple-definition needed). If the threaded build ever tried to

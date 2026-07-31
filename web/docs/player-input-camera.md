@@ -14,6 +14,57 @@ requested, separate Y-axis sensitivity), click to mine/build, scroll-wheel + dig
 below), B to toggle a block preview. Pointer-lock edge cases: window blur force-ends a held click; Escape is
 guarded against double-acting with pointer-lock's own forced pointer release.
 
+**"3-6 random clicks to mine/build" (fixed 2026-07-30, `public/eden-st.html`):** not an
+`Input.mm`/`Hud.mm` consumption bug — `mousedown` only reaches `holdActStart`
+(→ `eden_click_begin`) while `pointerLocked` is true, and *acquiring* that lock is
+what was unreliable. Chromium enforces a real ~1.2s cooldown on
+`requestPointerLock()` shortly after any lock exit (closing a menu/picker with
+Escape triggers one), silently rejecting calls made inside it via a
+`pointerlockerror` event — no exception, so the old `try/catch` around
+`requestLock()` never saw it, and both call sites (manual click-to-lock, and the
+auto-relock after a picker closes) were one-shot with no retry. A player clicking
+during the cooldown got nothing and had no way to know why; the "3-6" was just how
+many blind clicks it took to land one outside the window. Fixed with a
+`lockWanted`/`pointerlockerror`-driven retry (bounded backoff, ~250ms × 6) so one
+click keeps trying until the cooldown clears instead of requiring the player to
+guess.
+
+**"Extra click needed after closing the block/colour picker" (two-part fix,
+`public/eden-st.html`):**
+
+- *Part 1 (2026-07-31):* the auto-relock-after-picker-closes path (`trackCursorNeed`,
+  driven from `Module.__edenFramePost`, i.e. the engine's per-frame poll) calls
+  `requestPointerLock()` from a rAF-adjacent context with no active user gesture — a
+  tick after the click that closed the picker, not inside it. Browsers gate pointer
+  lock on transient user activation, so that call was liable to be silently rejected
+  regardless of the retry loop above (which only survives the *cooldown*, not a missing
+  gesture), leaving the player one real click short of getting the lock back. Fixed by
+  also attempting the relock synchronously inside the `mousedown`/`mouseup` listeners
+  themselves (`reacquireLockIfJustClosed`), gated on `eden_ui_wants_cursor()` reading
+  true-before/false-after the touch was forwarded into the engine.
+
+- *Part 2 (2026-07-31, still reproduced after part 1):* that `false-after` read was
+  itself always stale, so the gate never actually opened from a click. Forwarding the
+  touch (`sendTouch` → `eden_input_pointer_event` → `Input::touchesBegan/Ended`) only
+  fills `Input::getInput()`'s touch-slot table synchronously — the thing that reads a
+  picker-swatch touch and flips `hud->mode` back out of `MODE_PICK_BLOCK`/
+  `MODE_PICK_COLOR` is `Hud::update()` (`Classes/Hud.mm`), which runs only on the
+  engine's *next* tick (`World::update()`, driven by `emscripten_set_main_loop`'s
+  rAF), never inside the synchronous DOM handler. So `eden_ui_wants_cursor()`, read
+  immediately after `sendTouch()` in the same call, still reported the picker as open
+  on the exact click that closed it, and `reacquireLockIfJustClosed` bailed out every
+  time — silently falling through to the per-frame poll's non-gesture relock (part 1's
+  bug, reintroduced by a stale read). Fixed by dropping the post-touch
+  `eden_ui_wants_cursor()` check entirely and trusting `wantedCursorBefore` (an
+  accurate read from *before* this gesture, past the engine's last tick): if a picker
+  was open, attempt the relock unconditionally. A click that doesn't actually land on
+  a swatch (picker stays open) just costs one harmless lock/re-exit flicker next
+  frame, caught by the per-frame poll's own `wants` check. The JS-owned overlays
+  (settings/pause/load-error/main menu) are still gated on their own `isOpen()`, since
+  those are plain synchronous JS state, not engine-tick-delayed. The per-frame poll's
+  own relock branch remains as a fallback for picker closes that don't originate from
+  a click at all (e.g. Escape or an engine-side HUD button).
+
 ## The Y-axis coordinate gotcha
 `eden_input_pointer_event(phase, id, x, y)` takes **top-left-origin, Y-down**
 coordinates (the UIKit `-locationInView:` convention `Input.mm` expects) — but
@@ -123,6 +174,14 @@ settings toggle, not a compile-time constant like `FLY_MODE`: the "Crouch mode" 
 button entirely — its hit-test loop and its render/draw call are both wrapped in
 `if (CROUCH_ENABLED)` (`extern BOOL CROUCH_ENABLED`) — so there's no dead button sitting on screen,
 matching how `FLY_MODE` already hides its own up/down affordances when off.
+
+## Middle-click eyedropper (`eden_pick_block_at_crosshair`, `src/seam/Input_web.mm`)
+Middle-click raycasts the crosshair block and copies its type into the current hotbar
+slot (`Terrain::getLand`). **Fixed 2026-07-31:** it read type only and dropped the
+block's paint color, unlike the real 35-cell picker (`Hud.mm`) which always sets
+`hud->block_paintcolor` alongside `blocktype`. Now also reads `Terrain::getColor(x,z,y)`
+and assigns it to `hud->block_paintcolor`, so eyedropping a painted block carries the
+color into the next placement.
 
 ## Port-invented UI riding on this input layer
 A curated 9-block hotbar strip and a real DOM crosshair are **port inventions** — the

@@ -84,7 +84,9 @@ static const Setting kSettings[] = {
   { "music",             "Music",             "Audio",     KIND_TOGGLE, ENG_MUSIC,      0,   1,   1,   1,  NULL,                                                               NULL },
   { "sound",             "Sound effects",     "Audio",     KIND_TOGGLE, ENG_SOUND,      0,   1,   1,   1,  NULL,                                                               NULL },
   { "music_volume",      "Music volume",      "Audio",     KIND_RANGE,  -1,             0,   1, .05f,  1,  NULL,                                                               NULL },
+  { "ambience_volume",   "Ambience volume",   "Audio",     KIND_RANGE,  -1,             0,   1, .05f,  1,  NULL,                                                               NULL },
   { "effects_volume",    "Effects volume",    "Audio",     KIND_RANGE,  -1,             0,   1, .05f,  1,  NULL,                                                               NULL },
+  { "touch_controls_sound", "Touch controls sound", "Audio", KIND_TOGGLE, -1,           0,   1,   1,   0,  "Joystick and jump-button taps make a sound. Touchscreen only -- never fires for keyboard/mouse. Off by default.", NULL },
 
   // input_mode: 0=Auto (matchMedia + first-input detection, see eden-st.html), 1=Touch,
   // 2=Keyboard+Mouse. Auto is the default so nothing changes for players who never open Settings.
@@ -337,9 +339,15 @@ static void eden_apply_setting(int i, bool commitEngine) {
     } else if (std::strcmp(s.key, "music_volume") == 0) {
         if (CocosDenshion::SimpleAudioEngine::sharedEngine())
             CocosDenshion::SimpleAudioEngine::sharedEngine()->setBackgroundMusicVolume(v);
+    } else if (std::strcmp(s.key, "ambience_volume") == 0) {
+        if (CocosDenshion::SimpleAudioEngine::sharedEngine())
+            CocosDenshion::SimpleAudioEngine::sharedEngine()->setAmbienceVolume(v);
     } else if (std::strcmp(s.key, "effects_volume") == 0) {
         if (CocosDenshion::SimpleAudioEngine::sharedEngine())
             CocosDenshion::SimpleAudioEngine::sharedEngine()->setEffectsVolume(v);
+    } else if (std::strcmp(s.key, "touch_controls_sound") == 0) {
+        extern bool touchControlsSoundEnabled;
+        touchControlsSoundEnabled = (v != 0.0f);
     }
 }
 

@@ -1,4 +1,6 @@
 // eden-loading.js — a real loading/progress UI (perf-audit-dazzling-munching-bengio.md row 11:
+// Requires: window.EdenUI, Module.dataFileDownloads. Publishes: window.EdenLoading. See docs/ui.md's
+// dependency graph (audit I2).
 // "Minute-plus black screen on mobile" — the old UI was a 12px monospace diagnostic line plus a
 // black canvas, meant for developers, not players).
 //

@@ -1,4 +1,6 @@
 // eden-menu.js — the rebuilt main menu: Main Menu, Load World, New World.
+// Requires: window.EdenUI, window.EdenStorage, window.EdenAssets, window.EdenPauseMenu.tick.
+// Publishes: window.EdenMenu. See docs/ui.md's dependency graph (audit I2).
 //
 // These are the three Figma mockup screens (Emod-Menu, Emod-Menu-LoadWorld, Emod-Menu-CreateWorld)
 // rebuilt in the DOM on the Eden: Community Edition design system.

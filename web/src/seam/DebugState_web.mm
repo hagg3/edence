@@ -17,6 +17,7 @@
 #include "../../../Classes/Input.h"
 #include "../../../Classes/Constants.h"       // NUM_CREATURES, for the pass-27 model probe
 #include "../../../Classes/PVRTModelPOD.h"    // CPVRTModelPOD, ditto
+#include "../../../Classes/Resources.h"       // audit row 11 (A5) recolor probe
 #include <emscripten/emscripten.h>
 #include <cstdio>
 
@@ -177,6 +178,64 @@ extern "C" const char *eden_debug_alloc_state(void) {
              "{\"blockarray\":%u,\"lightarray\":%u,\"lightarray_bytes\":%u}",
              (unsigned)(uintptr_t)blockarray, (unsigned)(uintptr_t)lightarray,
              (unsigned)(sizeof(Vector8) * T_SIZE * T_SIZE * T_HEIGHT));
+    return buf;
+}
+
+// Audit row 11 (A5) regression probe. The recolor pipeline is entirely invisible from the outside
+// — its failure mode is a Texture2D whose GL `name` stayed 0, which draws as nothing and reports
+// no error — so there is no way to assert it from a headless harness without asking the engine
+// directly. Reports, for one paint colour, whether each input image survived load and whether the
+// recolored texture actually got a GL name. `stored_*` being 0 means initFromPath's storeImage
+// block didn't fire (asset missing, or the positional classification drifted); `paint_tex` being 0
+// with both inputs present means ManipulateImagePixelData returned null.
+//
+// Colour 0 is deliberately rejected: Resources::getPaintTex short-circuits it to the plain
+// ICO_PAINT atlas texture and never reaches the recolor at all, so probing it would pass whether
+// or not the pipeline works. tools/headless-recolor-test.js drives this.
+EMSCRIPTEN_KEEPALIVE
+extern "C" const char *eden_debug_recolor_state(int color) {
+    static char buf[512];
+    extern int realStoredSkinCounter;
+    extern int storedMaskCounter;
+    extern UIImage *storedPaint;
+    extern UIImage *storedPaintMask;
+    extern UIImage *storedDoor;
+    extern UIImage *storedDoorMask;
+    if (!Resources::getResources || color <= 0) {
+        snprintf(buf, sizeof(buf), "{\"error\":\"no Resources, or color<=0 (see comment)\"}");
+        return buf;
+    }
+    CGImageRef paintCG = [storedPaint CGImage];
+    CGImageRef maskCG = [storedPaintMask CGImage];
+    Texture2D *paintTex = Resources::getResources->getPaintTex(color);
+    int doorTex = Resources::getResources->getDoorTex(color);
+
+    // The creature half of the same pipeline. These two 5x2 tables are filled POSITIONALLY (the
+    // Nth texture load since Resources::loadResources zeroed the counter), which is the part most
+    // likely to drift silently if anyone reorders a texture load — a wrong count here means
+    // creatures get each other's skins, with nothing else to notice it by.
+    extern UIImage *storedSkins[5][2];
+    extern UIImage *storedMasks[5][2];
+    int skinsFilled = 0, masksFilled = 0;
+    for (int m = 0; m < 5; m++) {
+        for (int s = 0; s < 2; s++) {
+            if (storedSkins[m][s] != nil) skinsFilled++;
+            if (storedMasks[m][s] != nil) masksFilled++;
+        }
+    }
+
+    snprintf(buf, sizeof(buf),
+             "{\"color\":%d,\"stored_paint\":%d,\"stored_paint_mask\":%d,"
+             "\"stored_door\":%d,\"stored_door_mask\":%d,"
+             "\"paint_w\":%d,\"paint_h\":%d,\"mask_w\":%d,\"mask_h\":%d,"
+             "\"paint_tex\":%u,\"door_tex\":%d,"
+             "\"skins_filled\":%d,\"masks_filled\":%d,\"skin_counter\":%d,\"mask_counter\":%d}",
+             color, storedPaint != nil, storedPaintMask != nil,
+             storedDoor != nil, storedDoorMask != nil,
+             paintCG ? paintCG->width : -1, paintCG ? paintCG->height : -1,
+             maskCG ? maskCG->width : -1, maskCG ? maskCG->height : -1,
+             paintTex ? (unsigned)paintTex->name : 0u, doorTex,
+             skinsFilled, masksFilled, realStoredSkinCounter, storedMaskCounter);
     return buf;
 }
 

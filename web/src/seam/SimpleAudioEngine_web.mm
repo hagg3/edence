@@ -28,6 +28,8 @@
 // ---------------------------------------------------------------------------------------------
 // JS side: manifest lookup, CAF decode, effect cache, music element.
 // ---------------------------------------------------------------------------------------------
+// One playback channel: its own <audio> element, track name, and the two independent volume
+// factors the engine and the settings slider each own (see makeChannel below).
 EM_JS(void, eden_audio_js_init, (), {
     if (Module.__edenAudio) return;
     var A = {
@@ -38,19 +40,69 @@ EM_JS(void, eden_audio_js_init, (), {
         pending: {},      // name -> Promise
         voices: {},       // id -> AudioBufferSourceNode
         nextId: 1,
-        music: null,
-        musicName: null,
-        musicVolume: 1.0,
         // Browsers start an AudioContext suspended until a user gesture; the engine happily calls
         // playEffect before the player has clicked anything, so resume lazily on every gesture and
         // let pre-gesture sounds drop rather than queueing a burst that all fires at once later.
         resume: function() {
             if (A.ctx && A.ctx.state === 'suspended') A.ctx.resume();
-            if (A.music && A.music.paused && A.musicWanted) A.music.play().catch(function(){});
+            if (A.suspendedForVisibility) return;
+            for (var k in A.channels) {
+                var c = A.channels[k];
+                if (c.audio && c.audio.paused && c.wanted) c.audio.play().catch(function(){});
+            }
         }
     };
 
     A.effectsVolume = 1.0;
+
+    // channel ids: 0=music, 1=ambience bed, 2=ambience water/lava proximity, 3=ambience portal
+    // proximity, 4=ambience treasure-cube proximity.
+    A.makeChannel = function() {
+        return {
+            audio: null,
+            name: null,
+            wanted: false,
+            userVolume: 1.0,   // settings-slider value
+            engineFade: 1.0,   // per-frame crossfade value computed by the engine
+            applyVolume: function() {
+                if (!this.audio) return;
+                var f = this.engineFade; if (f < 0) f = 0; if (f > 1) f = 1;
+                var v = this.userVolume * f;
+                if (v < 0) v = 0; if (v > 1) v = 1;
+                this.audio.volume = v;
+            }
+        };
+    };
+    A.channels = { 0: A.makeChannel(), 1: A.makeChannel(), 2: A.makeChannel(), 3: A.makeChannel(), 4: A.makeChannel() };
+
+    // Part A: tell the browser this page's media is not to be driven by hardware/OS media keys —
+    // without this, browsers auto-register any playing <audio> element with the OS media-key /
+    // lock-screen "Now Playing" system, so a Bluetooth play-pause key would pause/resume game audio.
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+        ['play', 'pause', 'stop', 'seekbackward', 'seekforward', 'previoustrack', 'nexttrack'].forEach(function(action) {
+            try { navigator.mediaSession.setActionHandler(action, function() {}); } catch (e) {}
+        });
+    }
+
+    // Part A: backgrounding pauses every channel (without forgetting they're "wanted") and
+    // suspends the effects AudioContext; foregrounding resumes both. iOS otherwise keeps playing
+    // game sound like a music app when the tab is backgrounded or the screen locks.
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                A.suspendedForVisibility = true;
+                for (var k in A.channels) {
+                    var c = A.channels[k];
+                    if (c.audio) c.audio.pause();
+                }
+                if (A.ctx && A.ctx.state === 'running') A.ctx.suspend();
+            } else {
+                A.suspendedForVisibility = false;
+                if (A.ctx && A.ctx.state === 'suspended') A.ctx.resume();
+                A.resume();
+            }
+        });
+    }
 
     A.getCtx = function() {
         if (!A.ctx) {
@@ -228,6 +280,13 @@ EM_JS(unsigned int, eden_audio_play_effect, (const char *name, int loop), {
     var ctx = A.getCtx(); if (!ctx) return 0;
     A.resume();
     var id = A.nextId++;
+    // Per-file loudness correction: door_open.mp3/door_close.mp3 are mastered noticeably hotter
+    // than the rest of the (mostly .caf) effect library — a years-old complaint (see Classes/
+    // Terrain.mm's door-animation code) that isn't fixable via SimpleAudioEngine::playEffect since
+    // it takes no gain argument. Cheaper to correct here, once, than to remaster the asset.
+    var DOOR_SFX_GAIN = 0.5;
+    var gainScale = (n.indexOf('door_open.mp3') !== -1 || n.indexOf('door_close.mp3') !== -1)
+        ? DOOR_SFX_GAIN : 1.0;
     // Async by nature (first play of a sound has to fetch it). Returning the id immediately keeps
     // the engine's synchronous contract; a stopEffect(id) arriving before the fetch lands is
     // handled by checking that the id is still registered when the buffer is ready.
@@ -237,7 +296,15 @@ EM_JS(unsigned int, eden_audio_play_effect, (const char *name, int loop), {
         var src = ctx.createBufferSource();
         src.buffer = buf;
         src.loop = !!loop;
-        src.connect(A.effectsGain || ctx.destination);
+        var dest = A.effectsGain || ctx.destination;
+        if (gainScale !== 1.0 && A.effectsGain) {
+            var trim = ctx.createGain();
+            trim.gain.value = gainScale;
+            src.connect(trim);
+            trim.connect(dest);
+        } else {
+            src.connect(dest);
+        }
         src.onended = function() { delete A.voices[id]; };
         src.start(0);
         A.voices[id] = src;
@@ -263,45 +330,60 @@ EM_JS(void, eden_audio_unload, (const char *name), {
     if (n) { delete A.buffers[n]; delete A.pending[n]; }
 });
 
-EM_JS(void, eden_audio_play_music, (const char *name, int loop), {
+EM_JS(void, eden_audio_play_channel, (int ch, const char *name, int loop), {
     var A = Module.__edenAudio; if (!A) return;
+    var c = A.channels[ch]; if (!c) return;
     var n = UTF8ToString(name); if (!n) return;
     A.loadManifest().then(function() {
         var url = A.urlFor(n);
         if (!url) return;
-        if (A.music && A.musicName === n) { A.music.loop = !!loop; A.musicWanted = true;
-            A.music.play().catch(function(){}); return; }
-        if (A.music) { A.music.pause(); A.music.src = ''; }
-        A.music = new Audio(url);
-        A.music.loop = !!loop;
-        A.music.volume = A.musicVolume;
-        A.musicName = n;
-        A.musicWanted = true;
-        A.music.play().catch(function() {});  // blocked until a gesture; A.resume retries
+        if (c.audio && c.name === n) {
+            c.audio.loop = !!loop; c.wanted = true;
+            if (!A.suspendedForVisibility) c.audio.play().catch(function(){});
+            return;
+        }
+        if (c.audio) { c.audio.pause(); c.audio.src = ''; }
+        c.audio = new Audio(url);
+        c.audio.loop = !!loop;
+        c.applyVolume();
+        c.name = n;
+        c.wanted = true;
+        if (!A.suspendedForVisibility) c.audio.play().catch(function() {});  // blocked until a gesture; A.resume retries
     });
 });
 
-EM_JS(void, eden_audio_stop_music, (), {
-    var A = Module.__edenAudio; if (!A || !A.music) return;
-    A.musicWanted = false;
-    A.music.pause();
-    A.music.currentTime = 0;
-});
-
-EM_JS(int, eden_audio_is_music_playing, (), {
-    var A = Module.__edenAudio;
-    return (A && A.music && !A.music.paused && !A.music.ended) ? 1 : 0;
-});
-
-EM_JS(void, eden_audio_set_music_volume, (float v), {
+EM_JS(void, eden_audio_stop_channel, (int ch), {
     var A = Module.__edenAudio; if (!A) return;
-    A.musicVolume = Math.max(0, Math.min(1, v));
-    if (A.music) A.music.volume = A.musicVolume;
+    var c = A.channels[ch]; if (!c || !c.audio) return;
+    c.wanted = false;
+    c.audio.pause();
+    c.audio.currentTime = 0;
 });
 
-EM_JS(float, eden_audio_get_music_volume, (), {
-    var A = Module.__edenAudio;
-    return A ? A.musicVolume : 0;
+EM_JS(int, eden_audio_is_channel_playing, (int ch), {
+    var A = Module.__edenAudio; if (!A) return 0;
+    var c = A.channels[ch];
+    return (c && c.audio && !c.audio.paused && !c.audio.ended) ? 1 : 0;
+});
+
+EM_JS(void, eden_audio_set_channel_user_volume, (int ch, float v), {
+    var A = Module.__edenAudio; if (!A) return;
+    var c = A.channels[ch]; if (!c) return;
+    c.userVolume = Math.max(0, Math.min(1, v));
+    c.applyVolume();
+});
+
+EM_JS(float, eden_audio_get_channel_user_volume, (int ch), {
+    var A = Module.__edenAudio; if (!A) return 0;
+    var c = A.channels[ch];
+    return c ? c.userVolume : 0;
+});
+
+EM_JS(void, eden_audio_set_channel_fade, (int ch, float v), {
+    var A = Module.__edenAudio; if (!A) return;
+    var c = A.channels[ch]; if (!c) return;
+    c.engineFade = v;
+    c.applyVolume();
 });
 
 EM_JS(void, eden_audio_set_effects_volume, (float v), {
@@ -347,16 +429,34 @@ void SimpleAudioEngine::unloadEffect(const char *filePath) {
     if (filePath) eden_audio_unload(filePath);
 }
 void SimpleAudioEngine::playBackgroundMusic(const char *filePath, bool loop) {
-    if (filePath) eden_audio_play_music(filePath, loop ? 1 : 0);
+    if (filePath) eden_audio_play_channel(0, filePath, loop ? 1 : 0);
 }
 void SimpleAudioEngine::stopBackgroundMusic(bool releaseData) {
     (void)releaseData;
-    eden_audio_stop_music();
+    eden_audio_stop_channel(0);
 }
-bool SimpleAudioEngine::isBackgroundMusicPlaying() { return eden_audio_is_music_playing() != 0; }
-float SimpleAudioEngine::getBackgroundMusicVolume() { return eden_audio_get_music_volume(); }
-void SimpleAudioEngine::setBackgroundMusicVolume(float volume) { eden_audio_set_music_volume(volume); }
+bool SimpleAudioEngine::isBackgroundMusicPlaying() { return eden_audio_is_channel_playing(0) != 0; }
+// Music has always had a single volume knob (no separate user/engine fade split) — the settings
+// slider and Resources::update's song crossfade both call this, last write wins, unchanged from
+// before this channel split. Only the four ambience channels below get the userVolume/engineFade
+// separation, via setAmbienceVolume vs. setAmbienceFade.
+float SimpleAudioEngine::getBackgroundMusicVolume() { return eden_audio_get_channel_user_volume(0); }
+void SimpleAudioEngine::setBackgroundMusicVolume(float volume) { eden_audio_set_channel_user_volume(0, volume); }
 float SimpleAudioEngine::getEffectsVolume() { return eden_audio_get_effects_volume(); }
 void SimpleAudioEngine::setEffectsVolume(float volume) { eden_audio_set_effects_volume(volume); }
+
+void SimpleAudioEngine::playAmbience(int layer, const char *filePath, bool loop) {
+    if (filePath) eden_audio_play_channel(layer + 1, filePath, loop ? 1 : 0);
+}
+void SimpleAudioEngine::stopAmbience(int layer) { eden_audio_stop_channel(layer + 1); }
+bool SimpleAudioEngine::isAmbiencePlaying(int layer) { return eden_audio_is_channel_playing(layer + 1) != 0; }
+void SimpleAudioEngine::setAmbienceFade(int layer, float fade) { eden_audio_set_channel_fade(layer + 1, fade); }
+float SimpleAudioEngine::getAmbienceVolume() { return eden_audio_get_channel_user_volume(1); }
+void SimpleAudioEngine::setAmbienceVolume(float v) {
+    eden_audio_set_channel_user_volume(1, v);
+    eden_audio_set_channel_user_volume(2, v);
+    eden_audio_set_channel_user_volume(3, v);
+    eden_audio_set_channel_user_volume(4, v);
+}
 
 }  // namespace CocosDenshion

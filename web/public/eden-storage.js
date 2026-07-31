@@ -1,4 +1,8 @@
 // eden-storage.js — local persistence + the Settings panel's "Storage" tab (pass 29).
+// Requires: Module.preRun, FS.*, Module._eden_storage_list_worlds; calls window.EdenLoadError
+// (loaded later) only from async syncfs/quota callbacks, never at top-level script time — see
+// docs/ui.md's dependency graph (audit I2) for why that ordering is safe. Publishes:
+// window.EdenStorage.
 //
 // Mounts /documents (the REAL FileManager's save directory — see docs/save-load.md) on IndexedDB
 // via Emscripten's IDBFS, so world saves survive a reload instead of vanishing with the MEMFS they
@@ -52,6 +56,44 @@
     FS.syncfs(/*populate:*/true, function (err) {
       if (err) console.warn('[eden-storage] IndexedDB -> MEMFS populate failed:', err);
       M.removeRunDependency('eden-idbfs-populate');
+      checkQuotaAndWarn();
+    });
+  }
+
+  // Audit row A7: a `QuotaExceededError` (or any other) out of `FS.syncfs(false, …)` used to be
+  // swallowed by a bare `catch (e) {}` here and at importFile's syncfs below — the player sees a
+  // successful-looking save that never actually reached IndexedDB. Surface it through the same
+  // dialog eden-loaderror.js already shows for a corrupt load, since both are "your world isn't
+  // safe" situations the player must not find out about only on next boot. Reported once per
+  // session (`warnedThisSession`) so a string of autosaves during a long play session doesn't spam
+  // the dialog for what is, after the first hit, the same underlying full-quota condition.
+  var warnedThisSession = false;
+  function reportSyncError(err) {
+    console.warn('[eden-storage] IndexedDB persist failed:', err);
+    if (warnedThisSession) return;
+    if (!(window.EdenLoadError && window.EdenLoadError.showStorageWarning)) return;
+    var msg = (err && (err.name === 'QuotaExceededError' || /quota/i.test(String(err.message || err))))
+      ? 'Your browser’s storage quota is full, so this save did not actually persist.'
+      : 'A save to browser storage failed to persist (' + (err && (err.name || err.message) || err) + ').';
+    warnedThisSession = true;
+    window.EdenLoadError.showStorageWarning(msg);
+  }
+
+  // Pre-flight warning: check usage against quota *before* it actually fails, since by the time
+  // syncfs errors the write attempt already happened. 80% is the threshold the audit calls out —
+  // early enough to give the player a chance to export a world (F2) or clear space.
+  function checkQuotaAndWarn() {
+    if (warnedThisSession) return;
+    estimateQuota(function (est) {
+      if (!est || !est.quota) return;
+      if (est.usage / est.quota < 0.8) return;
+      if (warnedThisSession) return;
+      if (!(window.EdenLoadError && window.EdenLoadError.showStorageWarning)) return;
+      warnedThisSession = true;
+      window.EdenLoadError.showStorageWarning(
+        'Browser storage is ' + Math.round(100 * est.usage / est.quota) + '% full (' +
+        formatBytes(est.usage) + ' of ' + formatBytes(est.quota) + '). Saves may soon fail to ' +
+        'persist — consider exporting a world (Storage tab) or freeing space.');
     });
   }
 
@@ -60,7 +102,12 @@
   // 'beforeunload' (unreliable on mobile Safari) or 'unload' (deprecated).
   function flushNow() {
     if (!mounted || typeof FS === 'undefined') return;
-    try { FS.syncfs(false, function () {}); } catch (e) {}
+    checkQuotaAndWarn();
+    try {
+      FS.syncfs(false, function (err) { if (err) reportSyncError(err); });
+    } catch (e) {
+      reportSyncError(e);
+    }
   }
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'hidden') flushNow();
@@ -108,7 +155,10 @@
         var name = file.name || ('import-' + Date.now());
         if (!/\.eden$/i.test(name)) name += '.eden';
         FS.writeFile(MOUNT_PATH + '/' + name, new Uint8Array(reader.result));
-        if (mounted) { try { FS.syncfs(false, function () {}); } catch (e) {} }
+        if (mounted) {
+          try { FS.syncfs(false, function (err) { if (err) reportSyncError(err); }); }
+          catch (e) { reportSyncError(e); }
+        }
         if (ready() && M()._eden_storage_reload_worlds) M()._eden_storage_reload_worlds();
         cb && cb(true, null);
       } catch (e) {

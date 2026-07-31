@@ -307,9 +307,17 @@ int unloadChunk(any_t passedIn,any_t chunkToUnload){
 
 void Terrain::unloadTerrain(BOOL exitToMenu){
     loaded=FALSE;
-    portals->removeAllPortals();
-    fireworks->removeAllFireworks();
 	if(exitToMenu){
+        // Only wipe the portal/firework registries when the mesh cache (troot) is ALSO being
+        // discarded. Portal::addPortal only runs when a chunk's mesh is actually rebuilt
+        // (TerrainChunk.mm), which most portals never get again after their first meshing unless
+        // their chunk is dirtied or streams back in fresh -- so clearing the registry on every
+        // unloadTerrain(FALSE) call (warpToHome, column streaming, etc., which keep the cached
+        // meshes and never remesh an untouched portal's chunk again) permanently orphaned any
+        // portal whose chunk wasn't freshly remeshed afterward: proximity ambience (and actual
+        // teleport, Portal::enterPortal) would both silently stop finding it.
+        portals->removeAllPortals();
+        fireworks->removeAllFireworks();
         freeTree(&troot);
         initTree(&troot);
 	//	hashmap_iterate(chunkMap, unloadChunk, NULL);
@@ -2718,7 +2726,7 @@ void Terrain::render(){
             if(door->ani<0){
                 Resources::getResources->playSound(S_DOOR_OPEN);
             }else if(door->ani > 0){
-              //   Resources::getResources->playSound:S_DOOR_CLOSED];
+                Resources::getResources->playSound(S_DOOR_CLOSED);
             }
         }
         float rot=door->rot;
