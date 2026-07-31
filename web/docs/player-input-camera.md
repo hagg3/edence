@@ -144,10 +144,19 @@ one directly from web-side code (see
 ## Mobile touch-offset / picking-viewport fix
 `findWorldCoords`'s raycast reads back whatever `GL_VIEWPORT` currently reports and
 assumes a fixed `SCALE_WIDTH`/`SCALE_HEIGHT` of 2.0. This is really a rendering-side
-fix (a pinned `{0,0,1136,640}` viewport answer for picking purposes only) but it's
-exactly this subsystem's bug — see [gl-shim.md](gl-shim.md) for the full explanation
-of why the drawable becoming dynamically sized broke it and how the fix cancels the
-engine's fixed math regardless of true drawable size.
+fix (`GL_VIEWPORT` answers the engine's POINT space × `SCALE_*` for picking purposes only,
+never the real drawable) but it's exactly this subsystem's bug — see
+[gl-shim.md](gl-shim.md) for the full explanation of why the drawable becoming dynamically
+sized broke it and how the fix cancels the engine's fixed math regardless of true drawable
+size.
+
+Since audit D1/D4 that answer is no longer the compile-time `{0,0,1136,640}`: the point space
+is derived from the window aspect and a UI-scale setting, so it is recomputed on every metrics
+change (`eden_gl_set_pick_viewport()`). **The point space is not fixed for the process lifetime
+any more** — nothing on the input path may cache it. `Input::scr_width/scr_height` follow it via
+`Input::screenMetricsChanged()`, and the page re-reads `eden_display_point_width/height()` on
+every layout pass rather than holding the old 568×320 constants. See
+[ui.md](ui.md#the-point-space-derived-not-pinned-audit-rows-d1--d4).
 
 ## FOV
 A `-Wl,--wrap=` on `gluPerspective` (`Classes/Graphics.mm` hard-codes 80°). Picking

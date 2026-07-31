@@ -63,18 +63,28 @@ and the page is stuck.
 The drawable (canvas backing store) is dynamic; the engine's notion of screen size is
 not. `eden_set_drawable_size()` scales the CSS box × `min(devicePixelRatio, cap)` ×
 a render-scale setting into the actual backing-store/viewport size, but
-`SCREEN_WIDTH`/`SCREEN_HEIGHT` (the globals the engine reads) stay pinned to their
-original values. The backing store is clamped to 4096px/axis (risk of exceeding
-`GL_MAX_RENDERBUFFER_SIZE` otherwise).
+`SCREEN_WIDTH`/`SCREEN_HEIGHT` (the globals the engine reads) are untouched by it — the
+drawable and the point space are two independent things. The backing store is clamped to
+4096px/axis (risk of exceeding `GL_MAX_RENDERBUFFER_SIZE` otherwise).
 
-**This is the root cause of the mobile touch-offset bug** fixed in the recent "web:
-fix mobile touch offset in mine/build raycast" / "fix jumps added crosshair back"
-commits: `Util.mm`'s `findWorldCoords` raycast reads back whatever `GL_VIEWPORT`
-currently reports and assumes it matches a fixed pixel scale. Once the drawable
-became dynamically sized, that no longer matched the assumed 1136×640. Fix:
-`eden_gl_glGetIntegerv(GL_VIEWPORT, …)` answers a **pinned** `{0, 0, 1136, 640}` for
-picking purposes regardless of the real drawable size — the real size is tracked
-separately but deliberately not surfaced to this one call site.
+**This is the root cause of the mobile touch-offset bug** fixed in the "web: fix mobile
+touch offset in mine/build raycast" / "fix jumps added crosshair back" commits:
+`Util.mm`'s `findWorldCoords` raycast reads back whatever `GL_VIEWPORT` currently reports
+and assumes it matches the engine's own POINT space × `SCALE_*`. Once the drawable became
+dynamically sized, the real viewport no longer matched that. Fix: `eden_gl_glGetIntegerv(
+GL_VIEWPORT, …)` answers `kPickViewport` — the POINT space × `SCALE_*` — for picking
+purposes regardless of the real drawable size; the real size is tracked separately in
+`g_viewport` but deliberately not surfaced to this one call site.
+
+`kPickViewport` was a compile-time `{0, 0, 1136, 640}` until audit rows D1/D4 made the point
+space itself derived (window aspect × a UI-scale setting — see
+[ui.md](ui.md#the-point-space-derived-not-pinned-audit-rows-d1--d4)). It is now a variable that
+`src/seam/DisplayProfile_web.mm` writes through `eden_gl_set_pick_viewport()` on every metrics
+change; its initialiser is still the classic 568×320@2x, which is what the headless build and the
+pre-first-layout frames get. **The invariant, not the number, is what matters: this answers the
+POINT space, never the real drawable.** Getting it wrong is invisible at the screen centre and
+grows toward the edges. `tools/headless-display-profile-test.js` asserts it at every point space it
+visits.
 
 ## Creature (matrix-palette) skinning emulation
 - `glGetString(GL_EXTENSIONS)` is *answered*, not forwarded to the real driver: the

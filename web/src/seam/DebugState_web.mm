@@ -12,17 +12,22 @@
 // dynamically, single string, single frame use — no ownership/free story needed, matches this
 // port's other simple debug exports).
 #import "../shim/foundation/uikit_stubs.h"
+#include "gl_es1_shim.h"                     // eden_gl_glGetIntegerv, for the D1 pick-viewport probe
 #include "../../../Classes/World.h"
 #include "../../../Classes/Globals.h"
 #include "../../../Classes/Input.h"
 #include "../../../Classes/Constants.h"       // NUM_CREATURES, for the pass-27 model probe
 #include "../../../Classes/PVRTModelPOD.h"    // CPVRTModelPOD, ditto
 #include "../../../Classes/Resources.h"       // audit row 11 (A5) recolor probe
+#include "DisplayProfile_web.h"               // audit D1/D4 display-profile probe
 #include <emscripten/emscripten.h>
 #include <cstdio>
 
 // Globals.mm-only (not declared in Globals.h — Pass 16 already ran into this for the same reason).
 extern BOOL IS_WIDESCREEN;
+// Declared in Globals.h, but with C++ linkage — so it has to be re-declared HERE, outside the
+// `extern "C"` block below, not inside the one function that reads it.
+extern float P_ASPECT_RATIO;
 
 extern "C" {
 
@@ -82,6 +87,67 @@ const char* eden_debug_hud_rects(void) {
     snprintf(buf, sizeof(buf), "{\"rexit\":[%.2f,%.2f,%.2f,%.2f],\"rhome\":[%.2f,%.2f,%.2f,%.2f]}",
              h->rexit.origin.x, h->rexit.origin.y, h->rexit.size.width, h->rexit.size.height,
              h->rhome.origin.x, h->rhome.origin.y, h->rhome.size.width, h->rhome.size.height);
+    return buf;
+}
+
+// Audit D1/D4 addition: the derived point space + the HUD rects that actually move with it. This
+// is what tools/headless-display-profile-test.js asserts against — the whole point of unpinning
+// SCREEN_WIDTH/SCREEN_HEIGHT is that they now have more than one correct value, so "did the layout
+// follow?" stopped being answerable by reading a constant out of the source. rjumphit/rmenu are the
+// two extremes (right-edge-anchored and top-left-anchored), blockBounds[0] is the block picker's
+// first cell (the one whose margin has the hand-tuned widescreen nudge in it), and rmine is on the
+// right-hand mode column that HUDR_X drives.
+EMSCRIPTEN_KEEPALIVE
+const char* eden_debug_display_state(void) {
+    static char buf[1024];
+    const char* profile = eden_profile_name();
+    if (!World::getWorld || !World::getWorld->hud) {
+        snprintf(buf, sizeof(buf),
+                 "{\"profile\":\"%s\",\"SCREEN_WIDTH\":%.1f,\"SCREEN_HEIGHT\":%.1f,"
+                 "\"P_ASPECT_RATIO\":%.4f,\"IS_WIDESCREEN\":%d,\"hud\":false}",
+                 profile, SCREEN_WIDTH, SCREEN_HEIGHT, P_ASPECT_RATIO, (int)IS_WIDESCREEN);
+        return buf;
+    }
+    Hud* h = World::getWorld->hud;
+    Input* in = Input::getInput();
+    // What Util.mm's findWorldCoords will unproject a tap against. The contract the shim's
+    // kPickViewport exists to hold is exactly `viewport == point space x SCALE_*`; reporting it
+    // here is what lets the headless test assert that instead of trusting it.
+    GLint vp[4] = {0, 0, 0, 0};
+    eden_gl_glGetIntegerv(GL_VIEWPORT, vp);
+    snprintf(buf, sizeof(buf),
+        "{\"profile\":\"%s\",\"SCREEN_WIDTH\":%.1f,\"SCREEN_HEIGHT\":%.1f,"
+        "\"P_ASPECT_RATIO\":%.4f,\"IS_WIDESCREEN\":%d,\"hud\":true,"
+        "\"point_w\":%d,\"point_h\":%d,\"aspect_x1000\":%d,\"touch_chrome\":%d,"
+        "\"pick_viewport\":[%d,%d],"
+        "\"scr\":[%d,%d],\"use_joystick\":%d,"
+        "\"rmine\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"rjumphit\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"rmenu\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"rmenuframe\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"rpaintframe\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"rburn\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"rpaint\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"block0\":[%.1f,%.1f,%.1f,%.1f],"
+        "\"color0\":[%.1f,%.1f,%.1f,%.1f]}",
+        profile, SCREEN_WIDTH, SCREEN_HEIGHT, P_ASPECT_RATIO, (int)IS_WIDESCREEN,
+        eden_display_point_width(), eden_display_point_height(), eden_display_aspect_x1000(),
+        eden_profile_touch_chrome(),
+        (int)vp[2], (int)vp[3],
+        in->scr_width, in->scr_height, h->use_joystick,
+        h->rmine.origin.x, h->rmine.origin.y, h->rmine.size.width, h->rmine.size.height,
+        h->rjumphit.origin.x, h->rjumphit.origin.y, h->rjumphit.size.width, h->rjumphit.size.height,
+        h->rmenu.origin.x, h->rmenu.origin.y, h->rmenu.size.width, h->rmenu.size.height,
+        h->rmenuframe.origin.x, h->rmenuframe.origin.y,
+        h->rmenuframe.size.width, h->rmenuframe.size.height,
+        h->rpaintframe.origin.x, h->rpaintframe.origin.y,
+        h->rpaintframe.size.width, h->rpaintframe.size.height,
+        h->rburn.origin.x, h->rburn.origin.y, h->rburn.size.width, h->rburn.size.height,
+        h->rpaint.origin.x, h->rpaint.origin.y, h->rpaint.size.width, h->rpaint.size.height,
+        h->blockBounds[0].origin.x, h->blockBounds[0].origin.y,
+        h->blockBounds[0].size.width, h->blockBounds[0].size.height,
+        h->colorBounds[0].origin.x, h->colorBounds[0].origin.y,
+        h->colorBounds[0].size.width, h->colorBounds[0].size.height);
     return buf;
 }
 

@@ -20,6 +20,25 @@ Read this before writing any code. These are the implicit rules the codebase fol
    vertex data is additionally in quarter-block units (×4 shorts, ×0.25 modelview).
 4. **`IS_IPAD` means "2× UI scale"**, and is set for Retina iPhones too
    (`EAGLView.mm:66`). `IS_WIDESCREEN` = iPhone 5. Screen metrics are globals.
+   **MODIFIED FROM STOCK (2026-07-31), and the change is worth understanding before you read any
+   layout code**: `SCREEN_WIDTH`/`SCREEN_HEIGHT` were *device constants* here — one of
+   480×320 / 568×320, picked once in `EAGLView -initWithCoder:` and never changed again. They are
+   now a *derived layout coordinate system* that can change while the game runs. On iOS nothing
+   moves (that target is not built any more); in the web port the point space comes from the real
+   window aspect and a UI-scale setting, so a desktop window gets a bigger point space and a
+   proportionally smaller HUD instead of the iPhone-5 layout scaled up 4×. Two consequences for
+   anyone touching `Classes/`:
+   - The rect arithmetic that used to sit in `Hud::Hud()` / `Menu::Menu()` now lives in
+     `Hud::layoutForScreen()` / `Menu::layoutForScreen()` and **must stay idempotent** — it can be
+     re-run at any time. In particular the file-static margins in `Hud.mm` (`marginLeft2` and
+     friends) are *mutated* by that code and are reset at the top of the method for exactly this
+     reason. `Input::screenMetricsChanged()` is the same idea for `Input::scr_width/scr_height`,
+     which it now *reads* from `SCREEN_*` instead of re-deriving from device constants.
+   - `IS_WIDESCREEN` no longer means "this is an iPhone 5". It means "there is more width here than
+     the 480-point layout was drawn for", which is what all ~10 of its branches in `Classes/`
+     actually key off.
+   The selection logic itself is platform detection and stays in the port's seam
+   (`web/src/seam/DisplayProfile_web.mm`); only the layout generalisation is in the engine.
 5. **Singletons as static members**: `World::getWorld`, `Resources::getResources` are
    public static *pointers*, assigned in constructors. `Input::getInput()` is a
    function. Hot data are C globals (`blockarray`, `colorTable`, `blockinfo`…).

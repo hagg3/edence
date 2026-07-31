@@ -24,6 +24,19 @@ world load. `keyTyped` feeds the custom GL keyboard (`VKeyboard`).
 Coordinates arrive in screen points; note the axis swap when they reach the raycast
 (`findWorldCoords` swaps mx/my and scales by `SCALE_*` on "iPad"/Retina).
 
+`Input::scr_width`/`scr_height` are the point-space dimensions the Y-flip in
+`touchesBegan/Moved/Ended` uses. **MODIFIED FROM STOCK (2026-07-31):** the constructor used to
+re-derive them from the same three device constants `EAGLView` had just written into
+`SCREEN_WIDTH`/`SCREEN_HEIGHT`; it now *reads* those globals, through
+`Input::screenMetricsChanged()`, which the constructor calls and which can also be called again
+later. That is what lets the point space stop being fixed for the process lifetime — see the
+`IS_IPAD` entry in [conventions-and-pitfalls.md](conventions-and-pitfalls.md) for the whole change.
+Equivalent on every profile the original shipped; the one branch whose behaviour it *does* change
+(non-Retina iPad, which set `scr_*` to 1024×768 while `SCREEN_*` said 480×320) was already
+unreachable, because the iPad branch that would have set those metrics is commented out in
+`EAGLView.mm:114-119`. A stale `scr_height` inverts the Y of every touch, so anything that changes
+`SCREEN_HEIGHT` owes this call.
+
 ## Block picking — `findWorldCoords(mx, my, mode)` (`Util.mm:566`)
 1. Rebuilds the camera matrix, `gluUnProject`s the touch at depth 0 and 1 → ray.
 2. Marches the ray in 1/8-block steps up to 15 blocks.

@@ -57,11 +57,20 @@ ever hosted somewhere that does serve ranges, attack it with read-ahead in the F
 node, not by restructuring the engine's load.
 
 ## Boot order (the gotcha that matters)
-`Module.onRuntimeInitialized` fires **before** `main()` runs. `main()` asserts screen
-metrics of 1136×640 in `establishScreenMetrics` (the same "screen metrics are globals
-set once at startup" pattern as the root doc's `EAGLView initWithCoder:` step, just
-relocated) — so any page-sizing logic must re-run *after* `callMain` and dedupe
-against the real canvas dimensions, never memoize in JS before `main()` has run.
+`Module.onRuntimeInitialized` fires **before** `main()` runs. `main()` asserts a boot drawable
+size in `establishScreenMetrics` (the same "screen metrics are globals set once at startup" pattern
+as the root doc's `EAGLView initWithCoder:` step, just relocated) — so any page-sizing logic must
+re-run *after* `callMain` and dedupe against the real canvas dimensions, never memoize in JS before
+`main()` has run.
+
+That firing order is now also load-bearing in the other direction (audit D1/D4). `World::World()`
+reads `SCREEN_WIDTH`/`SCREEN_HEIGHT`/`P_ASPECT_RATIO`, and those are no longer constants — they are
+derived from the real window box by `src/seam/DisplayProfile_web.mm`. The page therefore calls
+`eden_display_set_viewport(w, h)` from `onRuntimeInitialized`, i.e. **before** `main()`, so the
+metrics are already right the first time the engine reads them. A later call is safe too: anything
+past construction goes through the re-layout path (`Hud::layoutForScreen` /
+`Menu::layoutForScreen` / `Input::screenMetricsChanged`), which is what a window resize takes.
+Headless (`node eden.js`, no DOM) never calls it and runs on the classic 568×320 fallback forever.
 
 Two async populates are registered as `Module.preRun`/`addRunDependency` gates before
 `main()` is allowed to proceed:
@@ -79,8 +88,11 @@ later still, after `main()`.
 Two async populates are registered as `Module.preRun`/`addRunDependency` gates before
 `main()` is allowed to proceed (see previous section); `eden_settings_init()` runs
 even later still, after `main()` (it needs a live `World`) — restored settings that
-must take effect before the first frame (`render_scale`, `dpr_cap`) need a one-shot
-re-apply gated on `eden_settings_loaded()`, not applied inline during init.
+must take effect before the first frame (`render_scale`, `dpr_cap`, and since audit D1
+`ui_scale`/`display_layout`) need a one-shot re-apply gated on `eden_settings_loaded()`, not
+applied inline during init. That one-shot is a full `applyDisplayMode()`, not just a
+backing-store resize: a restored `ui_scale` changes the point space, so the canvas has to be
+re-letterboxed to the new engine aspect as well.
 
 ## Frame-boundary gotcha
 **`glClear` is not a reliable frame-boundary signal** — `Graphics::prepareMenu`

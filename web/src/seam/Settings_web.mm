@@ -38,6 +38,7 @@
 #import "../../../Classes/Resources.h"
 #import "../../../Classes/Input.h"
 #import "../../../Classes/SimpleAudioEngine.h"
+#import "DisplayProfile_web.h"
 #include <emscripten/emscripten.h>
 #include <cstdio>
 #include <cstring>
@@ -105,6 +106,13 @@ static const Setting kSettings[] = {
 
   { "fov",               "Field of view",     "Video",     KIND_RANGE,  -1,            60, 110,   1,  80,  "Vertical FOV in degrees. 80 is the original.",                    NULL },
   { "display_mode",      "Display",           "Video",     KIND_ENUM,   -1,             0,   2,   1,   0,  "Fixed size, fit the window, or a fullscreen button.",             "Fixed,Fit window,Fullscreen" },
+  // Audit rows D1 + D4 — the two knobs on the (now derived) engine POINT space. Both default to
+  // Auto, which defers to the active device profile (src/seam/DisplayProfile_web.mm's kProfiles[]):
+  // desktop gets 125% + Adaptive, touch gets 200% + Classic, i.e. exactly the 568x320 layout this
+  // port shipped with. Leaving them on Auto is not the same as picking the profile's value by hand
+  // — Auto re-resolves if the input mode changes, an explicit choice does not.
+  { "ui_scale",          "UI scale",          "Video",     KIND_ENUM,   -1,             0,   4,   1,   0,  "Size of the HUD, buttons and menus. Larger percentages mean bigger UI and less of the world on screen.", "Auto,100%,125%,150%,200%" },
+  { "display_layout",    "Layout aspect",     "Video",     KIND_ENUM,   -1,             0,   2,   1,   0,  "Adaptive fits the game's layout to the window shape (wider windows show more world). Classic keeps the original 16:9 phone layout and letterboxes.", "Auto,Classic 16:9,Adaptive" },
   // Audit item #6 (§4a/§4c.1-2): the drawable used to be pinned to 1136x640 with devicePixelRatio
   // never read at all, so on any modern display the game was a small buffer upscaled — permanently
   // blurry. These two rows are the knobs on the now-dynamic drawable that public/eden-st.html
@@ -174,6 +182,11 @@ float eden_display_mode     = 0.0f;      // 0=Fixed/1=Fit/2=Fullscreen-on-demand
 float eden_render_scale     = 2.0f;      // index into {50%,75%,100%,125%}
 float eden_dpr_cap          = 2.0f;      // index into {1x,1.5x,2x}
 float eden_fps_cap          = 0.0f;      // index into {Uncapped,30,45,60}; row #14
+// Audit D1/D4. Both are enum indexes whose 0 is "Auto"; read (not written) by
+// src/seam/DisplayProfile_web.mm, which resolves Auto against the active profile every time it
+// recomputes the point space. Never seeded by eden_apply_profile_defaults — see that function.
+float eden_ui_scale         = 0.0f;      // index into {Auto,100%,125%,150%,200%}
+float eden_display_layout   = 0.0f;      // index into {Auto,Classic 16:9,Adaptive}
 // Read by eden_menu_active() (Menu_web.mm) and public/eden-menu.js. 0 = the rebuilt DOM menu.
 float eden_legacy_menu      = 0.0f;
 
@@ -229,32 +242,49 @@ void eden_play_switch_toggle_sound(int on) {
 }
 } // extern "C"
 
-// Row #14 (perf-audit §4c.3): "profile-driven defaults, not profile-driven code paths." Runs once
-// per session, the first time BOTH the settings model is loaded (so g_hadStored[] is meaningful)
-// AND the input profile is actually resolved (Auto's g_detectedTouch has a real value, or the
-// player forced one). Only ever adjusts a row the player has never explicitly touched (checked via
-// g_hadStored — the same "explicit choice wins" rule input_mode itself already followed), and only
-// ever the touch-shaped rows called out in the audit: dpr_cap and fps_cap (crosshair/block_preview
-// already default to sane values for both profiles — see their schema rows and Section 4b — so
-// there is nothing to override for them; render_scale is deliberately left alone since #6 already
-// makes 100% scale cheap via the DPR cap, and lowering render quality by default is a felt change
-// worth leaving to the player).
+// Row #14 (perf-audit §4c.3), generalised into audit row D4's first-class PROFILE concept: "one
+// build, two profiles" — profile-driven DEFAULTS, never profile-driven code paths. The two profiles
+// and every field they carry live in src/seam/DisplayProfile_web.mm's kProfiles[]; this function is
+// the half that pushes those fields into `kSettings[]` rows.
+//
+// Runs once per session, the first time BOTH the settings model is loaded (so g_hadStored[] is
+// meaningful) AND the input profile is actually resolved (Auto's g_detectedTouch has a real value,
+// or the player forced one). Only ever adjusts a row the player has never explicitly touched
+// (checked via g_hadStored — the same "explicit choice wins" rule input_mode itself already
+// followed).
+//
+// WHY ui_scale AND display_layout ARE NOT IN THIS LIST even though the profile carries them: they
+// default to "Auto", which resolves against the profile on every read. Seeding them here would
+// convert a live default into a frozen explicit choice the first time the page booted, so an
+// Auto-mode player who later plugged in a keyboard would keep the phone layout forever. The rows
+// below have no Auto option, so a written default is the only mechanism available to them.
+// (crosshair/block_preview already default to sane values for both profiles — see their schema rows
+// and Section 4b — so there is nothing to override for them.)
 extern "C" void eden_settings_set(int i, float v);   // defined further down in this file
 static bool g_profileDefaultsApplied = false;
-static void eden_apply_profile_defaults(bool isTouch) {
+static void eden_seed_profile_default(const char* key, int optionIndex) {
+    int i = eden_setting_index(key);
+    if (i >= 0 && !g_hadStored[i]) eden_settings_set(i, (float)optionIndex);
+}
+static void eden_apply_profile_defaults(void) {
     if (g_profileDefaultsApplied || !g_loaded) return;
     g_profileDefaultsApplied = true;
-    if (!isTouch) return;   // desktop keeps every compiled default as-is
-    int dpr_i = eden_setting_index("dpr_cap");
-    if (dpr_i >= 0 && !g_hadStored[dpr_i]) eden_settings_set(dpr_i, 1.0f);   // 1.5x, not 2x
-    int fps_i = eden_setting_index("fps_cap");
-    if (fps_i >= 0 && !g_hadStored[fps_i]) eden_settings_set(fps_i, 3.0f);  // 60fps cap
+    const EdenProfile* p = eden_profile_active();
+    eden_seed_profile_default("dpr_cap",      p->dpr_cap);
+    eden_seed_profile_default("fps_cap",      p->fps_cap);
+    eden_seed_profile_default("render_scale", p->render_scale);
 }
 
 static void eden_apply_input_profile(void) {
+    // The point space depends on the profile (ui_scale/display_layout resolve through it), so a
+    // profile change is a metrics change. Safe before the World exists — DisplayProfile_web.mm
+    // only re-lays-out what already exists.
+    eden_display_refresh();
     if (!World::getWorld || !World::getWorld->hud) return;
-    World::getWorld->hud->use_joystick = eden_effective_input_is_touch() ? TRUE : FALSE;
-    eden_apply_profile_defaults(eden_effective_input_is_touch() != 0);
+    // Control chrome (the on-screen joystick + jump/crouch buttons) is a profile field, not a
+    // separate detection. `use_joystick` is the engine's own name for it.
+    World::getWorld->hud->use_joystick = eden_profile_touch_chrome() ? TRUE : FALSE;
+    eden_apply_profile_defaults();
 }
 
 extern "C" void eden_set_block_preview(int on);
@@ -328,6 +358,12 @@ static void eden_apply_setting(int i, bool commitEngine) {
         eden_dpr_cap = v;
     } else if (std::strcmp(s.key, "fps_cap") == 0) {
         eden_fps_cap = v;
+    } else if (std::strcmp(s.key, "ui_scale") == 0) {
+        eden_ui_scale = v;
+        eden_display_refresh();     // re-derives the point space and re-lays-out the HUD/menu
+    } else if (std::strcmp(s.key, "display_layout") == 0) {
+        eden_display_layout = v;
+        eden_display_refresh();
     } else if (std::strcmp(s.key, "legacy_menu") == 0) {
         eden_legacy_menu = v;
     } else if (std::strcmp(s.key, "input_mode") == 0) {
@@ -418,7 +454,12 @@ int eden_settings_loaded(void) { return g_loaded ? 1 : 0; }
 // table above stays the single source of truth and the JS never hard-codes a row.
 EMSCRIPTEN_KEEPALIVE
 const char* eden_settings_schema(void) {
-    static char buf[6144];
+    // SIZED WITH REAL HEADROOM ON PURPOSE. `snprintf` truncates safely, so overflowing this does
+    // not corrupt memory — it emits JSON with no closing bracket, `JSON.parse` throws in
+    // eden-settings.js, and the ENTIRE settings panel silently fails to render. Adding one row with
+    // a long hint is enough to do it: at 6144 the table had 210 bytes of slack left when the D1/D4
+    // rows landed. The `truncated` guard below turns that failure into a visible one.
+    static char buf[12288];
     int n = 0;
     n += snprintf(buf + n, sizeof(buf) - n, "[");
     for (int i = 0; i < kSettingCount && n < (int)sizeof(buf) - 1; ++i) {
@@ -430,7 +471,15 @@ const char* eden_settings_schema(void) {
             s.hint ? "\"" : "", s.hint ? s.hint : "null", s.hint ? "\"" : "",
             s.options ? "\"" : "", s.options ? s.options : "null", s.options ? "\"" : "");
     }
+    // snprintf's return is what WOULD have been written, so `n` running past the buffer is the
+    // truncation signal. Say so out loud — the alternative is a settings panel that renders nothing
+    // with no clue why, which is the same silent-failure class this port keeps getting bitten by.
+    const bool truncated = (n >= (int)sizeof(buf) - 2);
     snprintf(buf + n, sizeof(buf) - n, "]");
+    if (truncated) {
+        std::fprintf(stderr, "[eden-settings] SCHEMA JSON TRUNCATED at %d bytes — grow buf[] in "
+                             "eden_settings_schema(). The settings panel will not render.\n", n);
+    }
     return buf;
 }
 

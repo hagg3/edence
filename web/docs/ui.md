@@ -230,9 +230,8 @@ reasoning. The short version, because it is the thing to understand before touch
 UI layout here:
 
 > **`IS_IPAD`/`IS_RETINA`/`SCALE_*` are this port's layout coordinate system, not its
-> resolution.** `EAGLView_web`'s `establishScreenMetrics` pins a 568×320 point space at
-> 2× and the engine lays every HUD and menu element out in it; the real drawable is
-> decoupled entirely, via `applyDrawableSize()` (CSS box × `min(devicePixelRatio,
+> resolution.** The engine lays every HUD and menu element out in a POINT space at 2×; the real
+> drawable is decoupled entirely, via `applyDrawableSize()` (CSS box × `min(devicePixelRatio,
 > dpr_cap)` × `render_scale`). Flipping those globals does not make pixels cheaper — it
 > halves the UI's own layout math underneath an unchanged surface.
 
@@ -241,10 +240,87 @@ The port already exposes the *intent* ("cheaper pixels") as two real settings,
 anything, which was the worst of both worlds; it is now an explicit no-op that announces
 itself once under `EDEN_DIAGNOSTICS` if it ever becomes reachable. It is unreachable
 today — `World::update` only requests a swap when `!bestGraphics`, and nothing in this
-port ever sets `LOW_MEM_DEVICE`/`LOW_GRAPHICS`, while `IS_WIDESCREEN` (pinned `TRUE` in
-the seam) forces `bestGraphics` back on regardless. Revisit only as part of audit row 18
-(D1, unpin the display constants) / row 22's successor D4 profiles, where it becomes a
-profile field rather than a per-frame branch.
+port ever sets `LOW_MEM_DEVICE`/`LOW_GRAPHICS`, while `IS_WIDESCREEN` (always true for any point
+space this port can derive) forces `bestGraphics` back on regardless.
+
+## The point space: derived, not pinned (audit rows D1 + D4)
+Until 2026-07-31 that point space was pinned at 568×320 in `EAGLView_web`'s
+`establishScreenMetrics`, which is what made the HUD *enormous* on a desktop monitor: a 45-point
+button drawn into a 2560-wide window came out 4.5× its design size. The point space is now derived,
+and the whole of that derivation — plus the two-profile concept it hangs off — lives in
+[`src/seam/DisplayProfile_web.mm`](../src/seam/DisplayProfile_web.mm). **Read that file's header
+before changing anything about layout, sizing or the settings rows below.** The summary:
+
+```
+SCREEN_HEIGHT = 640 * 100 / ui_scale_pct        # a user/profile choice: UI DENSITY
+SCREEN_WIDTH  = round_even(SCREEN_HEIGHT * aspect)   # the real window's aspect (clamped 1.2–2.4)
+P_ASPECT_RATIO = SCREEN_WIDTH / SCREEN_HEIGHT        # ALWAYS derived — see below
+```
+
+- **Two profiles, `desktop` and `touch`**, auto-detected from the existing input-mode arbitration
+  (`eden_effective_input_is_touch()` — one detector, one user override, for both concepts). A
+  profile is a row of *defaults*, never a code path: UI scale, layout aspect, fps cap, DPR cap,
+  render scale, and whether the on-screen joystick/jump chrome is drawn.
+- **Touch defaults reproduce the shipped layout exactly.** `ui_scale` 200% + `Classic 16:9` is
+  568×320 to the point, so a touch player who changes nothing sees a bit-identical HUD. That is the
+  audit's own "keep the pinned profile as the default until it's verified on a real phone"
+  mitigation, expressed as data.
+- **Desktop defaults are 125% + Adaptive**: half-size UI, and no letterboxing — a wider window shows
+  more world (vertical FOV is fixed, so a wider aspect widens the horizontal field) instead of the
+  same world with bigger buttons.
+- **A density floor keeps small windows usable.** `ui_scale` alone gives a fixed point space, i.e. a
+  UI that is a fixed *fraction* of the canvas — so shrinking the window shrinks every HUD icon with
+  it. That is right on a monitor and wrong the moment the window gets phone-shaped, and nothing
+  about resizing a mouse-driven window flips the touch profile, so the desktop 512-point space stays
+  in force and the 45-point buttons keep shrinking past ~35 CSS px (reported from live play,
+  2026-07-31). The floor is **one engine point is never smaller than one CSS pixel** — not an
+  arbitrary number: on the iPhone 5 the viewport was 568×320 CSS pixels and the point space was
+  568×320, so UIKit points *are* CSS pixels and this says "never denser than the device the art was
+  drawn for". It is applied against the letterboxed canvas box, not the raw viewport, and it makes a
+  phone-shaped window degrade toward the classic layout instead of a miniature of the desktop one.
+- **Two settings rows expose it**, both defaulting to `Auto`: `ui_scale`
+  (`Auto,100%,125%,150%,200%`) and `display_layout` (`Auto,Classic 16:9,Adaptive`). `Auto` is not
+  the same as picking the profile's value by hand — it re-resolves if the input mode changes.
+  Deliberately *not* seeded by the profile-defaults writer for that reason; `dpr_cap`/`fps_cap`/
+  `render_scale`, which have no `Auto` option, still are.
+- **A stock bug not reproduced:** `Classes/EAGLView.mm:138-143` only recomputes `P_ASPECT_RATIO`
+  inside `if(IS_WIDESCREEN)`, leaving the other branch on an iPad 4:3 default that matched no live
+  layout. This always derives it. (iPad's own 4:3 branch is *not* resurrected — it is commented out
+  in the original and never drove a live layout on any device. See
+  [`../../WORKING/aspect-ratio-toggle-scope.md`](../../WORKING/aspect-ratio-toggle-scope.md).)
+
+Engine-side, this needed `Hud::layoutForScreen()` / `Menu::layoutForScreen()` (rect math lifted out
+of the constructors so it can run more than once, and kept idempotent) and
+`Input::screenMetricsChanged()` — see root [ui.md](../../docs/ui.md) and
+[conventions-and-pitfalls.md](../../docs/conventions-and-pitfalls.md) for those. Page-side,
+`applyDisplayMode()` hands the available box to `eden_display_set_viewport()` *first*, then
+letterboxes the canvas to whatever aspect the engine chose — which is the box's own aspect in
+Adaptive mode, so the letterbox is normally a no-op.
+
+**Three invariants that will bite silently if broken:**
+0. **Vertically-coupled UI must share an anchor edge.** Two pairs in `Classes/Hud.mm` were anchored
+   to *opposite* edges and only agreed at 320 points — the picker card vs. its own swatch grid, and
+   the mode-button column's proportional spread. Both shipped broken in the first cut of D1 and were
+   caught by looking at the game, not by the suite. Root `docs/ui.md` has the detail; the lesson for
+   anything added here is that "it lines up at 568×320" is now evidence of nothing.
+1. **`GL_VIEWPORT` must report the point space × `SCALE_*`, never the real drawable.**
+   `Util.mm`'s `findWorldCoords` scales a point-space tap by `SCALE_*` and unprojects it against
+   whatever `GL_VIEWPORT` says, so the two have to agree. The GL shim's `kPickViewport` is that
+   answer and `eden_gl_set_pick_viewport()` keeps it in step; answering the real drawable there is
+   what once made mobile taps land left of the finger (perf-audit item #6). Wrong by a constant
+   factor = invisible at the screen centre, worse toward the edges — a centre-of-screen smoke test
+   cannot see it.
+2. **Re-layout must be idempotent.** `Hud.mm`'s margins are file-static and *mutated* by the layout
+   body; they are reset at the top of `layoutForScreen()` for exactly this reason.
+
+`tools/headless-display-profile-test.js` pins both invariants, the stock 568×320 rects byte-exact,
+the derivation, the clamps, and the profile's control-chrome field.
+
+**Live-verified on desktop 2026-07-31** (menu, in-world HUD, mode column, picker card, window
+resize down to phone proportions) — that pass is what found the two anchor bugs and the missing
+density floor, none of which the headless suite could see. **Still owed: the touch profile on real
+phone hardware.** It should be pixel-identical to the pre-D1 build; if it is not, that is a
+regression, not a design question.
 
 ## Known gaps
 - **World name display**: `Menu.mm` draws the "EDEN" wordmark, not the selected

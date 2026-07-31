@@ -66,6 +66,9 @@ public:
 	BOOL showsettings;
 	BOOL showlistscreen;
     BOOL loadShared(SharedListNode* sharedNode);
+    // Recomputes every screen-space rect from the CURRENT SCREEN_WIDTH/SCREEN_HEIGHT. Split out of
+    // the constructor so the point space can change after construction; see Hud::layoutForScreen.
+    void layoutForScreen();
     void update(float etime);
     void loadWorlds();
     void render();

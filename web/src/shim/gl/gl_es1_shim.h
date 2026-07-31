@@ -228,6 +228,12 @@ void eden_gl_context_destroy(void);
 // item #6 (dynamic drawable); see that constant's comment for why Util.mm's unproject/picking
 // needs the fixed answer, not the real one.
 void eden_gl_context_get_drawable_size(int* width, int* height);
+// The size eden_gl_glGetIntegerv answers GL_VIEWPORT with — see kPickViewport in the .cpp. It is
+// SCREEN_WIDTH*SCALE_WIDTH x SCREEN_HEIGHT*SCALE_HEIGHT, i.e. the engine's retina-doubled POINT
+// space, NOT the real drawable. Was a compile-time 1136x640 constant until the point space itself
+// became derived (audit D1/D4); DisplayProfile_web.mm now calls this whenever it changes. Passing
+// a non-positive size is ignored, so the boot default survives an early/garbage call.
+void eden_gl_set_pick_viewport(int width, int height);
 // Force the drawable (canvas backing store) to a specific PIXEL size and re-seed the g_viewport
 // MIRROR to match (kept for parity with real GL state — no longer what GL_VIEWPORT answers with,
 // see kPickViewport). This is the RETINA path: the engine renders in POINTS (SCREEN_WIDTH/HEIGHT,

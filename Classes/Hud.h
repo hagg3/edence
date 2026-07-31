@@ -94,6 +94,12 @@ public:
 	int use_joystick;
     
     Hud();
+    // Recomputes every screen-space rect from the CURRENT SCREEN_WIDTH/SCREEN_HEIGHT/IS_WIDESCREEN.
+    // Split out of the constructor (which used to inline all of it) so the point space can change
+    // after the Hud exists — the web port derives it from the real window aspect and a UI-scale
+    // setting, and re-runs this on resize. Idempotent: every margin it consumes is reset at the
+    // top, so calling it twice gives the same answer as calling it once.
+    void layoutForScreen();
     BOOL handlePickBlock(int x,int y);
     BOOL handlePickColor(int x,int y);
     BOOL handlePickMenu(int x,int y);

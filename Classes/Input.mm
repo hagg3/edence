@@ -26,19 +26,22 @@ Input* Input::getInput(){
 
 Input::Input(){
 	this->clearAll();
-    if(IS_IPAD&&!IS_RETINA){
-        scr_width=IPAD_WIDTH;
-        scr_height=IPAD_HEIGHT;
-        
-    }else{
-        if(IS_WIDESCREEN)
-        scr_width=IPHONE5_WIDTH;
-        else
-            scr_width=IPHONE_WIDTH;
-        //IPHONE_WIDTH;
-        scr_height=IPHONE_HEIGHT;
-    }
-	
+	this->screenMetricsChanged();
+}
+
+// Was inline in the constructor, and picked scr_width/scr_height out of the same three hard-coded
+// device profiles (1024x768 / 568x320 / 480x320) EAGLView had just written into SCREEN_WIDTH/
+// SCREEN_HEIGHT — i.e. it re-derived a value it could simply have read. Reading it instead is what
+// lets the point space stop being one of three constants (web port audit D1/D4: it is derived from
+// the real window aspect and a UI-scale setting, and can change while the game is running).
+// Equivalent on every profile the original shipped: EAGLView -initWithCoder: sets SCREEN_WIDTH/
+// SCREEN_HEIGHT before anything can construct an Input, and the non-retina iPad branch is the one
+// the original commented out (EAGLView.mm:114-119), so it never set 1024x768 there either.
+void Input::screenMetricsChanged(){
+    scr_width=(int)SCREEN_WIDTH;
+    scr_height=(int)SCREEN_HEIGHT;
+    if(scr_width<=0) scr_width=IPHONE5_WIDTH;
+    if(scr_height<=0) scr_height=IPHONE_HEIGHT;
 }
 void Input::clearAll(){
 	for(int i=0;i<MAX_TOUCHES;i++){

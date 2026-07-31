@@ -219,7 +219,15 @@ static GLint g_viewport[4] = {0, 0, 0, 0};
 // x2 reconstruct that same fraction on the way back out, independent of DPR/render_scale/CSS
 // aspect. NOT yet browser/`node eden.js`-verified (written in a sandbox with no build tree) — do
 // that before trusting this fully, per this port's own "measure, never extrapolate" rule.
-static const GLint kPickViewport[4] = {0, 0, 1136, 640};
+//
+// NO LONGER A COMPILE-TIME CONSTANT (audit D1/D4): the point space is now derived from the window
+// aspect and a UI-scale setting rather than pinned to the iPhone-5 profile, so "the fixed size the
+// engine's x2 assumes" is whatever SCREEN_*xSCALE_* currently is. src/seam/DisplayProfile_web.mm
+// writes it through eden_gl_set_pick_viewport() every time it recomputes the metrics; the
+// initialiser below is still the 568x320@2x profile, which is what the headless build and the
+// pre-first-layout frames get. What must stay true is the invariant, not the number: this answers
+// the POINT space, never the real drawable.
+static GLint kPickViewport[4] = {0, 0, 1136, 640};
 
 // The live context handle and the drawable size. Declared HERE, above eden_gl_have_context()
 // (GROUP 2b), rather than next to GROUP 2c's create/destroy below, because the guard predicate
@@ -1099,6 +1107,15 @@ void eden_gl_context_destroy(void) {
 void eden_gl_context_get_drawable_size(int* width, int* height) {
     if (width)  *width  = g_drawable_w;
     if (height) *height = g_drawable_h;
+}
+
+void eden_gl_set_pick_viewport(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    if (kPickViewport[2] == width && kPickViewport[3] == height) return;
+    kPickViewport[2] = width;
+    kPickViewport[3] = height;
+    std::fprintf(stderr, "[eden-gl] pick viewport now %dx%d (engine point space x scale).\n",
+                 width, height);
 }
 
 void eden_gl_context_set_drawable_size(int width, int height) {

@@ -18,14 +18,20 @@
 // ccall/cwrap marshaling needed, so nothing else in the build had to change). See public/
 // eden-st.html for the JS-side listener that calls this.
 //
-// COORDINATE CONTRACT: `x`/`y` must already be in the engine's POINT space (SCREEN_WIDTH=568 ×
-// SCREEN_HEIGHT=320, top-left origin, Y increasing downward) — exactly what a real UIKit
+// COORDINATE CONTRACT: `x`/`y` must already be in the engine's POINT space (SCREEN_WIDTH ×
+// SCREEN_HEIGHT, top-left origin, Y increasing downward) — exactly what a real UIKit
 // `-locationInView:` would have returned. `Input::touchesBegan/Moved` do their own `scr_height -
 // point.y` flip (Classes/Input.mm) and, on an `IS_IPAD&&!IS_RETINA` profile, their own
 // `/SCALE_WIDTH` — this port's profile is retina-iPhone (CLAUDE.md #3: IS_IPAD&&IS_RETINA both
 // true), which takes neither of those branches, so callers must NOT pre-divide by SCALE_WIDTH/
 // SCALE_HEIGHT themselves. The JS side's only job is DOM-pixel -> point-space (CSS display size
-// -> 568x320), nothing else.
+// -> SCREEN_WIDTH x SCREEN_HEIGHT), nothing else.
+//
+// THAT POINT SPACE IS NO LONGER A CONSTANT (audit D1/D4). It was pinned at 568x320; it is now
+// derived from the window aspect and the `ui_scale` setting by src/seam/DisplayProfile_web.mm,
+// and can change mid-session (window resize, settings change). Nothing in THIS file may cache it:
+// every use below reads SCREEN_WIDTH/SCREEN_HEIGHT or `input->scr_*` live, and the page's
+// toEnginePoint() re-reads it from eden_display_point_width/height on every layout pass.
 //
 // TOUCH IDENTITY: Input::touchesMoved/Ended match by `UITouch*` POINTER IDENTITY (Classes/
 // Input.h: `UITouch* touch_id`, compared via `==`, per uikit_stubs.h's header comment) — so the

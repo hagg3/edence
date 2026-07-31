@@ -49,6 +49,10 @@ public:
     void touchesEnded(NSSet* touches,UIEvent* event);
     void keyTyped(NSString* key);
     void clearAll();
+    // Re-reads scr_width/scr_height from the current SCREEN_WIDTH/SCREEN_HEIGHT. The constructor
+    // calls it too; it exists separately because the point space is no longer fixed for the process
+    // lifetime (web port audit D1/D4 — it is derived from the window aspect and a UI-scale setting).
+    void screenMetricsChanged();
    void touchesCancelled(NSSet* touches,UIEvent* event);
     
 };

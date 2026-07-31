@@ -225,6 +225,7 @@ set(EDEN_SHIM_GL_SOURCES
 
 set(EDEN_SEAM_SOURCES
   src/seam/EAGLView_web.mm
+  src/seam/DisplayProfile_web.mm  # audit D1+D4: the device profile table + the derived (no longer pinned) point space. See file header.
   src/seam/EdenViewController_web.cpp
   src/seam/EdenAppDelegate_web.cpp
   src/seam/main_web.cpp

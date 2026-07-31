@@ -198,18 +198,58 @@ void Hud::genColorTable(){
     
 }
 Hud::Hud(){
-    
+
     fps=60;
 	flash=-1;
     build_size=1;
     flashcolor=MakeVector(1.0,1.0,1.0);
    //  printf("flashcolor memlocation1: %X",(unsigned int)(&flashcolor));
 	hideui=FALSE;
-	HUDR_X=SCREEN_WIDTH-HUD_BOX_SIZE-13;
 	ttime=0;
     blocktype_pressed=-1;
     justLoaded=1;
-    
+    inmenu=FALSE;
+    underLiquid=FALSE;
+    m_crouch=FALSE;
+    fade_out=0;
+	test_a=0;
+	mode=MODE_MINE;
+	blocktype=TYPE_BRICK;
+    holding_creature=FALSE;
+    block_paintcolor=0;
+
+    Hud::genColorTable();
+
+    // Both of these size themselves from layoutForScreen() below (statusbar::pos is public and
+    // Joystick's own rects are screen-independent), so they are constructed once here and merely
+    // repositioned on a later re-layout rather than being rebuilt.
+	sb= new statusbar(CGRectMake(0,0,0,0));
+	//gamepad=[[Gamepad alloc] init];
+	joystick=new Joystick();
+
+    test1r=CGRectMake(0,0,50,50);
+    test2r=CGRectMake(0,0,100,100);
+    test1=MakeVector(randf(1),randf(1),randf(1));
+    test2=colorTable[lookupColor(test1)];
+
+    this->layoutForScreen();
+}
+
+// Everything below used to live inline in the constructor above. It is unchanged arithmetic except
+// where marked "adaptive point space": the original only ever ran against one of two hard-coded
+// profiles (480x320 or 568x320 points), so a handful of offsets were hand-tuned constants for the
+// wider of the two. Those now keep their stock value at exactly 568 points and split any width
+// beyond it evenly, which is what makes a derived, window-shaped point space (web port: audit
+// D1/D4) land the same UI in the same place instead of pinning it to the left edge.
+void Hud::layoutForScreen(){
+    // The margins are file-scope statics that the body below MUTATES (marginLeft2 += ...). Reset
+    // them from their compile-time values first or a second call compounds the adjustment.
+    marginVert=10;
+    marginLeft=10;
+    marginLeft2=10-6;
+
+	HUDR_X=SCREEN_WIDTH-HUD_BOX_SIZE-13;
+
 	rjumprender.origin.x=HUDR_X;
 	rjumprender.origin.y=0;
 	rjumprender.size.width=45;
@@ -222,14 +262,12 @@ Hud::Hud(){
     rmenu.origin.y=SCREEN_HEIGHT-45;
     rmenu.size.width=45;
     rmenu.size.height=45;
-    inmenu=FALSE;
    // }else{
     //    rjumprender.origin.y+=13;
     //    rjumprender.origin.x-=7;
     //}
     rjumphit.origin.x=rjumprender.origin.x-1;
 	rjumphit.origin.y=0;
-    underLiquid=FALSE;
 	rjumphit.size.width=SCREEN_WIDTH- rjumphit.origin.x;
 	rjumphit.size.height=45+rjumprender.origin.y;
 
@@ -242,10 +280,7 @@ Hud::Hud(){
     rcrouchhit.origin.y=0;
     rcrouchhit.size.width=rjumphit.origin.x-rcrouchhit.origin.x;
     rcrouchhit.size.height=45+rcrouchrender.origin.y;
-    m_crouch=FALSE;
 
-    fade_out=0;
-	test_a=0;
 	CGRect sbrect;
 	sbrect.origin.x=20;
 	sbrect.size.width=SCREEN_WIDTH-40;
@@ -254,17 +289,26 @@ Hud::Hud(){
 	sbrect.size.height=25;
 	
     int roffy=3;
+    // Adaptive point space: stock spread this four-button column PROPORTIONALLY down the right
+    // edge — `k*SCREEN_HEIGHT/HUDR_NUM - HUD_BOX_SIZE - roffy` for k = 5,4,3,2. At the 320-point
+    // height the engine was drawn for, that is a 64-point pitch running down from the top edge and
+    // it reads as one toolbar; scaled into a taller point space the buttons stay 45 points but the
+    // gaps grow with the screen, so it stops reading as a group. Keep the pitch the 320-point
+    // layout had and anchor the column to the top edge, which is where it already sat (`k==5` is
+    // flush against it). Identical to the stock arithmetic at SCREEN_HEIGHT==320.
+    const float hudr_pitch=(float)IPHONE_HEIGHT/(HUDR_NUM);
+    const float hudr_top=SCREEN_HEIGHT-(int)(HUD_BOX_SIZE)-roffy;
 	rbuild.origin.x=HUDR_X;
-	rbuild.origin.y=(3*SCREEN_HEIGHT/(HUDR_NUM))-(int)(HUD_BOX_SIZE)-roffy;
+	rbuild.origin.y=hudr_top-hudr_pitch*2;
 	rbuild.size.width=rbuild.size.height=HUD_BOX_SIZE;
-	rmine.origin.x=HUDR_X;	
-	rmine.origin.y=(4*SCREEN_HEIGHT/(HUDR_NUM))-(int)(HUD_BOX_SIZE)-roffy;
+	rmine.origin.x=HUDR_X;
+	rmine.origin.y=hudr_top-hudr_pitch;
 	rmine.size.width=rmine.size.height=HUD_BOX_SIZE;
-	rburn.origin.x=HUDR_X;	
-	rburn.origin.y=(5*SCREEN_HEIGHT/(HUDR_NUM))-(int)(HUD_BOX_SIZE)-roffy;
+	rburn.origin.x=HUDR_X;
+	rburn.origin.y=hudr_top;
 	rburn.size.width=rburn.size.height=HUD_BOX_SIZE;
-    rpaint.origin.x=HUDR_X;	
-	rpaint.origin.y=(2*SCREEN_HEIGHT/(HUDR_NUM))-(int)(HUD_BOX_SIZE)-roffy+5;
+    rpaint.origin.x=HUDR_X;
+	rpaint.origin.y=hudr_top-hudr_pitch*3+5;
 	rpaint.size.width=rpaint.size.height=HUD_BOX_SIZE;
 	int c=0;
 	int r=0;
@@ -281,8 +325,15 @@ Hud::Hud(){
     if(IS_WIDESCREEN){
        // printg("It's widescreen homie!\n");
         marginLeft2+=57;
-        
+
     }
+    // Adaptive point space: the +57 above is the hand-tuned nudge that re-centred the 7-column
+    // block/colour grid when the iPhone-5 profile added 88 points of width over the 480 one. Any
+    // width past that profile is split evenly here, so the grid (and rpaintframe, which shares
+    // marginLeft2) keeps the same position relative to the screen centre at any width, and 568
+    // points still produces byte-identical numbers to the stock layout.
+    if(SCREEN_WIDTH>IPHONE5_WIDTH)
+        marginLeft2+=(int)((SCREEN_WIDTH-IPHONE5_WIDTH)/2.0f);
 	for(int i=0;i<NUM_DISPLAY_BLOCKS;i++){
 		
 		blockBounds[i].origin.x=7+BLOCK_ICON_SPACING+marginLeft2+(BLOCK_ICON_SPACING+BLOCK_ICON_SIZE)*c;
@@ -297,13 +348,8 @@ Hud::Hud(){
 			r++;
 		}
 	}
-    Hud::genColorTable();
-    
-  
+
     c=r=0;
-    colorTable[0].x=1.0f;
-    colorTable[0].y=1.0f;
-    colorTable[0].z=1.0f;
     for(int i=0;i<NUM_COLORS;i++){
 		
 		colorBounds[i].origin.x=5+4+COLOR_ICON_SPACING+marginLeft2+(COLOR_ICON_SPACING+COLOR_ICON_SIZE)*c;
@@ -329,21 +375,23 @@ Hud::Hud(){
 	rcam.origin.x=marginLeft+4*magic_number-30;
 	rcam.size.width=rhome.size.width=rsave.size.width=rexit.size.width=45;
 	rcam.size.height=rhome.size.height=rsave.size.height=rexit.size.height=45;
-	mode=MODE_MINE;
-	blocktype=TYPE_BRICK;
-    holding_creature=FALSE;
-    
-    block_paintcolor=0;
-	sb= new statusbar(sbrect);
-	//gamepad=[[Gamepad alloc] init];
-    
-	joystick=new Joystick();
-	
+	sb->pos=sbrect;
+
 	rpaintframe.origin.x=marginLeft2;
 	rpaintframe.origin.y=marginVert+10;
 	rpaintframe.size.width=402;
 	rpaintframe.size.height=282;
-    
+    // Adaptive point space, and this one is not cosmetic. rpaintframe is the fixed 402x282 card
+    // drawn BEHIND the colour swatch grid (and, via renderBlockScreen, behind the block grid). The
+    // grids are anchored to the TOP of the screen — every one of their Y values is computed as
+    // `SCREEN_HEIGHT - margins - ...` — while this constant Y anchors the card to the BOTTOM. At
+    // 320 points the two coincide exactly, which is why the coupling was invisible for 15 years; at
+    // any taller point space the card slides out from under its own contents and you get an empty
+    // panel with a grid of swatches floating above it. Anchor it to the edge the grids use.
+    if(SCREEN_HEIGHT>IPHONE_HEIGHT)
+        rpaintframe.origin.y+=SCREEN_HEIGHT-IPHONE_HEIGHT;
+
+
     rmenuframe.origin.x=110;
   
 	rmenuframe.origin.y=40;
@@ -354,6 +402,17 @@ Hud::Hud(){
         rmenuframe.size.width=SCREEN_WIDTH-300;
     }
 	rmenuframe.size.height=SCREEN_HEIGHT-80;
+    // Adaptive point space: the in-game menu panel is a fixed-size card, not a stretch-to-fit one
+    // (its frame texture and its four buttons are all absolute sizes), so past the profile it was
+    // drawn for it keeps that size and centres instead of growing to fill the screen.
+    if(SCREEN_WIDTH>IPHONE5_WIDTH){
+        rmenuframe.origin.x+=(SCREEN_WIDTH-IPHONE5_WIDTH)/2.0f;
+        rmenuframe.size.width-=(SCREEN_WIDTH-IPHONE5_WIDTH);
+    }
+    if(SCREEN_HEIGHT>IPHONE_HEIGHT){
+        rmenuframe.origin.y+=(SCREEN_HEIGHT-IPHONE_HEIGHT)/2.0f;
+        rmenuframe.size.height-=(SCREEN_HEIGHT-IPHONE_HEIGHT);
+    }
     rsave.origin.x=rmenuframe.origin.x+17;
     rhome.origin.x=rmenuframe.origin.x+17;
     rexit.origin.x=rmenuframe.origin.x+17;
@@ -369,13 +428,6 @@ Hud::Hud(){
     rtHome=ButtonMake(rhome.origin.x+57,rhome.origin.y+5,180,56/2+10);
     rtCam=ButtonMake(rcam.origin.x+57,rcam.origin.y+5,180,56/2+10);
     rtExit=ButtonMake(rexit.origin.x+57,rexit.origin.y+5,180,56/2+10);
-
-    test1r=CGRectMake(0,0,50,50);
-    test2r=CGRectMake(0,0,100,100);
-    test1=MakeVector(randf(1),randf(1),randf(1));
-    test2=colorTable[lookupColor(test1)];
-    
-	
 }
 static float at1=0,at2=0,at3=0;
 void Hud::worldLoaded(){
@@ -1637,14 +1689,12 @@ void Hud::renderBlockScreen(){
     float alpha=at2;
 	//glDisable(GL_TEXTURE_2D);
 	//glBlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glColor4f(1.0, 1.0, 1.0, at2);	
-	CGRect rblocksframe;
-	rblocksframe.origin.x=marginLeft2;
-    
-	rblocksframe.origin.y=marginVert+10;
-	rblocksframe.size.width=402;
-	rblocksframe.size.height=282;
-    
+	glColor4f(1.0, 1.0, 1.0, at2);
+	// Was a local rebuilt here from the same `marginLeft2` / `marginVert+10` / 402x282 as
+	// rpaintframe — i.e. a verbatim duplicate of a rect the layout already computes. Now that the
+	// card has to be anchored against a screen height that is no longer constant (see
+	// layoutForScreen), one copy of that arithmetic is the only version that can stay correct.
+	CGRect rblocksframe=rpaintframe;
 	Resources::getResources->getTex(ICO_COLOR_SELECT_BACKGROUND)->drawInRect(rblocksframe);
 	//
 	

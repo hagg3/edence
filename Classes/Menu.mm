@@ -25,13 +25,14 @@ extern float P_ASPECT_RATIO;
 
 
 static float fade_out=0;
-Menu::Menu(){
-   
-    fade_out=0;
-    settings=new SettingsMenu();
-    menu_back=new Menu_background();
-	delete_mode=FALSE;
-	share_mode=FALSE;
+
+// Split out of the constructor so the point space can change after the Menu exists — see the same
+// method on Hud for why (web port audit D1/D4: SCREEN_WIDTH/SCREEN_HEIGHT are derived from the real
+// window aspect and a UI-scale setting, not pinned to one device profile). Pure rect arithmetic,
+// unchanged from the constructor's; idempotent. The world-list nodes are deliberately NOT re-seeded
+// here: Menu::update recomputes their positions from SCREEN_WIDTH every frame anyway, so a
+// re-layout that reset them would only stomp the carousel animation mid-flight.
+void Menu::layoutForScreen(){
 	rect_name.size.width=284*.77f;
 	rect_name.size.height=83*.77f;
 	rect_name.origin.x=SCREEN_WIDTH/2-rect_name.size.width/2;
@@ -40,7 +41,7 @@ Menu::Menu(){
         rect_name.origin.x=SCREEN_WIDTH/2-(591/SCALE_WIDTH)/2.0f;
         rect_name.origin.y-=10;
     }
-	
+
 
 	rect_loading.size.width=150;
 	rect_loading.size.height=40;
@@ -51,13 +52,82 @@ Menu::Menu(){
     if(IS_IPAD){
         rect_loading.origin.y-=10;
     }
-	sbar=new statusbar(rect_loading);
+	sbar->pos=rect_loading;
 	rect_loading.origin.y=SCREEN_HEIGHT-233;
-	fnbar=new statusbar(rect_loading);
+	fnbar->pos=rect_loading;
+
+	left_arrow.size.width=36;
+	left_arrow.size.height=89;
+   // if(IS_IPAD)
+	//left_arrow.origin.x=20;
+   // else
+    left_arrow.origin.x=0;
+	left_arrow.origin.y=SCREEN_HEIGHT/2-45;
+
+	right_arrow.size.width=36;
+	right_arrow.size.height=89;
+     if(IS_IPAD)
+	right_arrow.origin.x=SCREEN_WIDTH-41;
+    else
+       right_arrow.origin.x=SCREEN_WIDTH-36;
+	right_arrow.origin.y=SCREEN_HEIGHT/2-45;
+
+
+
+	rect_options.size.width=180;
+	rect_options.size.height=62;
+	rect_options.origin.x=(SCREEN_WIDTH)/2-90;
+
+	rect_options.origin.y=5;
+
+	rect_share.size.width=70;
+	rect_share.size.height=70;
+    if(!IS_IPAD)
+	rect_share.origin.x=0;
+    else{
+    rect_share.origin.x=20;
+    }
+	rect_share.origin.y=11;
+
+
+	rect_loadshared.size.width=70;
+	rect_loadshared.size.height=70;
+	rect_loadshared.origin.x=SCREEN_WIDTH-70;
+	rect_loadshared.origin.y=11;
+
+
+
+	rect_delete.size.width=70;
+	rect_delete.size.height=70;
+    if(!IS_IPAD)
+        rect_delete.origin.x=0;
+    else{
+        rect_delete.origin.x=20;
+    }
+	rect_delete.origin.y=(SCREEN_HEIGHT-70);
+
+
+	rect_create.size.width=70;
+	rect_create.size.height=70;
+	rect_create.origin.x=(SCREEN_WIDTH-70);
+	rect_create.origin.y=(SCREEN_HEIGHT-70);
+}
+
+Menu::Menu(){
+   
+    fade_out=0;
+    settings=new SettingsMenu();
+    menu_back=new Menu_background();
+	delete_mode=FALSE;
+	share_mode=FALSE;
+
+	sbar=new statusbar(CGRectMake(0,0,0,0));
+	fnbar=new statusbar(CGRectMake(0,0,0,0));
+	this->layoutForScreen();
     share_menu=new ShareMenu();
 	fnbar->clear();
-	
-	
+
+
 	world_list=NULL;
 	selected_world=NULL;
 	this->loadWorlds();
@@ -72,63 +142,6 @@ Menu::Menu(){
 		node->anim=node->rect;
 		node=node->next;
 	}
-	
-	left_arrow.size.width=36;
-	left_arrow.size.height=89;
-   // if(IS_IPAD)
-	//left_arrow.origin.x=20;
-   // else
-    left_arrow.origin.x=0;
-	left_arrow.origin.y=SCREEN_HEIGHT/2-45;
-	
-	right_arrow.size.width=36;
-	right_arrow.size.height=89;
-     if(IS_IPAD)
-	right_arrow.origin.x=SCREEN_WIDTH-41;
-    else
-       right_arrow.origin.x=SCREEN_WIDTH-36; 
-	right_arrow.origin.y=SCREEN_HEIGHT/2-45;
-	
-	
-	
-	rect_options.size.width=180;
-	rect_options.size.height=62;
-	rect_options.origin.x=(SCREEN_WIDTH)/2-90;
-    
-	rect_options.origin.y=5;
-	
-	rect_share.size.width=70;
-	rect_share.size.height=70;
-    if(!IS_IPAD)
-	rect_share.origin.x=0;
-    else{
-    rect_share.origin.x=20;    
-    }
-	rect_share.origin.y=11;
-	
-	
-	rect_loadshared.size.width=70;
-	rect_loadshared.size.height=70;
-	rect_loadshared.origin.x=SCREEN_WIDTH-70;
-	rect_loadshared.origin.y=11;
-	
-	
-	
-	rect_delete.size.width=70;
-	rect_delete.size.height=70;
-    if(!IS_IPAD)
-        rect_delete.origin.x=0;
-    else{
-        rect_delete.origin.x=20;    
-    }
-	rect_delete.origin.y=(SCREEN_HEIGHT-70);
-	
-	
-	rect_create.size.width=70;
-	rect_create.size.height=70;
-	rect_create.origin.x=(SCREEN_WIDTH-70);
-	rect_create.origin.y=(SCREEN_HEIGHT-70);
-	
 	
 	shareutil=[[ShareUtil alloc] init];
 	showsettings=FALSE;

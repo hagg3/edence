@@ -110,9 +110,10 @@ Module['preRun'].push(function () {
 
   // Pass 50: serve straight out of the already-downloaded buffer instead of FS.writeFile, which
   // makes MEMFS allocate and memcpy a SECOND ~size-of-file buffer on top of the one `bytes`
-  // already holds. On a host that can't do Range requests (GitHub Pages — confirmed by curl:
-  // responds 200 with the full body regardless of a Range header, despite advertising
-  // `accept-ranges: bytes`) this IS the whole-file path for every cold boot, so that transient
+  // already holds. On a host where byte serving is not usable — which since pass 57 means Safari
+  // against GitHub Pages, whose sync-XHR ranges come out of the gzip representation (see the probe
+  // below; the older claim here, that Pages ignores Range outright, was measured wrong) — this IS
+  // the whole-file path for every cold boot, so that transient
   // doubling — on top of whatever the download itself (chunks array + concat, see eagerFetch)
   // was already holding — is real peak-memory pressure, not a rounding error. iOS Safari's
   // per-tab memory ceiling is tighter than desktop, and this function's old body was the
@@ -381,13 +382,20 @@ Module['preRun'].push(function () {
     // on a synchronous main-thread XHR (InvalidAccessError), so the binary comes back through the
     // classic overrideMimeType('text/plain; charset=x-user-defined') channel: that charset maps
     // bytes 0x80-0xFF to U+F780-U+F7FF, so `charCodeAt(i) & 0xFF` recovers the exact byte.
-    var syncRange = function (start, end) {
+    //
+    // `rawSyncRange` is the transport; `syncRange` below is what the lazy node gets. The split
+    // exists so the capability probe can exercise the EXACT transport the reads will use — see
+    // the probe's comment for the Safari/gzip bug that made that necessary.
+    var rawSyncRange = function (start, end) {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', URL_PATH, false);
       xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
       if (xhr.overrideMimeType) xhr.overrideMimeType('text/plain; charset=x-user-defined');
       xhr.send(null);
-      if (xhr.status !== 206 && xhr.status !== 200) throw new Error('Eden.eden range ' + start + '-' + end + ': HTTP ' + xhr.status);
+      if (xhr.status !== 206 && xhr.status !== 200) {
+        throw new Error('Eden.eden range ' + start + '-' + end + ': HTTP ' + xhr.status +
+                        ' (Content-Range ' + xhr.getResponseHeader('Content-Range') + ')');
+      }
       var text = xhr.responseText || '';
       var out = new Uint8Array(text.length);
       for (var i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 0xFF;
@@ -398,6 +406,31 @@ Module['preRun'].push(function () {
       return out;
     };
 
+    // A FAILED RANGE READ MUST NOT THROW A PLAIN JS ERROR. This runs underneath a synchronous
+    // fread() inside the engine, which during boot is underneath main() itself; a bare throw
+    // unwinds THROUGH the wasm frames, so `main()` never reaches emscripten_set_main_loop() and
+    // the engine's frame loop is never registered. The page survives (the DOM menu, hotbar and
+    // eden-st.html's own rAF watchdog all keep running) and the only symptom is a permanently
+    // black canvas over a perfectly healthy WebGL2 context — a failure that looks like a renderer
+    // bug and is nothing of the kind. That is the shape the Safari/GitHub-Pages bug took; the
+    // probe below is what stops it happening, and this is what keeps it survivable if some other
+    // host finds a new way to break mid-session.
+    //
+    // FS.ErrnoError is the right currency instead: Emscripten's syscall wrappers catch it and
+    // return -errno to the caller, so a broken read degrades to an I/O error the engine's own
+    // truncated/corrupt-world handling can see (and eden-loaderror.js can surface), with the wasm
+    // stack intact.
+    var syncRange = function (start, end) {
+      try {
+        return rawSyncRange(start, end);
+      } catch (e) {
+        console.error('[eden] Eden.eden lazy read failed at ' + start + '-' + end +
+                      ' — reporting EIO to the engine rather than unwinding main():', e);
+        Module['EdenWorldFS'].degraded = true;
+        throw new FS.ErrnoError(29 /* EIO */);
+      }
+    };
+
     if (wantsEager()) {
       eagerFetch();
     } else {
@@ -405,6 +438,24 @@ Module['preRun'].push(function () {
       // "bytes 0-0/<total>" Content-Range, which is also where the file size comes from — no
       // separate HEAD needed. Anything else (200, no Content-Range, a Content-Encoding meaning
       // the range would be of the COMPRESSED body) means byte serving is not usable here.
+      //
+      // STAGE 2 IS NOT OPTIONAL, and the reason is worth keeping. This fetch() probe passing does
+      // NOT mean the reads will work, because the reads do not use fetch() — they use synchronous
+      // XHR, and the two do not negotiate the same content encoding. Measured on Safari against
+      // GitHub Pages (both macOS and iOS, live): WebKit's fetch() suppresses compression when the
+      // request carries a Range header, so the probe gets identity and a truthful
+      // "bytes 0-0/55023840". WebKit's sync XHR does not, so Fastly answers it from the *gzip*
+      // representation instead — 9,223,675 bytes — and applies the byte range to the COMPRESSED
+      // body. Every small read still succeeds (and returns gzip bytes where the engine expects
+      // terrain), and the first read past 9.2 MB — the ColumnIndex at EOF, i.e. the very first
+      // thing the engine reads — comes back 416. Chromium negotiates identity on both, which is
+      // why this was Safari-only, and web/tools/serve.js never compresses the .eden, which is why
+      // it only ever appeared on the deployed site.
+      //
+      // So: probe the real transport, at the FAR END of the file, and require the size it reports
+      // to agree with stage 1. A server serving ranges out of a compressed representation fails
+      // this on both counts (416, or a Content-Range total that is the compressed size), and we
+      // take the whole-file path — which is correct everywhere, just heavier.
       fetch(URL_PATH, { headers: { 'Range': 'bytes=0-0' } }).then(function (r) {
         var cr = r.headers.get('Content-Range');
         var enc = r.headers.get('Content-Encoding');
@@ -415,12 +466,34 @@ Module['preRun'].push(function () {
           eagerFetch();
           return;
         }
+        var total = Number(m[1]);
         return r.arrayBuffer().then(function () {
-          installLazyNode(Number(m[1]), syncRange, 'lazy-range');
-          console.log('[eden] Eden.eden: lazy range-fetch active (' + m[1] + ' bytes, ' +
+          // Stage 2: the same sync XHR the reads use, on the last byte of the file.
+          try {
+            var tail = rawSyncRange(total - 1, total - 1);
+            if (tail.length !== 1) throw new Error('tail read returned ' + tail.length + ' bytes, expected 1');
+          } catch (e) {
+            console.log('[eden] Eden.eden: byte serving is not usable from synchronous XHR on this ' +
+                        'host (' + e.message + ') — fetching it whole. This is the Safari/GitHub-Pages ' +
+                        'gzip-range case; see this file\'s probe comment.');
+            eagerFetch();
+            return;
+          }
+          installLazyNode(total, syncRange, 'lazy-range');
+          console.log('[eden] Eden.eden: lazy range-fetch active (' + total + ' bytes, ' +
                       (BLOCK_SIZE / 1024) + ' KB blocks, ' + MAX_BLOCKS + ' cached).');
         });
       }).catch(function (e) {
+        // installLazyNode() releases the run dependency, which starts main() SYNCHRONOUSLY inside
+        // the .then above — so anything the engine throws during boot lands here too, looking
+        // exactly like a probe failure. Re-running eagerFetch() at that point would swap the FS
+        // node out from under a half-booted engine and bury the real error under a wrong message
+        // (which is how the Safari bug first presented). Only fall back if the boot has not
+        // actually started yet.
+        if (depDone) {
+          console.error('[eden] Eden.eden: error escaped engine startup, not a probe failure:', e);
+          return;
+        }
         console.warn('[eden] Eden.eden range probe failed, falling back to whole-file fetch:', e);
         eagerFetch();
       });

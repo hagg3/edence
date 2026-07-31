@@ -22,6 +22,46 @@ with OpenGL by the game itself. There is **no UIKit UI** beyond the GL view (and
   All layout code branches on `IS_IPAD`/`IS_WIDESCREEN` with hard-coded coordinates
   in a 480×320 / 568×320 / 1024×768 space.
 
+> **MODIFIED FROM STOCK (2026-07-31) — the point space is no longer a device constant.**
+> `SCREEN_WIDTH`/`SCREEN_HEIGHT` are still the layout coordinate system every rect below is written
+> in, and every number in this file is still correct *at* 568×320. What changed is that 568×320 is
+> now one value among many: the web port derives the point space from the real window aspect and a
+> UI-scale setting (`web/src/seam/DisplayProfile_web.mm`, audit rows D1/D4), so the same rect
+> arithmetic runs at, say, 1024×640 on a desktop window. Three engine-side consequences:
+>
+> - **The rect math moved out of the constructors.** `Hud::layoutForScreen()` and
+>   `Menu::layoutForScreen()` hold everything that reads `SCREEN_*`; the constructors now do state
+>   init, build the owned objects (`statusbar`, `Joystick`) and call the layout method once. Both are
+>   re-runnable and **must stay idempotent** — `Hud.mm`'s file-static margins (`marginLeft2`,
+>   `marginVert`, `marginLeft`) are mutated by the layout body and are reset at the top of the
+>   method so a second call does not compound them.
+> - **The two hand-tuned widescreen offsets are now width-derived.** The block/colour picker's
+>   `marginLeft2 += 57` and the in-game menu card's `+50 / SCREEN_WIDTH-300` were tuned for the
+>   88 extra points the iPhone-5 profile had over the 480 one. They keep those exact values at 568
+>   points and split any further width evenly, so the picker stays put relative to the screen centre
+>   and the menu card keeps its 268×240 size and centres rather than stretching.
+> - **Two vertical couplings that only 320 points held together.** Both found in live play and both
+>   invisible at the stock height, which is what makes them worth reading before adding UI here:
+>   - `rpaintframe` — the 402×282 card drawn *behind* the colour/block picker grid — was anchored to
+>     the BOTTOM of the screen by a constant `marginVert+10`, while the grids it backs are anchored
+>     to the TOP (every one of their Y values is `SCREEN_HEIGHT - margins - …`). At 320 points those
+>     coincide; anywhere else the card slid out from under its own contents and rendered as an empty
+>     panel with swatches floating above it. It now takes the same anchor the grids use.
+>     `Hud::renderBlockScreen` used to rebuild a byte-identical local copy of that rect — it reuses
+>     `rpaintframe` now, because one copy of the arithmetic is the only version that can stay right.
+>   - The four mode buttons (build/mine/burn/paint) were spread PROPORTIONALLY down the right edge
+>     (`k*SCREEN_HEIGHT/HUDR_NUM - HUD_BOX_SIZE - roffy`, k = 5…2). At 320 points that is a 64-point
+>     pitch running from the top edge and it reads as one toolbar; in a taller point space the
+>     buttons stay 45 points while the gaps grow with the screen. They now keep the 320-point pitch
+>     and stay anchored to the top edge.
+> - **`Menu_background`'s scrolling strips are loops now** rather than a hand-written count of two
+>   ground tiles (three if widescreen) and two tree pairs. Same output at both stock widths; covers
+>   whatever `SCREEN_WIDTH` is.
+>
+> `tools/headless-display-profile-test.js` in the web port pins the stock 568×320 rects byte-exact
+> and the idempotence property. iOS behaviour is unchanged: that target is not built any more, and
+> at 568×320 every number here is what it always was.
+
 ## HUD (`Classes/Hud.mm`, 2246 lines)
 
 State machine over `mode`:

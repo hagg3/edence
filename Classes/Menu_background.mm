@@ -176,36 +176,35 @@ void Menu_background::render(){
     mountain.size.height=456;
     mountain.size.width=835;
     
-    Resources::getResources->getMenuTex(MENU_TREESLEFT)->drawTextNoScale(mountain);
-    mountain.origin.x+=835;
-    Resources::getResources->getMenuTex(MENU_TREESRIGHT)->drawTextNoScale(mountain);
-    mountain.origin.x-=835;
-    
-    mountain.origin.x-=835*2;
-   Resources::getResources->getMenuTex(MENU_TREESLEFT)->drawTextNoScale(mountain);
-    mountain.origin.x+=835;
-  Resources::getResources->getMenuTex(MENU_TREESRIGHT)->drawTextNoScale(mountain);
-    mountain.origin.x-=835;
-    
-    mountain.origin.x+=835*2;
-    
+    // Same generalisation as the ground strip below: stock drew exactly two left/right pairs
+    // (at mountainx and mountainx-1670), enough to cover 568 points at any scroll offset. The loop
+    // covers whatever SCREEN_WIDTH is and draws the identical two pairs at the stock widths.
+    for(float mx=mountainx-835*2; mx<SCREEN_WIDTH; mx+=835*2){
+        mountain.origin.x=mx;
+        Resources::getResources->getMenuTex(MENU_TREESLEFT)->drawTextNoScale(mountain);
+        mountain.origin.x=mx+835;
+        Resources::getResources->getMenuTex(MENU_TREESRIGHT)->drawTextNoScale(mountain);
+    }
+    mountain.origin.x=mountainx;
+
     
 	CGRect ground;
 	ground.origin.x=groundx;
 	ground.origin.y=0;
 	ground.size.height=25;
 	ground.size.width=481;
-	Resources::getResources->getMenuTex(MENU_GROUND)->drawTextM(ground);
-	ground.origin.x-=480;
-	Resources::getResources->getMenuTex(MENU_GROUND)->drawTextM(ground);
-    if(IS_WIDESCREEN){
-        ground.origin.x+=480*2;
+    // Stock drew a fixed number of 480-wide tiles: two, plus a third only on the widescreen
+    // profile. That is the same "enough tiles to cover 568 points" count written out by hand.
+    // Written as a loop it covers whatever SCREEN_WIDTH actually is, which is what an adaptive
+    // point space needs (web port audit D1/D4) and is identical at both stock widths — groundx
+    // scrolls within [0,480), so tiles at -480 and 0 cover 480 points and each further tile adds
+    // another 480.
+    for(float gx=groundx-480; gx<SCREEN_WIDTH; gx+=480){
+        ground.origin.x=gx;
         Resources::getResources->getMenuTex(MENU_GROUND)->drawTextM(ground);
-         ground.origin.x-=480*2;
-
     }
-	ground.origin.x+=480;
-	
+	ground.origin.x=groundx;
+
     
    
     

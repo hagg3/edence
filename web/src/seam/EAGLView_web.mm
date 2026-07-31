@@ -24,13 +24,9 @@
 #import "../../../Classes/Globals.h"
 #import "../../../Classes/Constants.h"
 #include "gl_es1_shim.h"
+#include "DisplayProfile_web.h"
 
 extern EAGLView* G_EAGL_VIEW; // defined in Classes/Globals.mm — unchanged
-
-// IS_WIDESCREEN is defined in Classes/Globals.mm but NOT declared in Globals.h — the original
-// Classes/EAGLView.mm:34 externs it locally, so this file does the same rather than touch the
-// engine header (CLAUDE.md: no engine edits).
-extern bool IS_WIDESCREEN;
 
 // Constructs the one process-lifetime EAGLView and, as a side effect of -init, publishes it as
 // G_EAGL_VIEW and establishes the screen-metric globals. Called from src/seam/main_web.cpp
@@ -87,36 +83,25 @@ extern "C" void eden_seam_create_eagl_view(void) {
 // projection matrix just comes out degenerate and the frame renders empty, which is precisely
 // the "subtly wrong frame rather than a crash" failure mode RESUME-HERE warns about for P2.
 //
-// Values mirror the original's iPhone-5 widescreen branch: the engine is landscape, so
-// SCREEN_WIDTH is the LONG axis (568) and SCREEN_HEIGHT the short one (320) — do not "fix"
-// that apparent inversion, Util.mm's takeScreenshot reads them the same way round.
-// TODO P3: drive these from the actual canvas aspect ratio once input/resize handling lands,
-// rather than pinning to one device profile.
+// The engine is landscape, so SCREEN_WIDTH is the LONG axis and SCREEN_HEIGHT the short one — do
+// not "fix" that apparent inversion, Util.mm's takeScreenshot reads them the same way round.
 //
-// THE RETINA/IS_IPAD/SCALE GLOBALS (added Pass 16): the original
-// Classes/EAGLView.mm -initWithCoder: (lines 57-78) ALSO sets IS_IPAD/IS_RETINA/SUPPORTS_RETINA
-// and SCALE_WIDTH/SCALE_HEIGHT — and this seam replacement previously set NONE of them, leaving
-// all five at their zero-init value (`false`/`0.0f`). Two distinct failures resulted, both
-// silent (the port's recurring "a seam owes the SIDE EFFECTS of the method it replaced" class,
-// 5th instance): (1) IS_RETINA==false made the engine take its non-retina asset/layout branches
-// everywhere (79 IS_IPAD sites / 35 IS_RETINA sites), and (2) — worse — SCALE_WIDTH/SCALE_HEIGHT
-// are used as DIVISORS in layout math (Menu.mm:39 `591/SCALE_WIDTH`, Hud.mm `128/SCALE_WIDTH`,
-// Input.mm `point.x/SCALE_WIDTH`), so at 0 they produced inf/nan geometry that fell off-screen.
-// This port targets the retina iPhone-5 profile (CLAUDE.md #3: "IS_IPAD==true also on Retina
-// iPhones"), which is the original's `[[UIScreen mainScreen] scale]==2` branch: all three flags
-// TRUE, SCALE_WIDTH==SCALE_HEIGHT==2. All five are declared `extern` in Classes/Globals.h
-// (already imported above), unlike IS_WIDESCREEN which is Globals.mm-only.
+// NO LONGER PINNED (audit rows D1 + D4, 2026-07-31). This method used to hard-code the original's
+// iPhone-5 widescreen branch — 568x320 points, IS_WIDESCREEN/IS_IPAD/IS_RETINA all TRUE. All of
+// that arithmetic moved to src/seam/DisplayProfile_web.mm, which derives the point space from the
+// real window aspect and a UI-scale setting instead, with the pinned 568x320 still reachable (and
+// still the touch profile's default) as "Classic 16:9 + ui_scale 200%". Read that file's header
+// before changing anything here; in particular the retina/scale flags are NOT what D1 unpins and
+// are still set unconditionally, because SCALE_WIDTH/SCALE_HEIGHT are DIVISORS in layout math
+// (Menu.mm:39 `591/SCALE_WIDTH`, Hud.mm `128/SCALE_WIDTH`, Input.mm `point.x/SCALE_WIDTH`) and were
+// once the source of a silent inf/nan-geometry bug when this seam left them at 0.
+//
+// The page calls eden_display_set_viewport() from onRuntimeInitialized — which fires BEFORE main()
+// — so by the time this runs the real canvas box is usually already known. When it is not (headless
+// `node eden.js`, or a boot with no layout yet) the classic aspect is used and the page's first
+// resize corrects it through the re-layout path.
 - (void)establishScreenMetrics {
-    IS_WIDESCREEN = TRUE;
-    SCREEN_WIDTH  = IPHONE5_WIDTH;   // 568 POINTS (long/landscape axis)
-    SCREEN_HEIGHT = IPHONE_HEIGHT;   // 320 POINTS
-    P_ASPECT_RATIO = (float)SCREEN_WIDTH / (float)SCREEN_HEIGHT;
-
-    IS_IPAD        = TRUE;   // "2x UI scale" flag per CLAUDE.md #3 — TRUE on retina iPhones too
-    IS_RETINA      = TRUE;
-    SUPPORTS_RETINA = TRUE;
-    SCALE_WIDTH    = 2.0f;   // original's scale==2 branch; NEVER 0 (used as a divisor)
-    SCALE_HEIGHT   = 2.0f;
+    eden_display_refresh();
 
     G_EAGL_VIEW = self;
 
