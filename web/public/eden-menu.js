@@ -341,13 +341,13 @@
     var status = UI.el('div', 'eden-section__desc');
     pad.appendChild(status);
 
+    var detailWrap = UI.el('div', 'eden-worldbrowser__detail');
+    pad.appendChild(detailWrap);
+
     var resultsWrap = UI.el('div', 'eden-worldbrowser__results');
     resultsWrap.setAttribute('role', 'listbox');
     resultsWrap.setAttribute('aria-label', 'Downloadable worlds');
     pad.appendChild(resultsWrap);
-
-    var detailWrap = UI.el('div', 'eden-worldbrowser__detail');
-    pad.appendChild(detailWrap);
 
     // The catalog is a flat ~800-entry list with no server-side paging. The full manifest is
     // fetched up front (EdenWorldBrowser.fetchManifest) and search/tag filtering always runs over
@@ -451,8 +451,25 @@
       });
     }
 
+    // The download button lives in the titlebar (win.actions) rather than inline in detailWrap —
+    // with up to 200 rows per page, an inline button can be a page-plus of scrolling away from the
+    // row the user just clicked. The titlebar stays visible next to Back/the title regardless of
+    // scroll position.
+    function renderHeaderAction() {
+      win.actions.innerHTML = '';
+      var entry = S.wbSelected;
+      if (!entry) return;
+      var dl = S.wbDownload && S.wbDownload.entry === entry ? S.wbDownload : null;
+      win.actions.appendChild(UI.button({
+        size: 'sm', tone: 'positive', label: dl && dl.busy ? 'Downloading…' : 'Download',
+        disabled: !!(dl && dl.busy),
+        onClick: dl && dl.busy ? null : function () { startDownload(entry); },
+      }));
+    }
+
     function renderDetail() {
       detailWrap.innerHTML = '';
+      renderHeaderAction();
       var entry = S.wbSelected;
       if (!entry) return;
 
@@ -468,13 +485,6 @@
       detailWrap.appendChild(img);
 
       var dl = S.wbDownload && S.wbDownload.entry === entry ? S.wbDownload : null;
-      var actions = UI.el('div', 'eden-section__body');
-      actions.appendChild(UI.button({
-        size: 'sm', tone: 'positive', label: dl && dl.busy ? 'Downloading…' : 'Download',
-        disabled: !!(dl && dl.busy),
-        onClick: dl && dl.busy ? null : function () { startDownload(entry); },
-      }));
-      detailWrap.appendChild(actions);
 
       if (dl && dl.busy) {
         var bar = UI.el('div', 'eden-progress');
