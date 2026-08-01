@@ -1266,9 +1266,17 @@
     if (pointerLocked) stopWantingLock();
   });
 
+  // 2026-08-01: the raw 1:1 mapping from movementX/Y to eden_apply_look_delta made the "Mouse
+  // sensitivity" slider's default (1.00) feel too fast — this trims the mouse path only (NOT
+  // eden_apply_look_delta itself, which the gamepad's right-stick look also calls through
+  // EdenGamepad's applyLook bridge above, calibrated separately against that function's untrimmed
+  // units; scaling there would silently detune the gamepad too). 0.4 was picked so the slider's
+  // default of 1.00 now feels like the old 0.40 did; the slider's own range/steps are unchanged.
+  const MOUSE_SENSITIVITY_TRIM = 0.4;
   canvasEl.addEventListener('mousemove', (e) => {
     if (!pointerLocked) return;
-    callIfReady(() => Module._eden_apply_look_delta(e.movementX, e.movementY));
+    callIfReady(() => Module._eden_apply_look_delta(
+      e.movementX * MOUSE_SENSITIVITY_TRIM, e.movementY * MOUSE_SENSITIVITY_TRIM));
   });
   // Only while locked do mousedown/up mean mine/build-at-crosshair (routed through the F4
   // hold-to-act state machine above, not a direct eden_click_begin/end pulse); when NOT locked,
