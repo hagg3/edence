@@ -706,6 +706,43 @@
 }
 
 /* ==========================================================================================
+   Get Worlds — search/tag controls + preview, built from the same field/listrow/section
+   primitives as the rest of the kit rather than introducing new ones.
+   ========================================================================================== */
+.eden-worldbrowser__controls {
+  padding: calc(5 * var(--u));
+}
+.eden-worldbrowser__controls .eden-field {
+  width: auto;
+}
+.eden-worldbrowser__controls input.eden-field {
+  flex: 2 1 calc(140 * var(--u));
+}
+.eden-worldbrowser__controls select.eden-field {
+  flex: 1 1 calc(90 * var(--u));
+}
+.eden-worldbrowser__detail:empty {
+  display: none;
+}
+.eden-worldbrowser__preview {
+  display: block;
+  max-width: 100%;
+  box-shadow: var(--bevel-sunken);
+  margin: 0 calc(5 * var(--u)) calc(5 * var(--u));
+}
+.eden-worldbrowser__pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(4 * var(--u));
+  padding: calc(4 * var(--u)) calc(5 * var(--u));
+}
+.eden-worldbrowser__pager .eden-section__desc {
+  padding: 0;
+  text-align: center;
+}
+
+/* ==========================================================================================
    Toggle — split-pill, no sliding knob
    ------------------------------------------------------------------------------------------
    ON  = lime fill on the left, white "knob" half on the right.

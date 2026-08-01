@@ -25,11 +25,13 @@
 // the original's art. The three home-tile icons are placeholders taken from the engine's existing
 // create/load/share button art, to be replaced with purpose-drawn tiles later.
 //
-// PLACEHOLDERS: the mockups specify controls the port cannot do yet — Get Worlds (the online world
-// browser, which needs the edengame.net client), per-world Share and Info, and the New Dawn 256z
-// height format (blocked by the frozen T_HEIGHT, see ../CLAUDE.md's format freeze). Those are
-// rendered, focusable, and honest about doing nothing (see eden-ui.css's `.is-placeholder`), rather
-// than omitted — the screen should show what it will be.
+// PLACEHOLDERS: the mockups specify controls the port cannot do yet — per-world Share and Info, and
+// the New Dawn 256z height format (blocked by the frozen T_HEIGHT, see ../CLAUDE.md's format
+// freeze). Those are rendered, focusable, and honest about doing nothing (see eden-ui.css's
+// `.is-placeholder`), rather than omitted — the screen should show what it will be. Get Worlds
+// used to be one of these; it now opens a real screen (see renderGetWorlds below) backed by
+// eden-worldbrowser.js against the community's static hagg3.github.io/edenarchive catalog, not the
+// original edengame.net service (which this fork does not implement a client for).
 (function () {
   'use strict';
 
@@ -39,14 +41,37 @@
 
   var S = {
     open: false,
-    screen: 'menu',      // 'menu' | 'load' | 'new'
+    screen: 'menu',      // 'menu' | 'load' | 'new' | 'getworlds' | 'autoplay'
     root: null,
     releaseFocus: null,
     loadingEl: null,
     newWorldType: 1,     // 1 = flat, 0 = normal. Index 0 of the generator rail.
     heightFormat: 0,     // 0 = Legacy 64z (the only one the engine can do)
     selected: -1,
+    // Get Worlds screen state — kept here (not screen-local) so the manifest fetch and any
+    // in-flight download survive a re-render, e.g. after a search-box keystroke.
+    wbQuery: '',
+    wbTag: '',
+    wbPage: 0,           // 0-based index into the current filtered result set, PAGE_SIZE per page
+    wbList: null,        // cached manifest, once fetched
+    wbSelected: null,     // the manifest entry currently shown in the detail pane
+    wbDownload: null,     // { entry, busy, progress, done, error }
+    // Deep-link ("Play in browser") state — see startAutoPlay below.
+    apStatus: null,       // { message, progress } while working, or { error } on failure
   };
+
+  // Deep-link entry point: edenarchive world pages / search results link here as
+  // `?playworld=<archive-id>` (the numeric id in a world's `filename`, e.g. "1315348100"), the
+  // same query-param scheme eden-st.html already uses for `?build=rel`. Read once at load;
+  // `autoplayStarted` makes it fire exactly once even if the player quits back to this menu later
+  // in the session (a stale/second boot into the archive world would surprise them).
+  var pendingPlayworldId = (function () {
+    try {
+      var v = new URLSearchParams(location.search).get('playworld');
+      return v ? v.trim() : null;
+    } catch (e) { return null; }
+  })();
+  var autoplayStarted = false;
 
   function M() { return window.Module; }
   function ready() {
@@ -132,8 +157,7 @@
     tiles.appendChild(UI.button({
       size: 'lg', label: 'Get Worlds',
       art: A.img(A.NAMES.tileGetWorlds, ''),
-      placeholder: true,
-      placeholderNote: 'Online world browser is not available in this build',
+      onClick: function () { go('getworlds'); },
     }));
     root.appendChild(tiles);
 
@@ -267,6 +291,228 @@
     S.root.appendChild(scrim);
     UI.bindButtonSounds(scrim);
     var release = UI.trapFocus(scrim);
+  }
+
+  /**
+   * Get Worlds — search/browse the community's static edenarchive catalog and download+import a
+   * world. Data comes from eden-worldbrowser.js; this function only owns the DOM.
+   *
+   * Unlike renderLoadWorld, the search box and tag filter re-render only the results/detail
+   * sub-trees (renderResults/renderDetail below) rather than going through the top-level render() —
+   * that would rebuild the whole screen (including the search <input>) on every keystroke and lose
+   * focus/caret position.
+   */
+  function renderGetWorlds(root) {
+    var UI = window.EdenUI;
+    var WB = window.EdenWorldBrowser;
+
+    var win = UI.window({
+      title: 'Get Worlds',
+      onBack: function () { go('menu'); },
+    });
+
+    var pad = UI.el('div', 'eden-content__pad');
+    win.content.appendChild(pad);
+
+    var controls = UI.el('div', 'eden-section__body eden-worldbrowser__controls');
+    var searchInput = UI.el('input', 'eden-field');
+    searchInput.type = 'text';
+    searchInput.placeholder = 'Search name, author, tag…';
+    searchInput.value = S.wbQuery;
+    searchInput.setAttribute('aria-label', 'Search worlds');
+    searchInput.addEventListener('input', function () {
+      S.wbQuery = searchInput.value;
+      S.wbPage = 0;
+      renderResults();
+      win.content.scrollTop = 0;
+    });
+    var tagSelect = UI.el('select', 'eden-field');
+    tagSelect.setAttribute('aria-label', 'Filter by tag');
+    tagSelect.addEventListener('change', function () {
+      S.wbTag = tagSelect.value;
+      S.wbPage = 0;
+      renderResults();
+      win.content.scrollTop = 0;
+    });
+    controls.appendChild(searchInput);
+    controls.appendChild(tagSelect);
+    pad.appendChild(controls);
+
+    var status = UI.el('div', 'eden-section__desc');
+    pad.appendChild(status);
+
+    var resultsWrap = UI.el('div', 'eden-worldbrowser__results');
+    resultsWrap.setAttribute('role', 'listbox');
+    resultsWrap.setAttribute('aria-label', 'Downloadable worlds');
+    pad.appendChild(resultsWrap);
+
+    var detailWrap = UI.el('div', 'eden-worldbrowser__detail');
+    pad.appendChild(detailWrap);
+
+    // The catalog is a flat ~800-entry list with no server-side paging. The full manifest is
+    // fetched up front (EdenWorldBrowser.fetchManifest) and search/tag filtering always runs over
+    // all of it — PAGE_SIZE only bounds how many rows we render into the DOM at once, via
+    // S.wbPage/prev-next controls below, so a query can still match anywhere in the catalog even
+    // though rows are shown a page at a time.
+    var PAGE_SIZE = 200;
+
+    function populateTagOptions(list) {
+      var current = tagSelect.value || S.wbTag;
+      tagSelect.innerHTML = '';
+      var allOpt = document.createElement('option');
+      allOpt.value = '';
+      allOpt.textContent = 'All tags';
+      tagSelect.appendChild(allOpt);
+      WB.allTags(list).forEach(function (t) {
+        var o = document.createElement('option');
+        o.value = t;
+        o.textContent = t;
+        tagSelect.appendChild(o);
+      });
+      tagSelect.value = current;
+    }
+
+    // .eden-content (win.content) is the actual scroll container the results list lives in, not
+    // resultsWrap itself — scrolling resultsWrap.scrollTop does nothing.
+    function goToPage(n) {
+      S.wbPage = n;
+      renderResults();
+      win.content.scrollTop = 0;
+    }
+
+    function makePager(pageCount, filteredLength) {
+      var pager = UI.el('div', 'eden-worldbrowser__pager');
+      var prevBtn = UI.button({
+        size: 'sm', label: 'Previous',
+        disabled: S.wbPage <= 0,
+        onClick: S.wbPage <= 0 ? null : function () { goToPage(S.wbPage - 1); },
+      });
+      var label = UI.el('span', 'eden-section__desc',
+        'Page ' + (S.wbPage + 1) + ' of ' + pageCount + ' (' + filteredLength + ' matches)');
+      var nextBtn = UI.button({
+        size: 'sm', label: 'Next',
+        disabled: S.wbPage >= pageCount - 1,
+        onClick: S.wbPage >= pageCount - 1 ? null : function () { goToPage(S.wbPage + 1); },
+      });
+      pager.appendChild(prevBtn);
+      pager.appendChild(label);
+      pager.appendChild(nextBtn);
+      return pager;
+    }
+
+    function renderResults() {
+      resultsWrap.innerHTML = '';
+      if (!S.wbList) return;
+      var filtered = WB.search(S.wbList, S.wbQuery, S.wbTag);
+      if (!filtered.length) {
+        resultsWrap.appendChild(UI.section({
+          title: 'No worlds found', desc: 'Try a different search or tag.',
+        }));
+        return;
+      }
+      var pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+      if (S.wbPage >= pageCount) S.wbPage = pageCount - 1;
+      if (S.wbPage < 0) S.wbPage = 0;
+      var start = S.wbPage * PAGE_SIZE;
+      if (pageCount > 1) resultsWrap.appendChild(makePager(pageCount, filtered.length));
+      filtered.slice(start, start + PAGE_SIZE).forEach(function (entry) {
+        var row = UI.listRow({
+          title: entry.worldname || entry.filename,
+          sub: [entry.author, entry.publishdate, entry.filesize].filter(Boolean).join('   '),
+          desc: (entry.tags || []).join(', '),
+          selectable: true,
+          selected: S.wbSelected === entry,
+          onClick: function () {
+            S.wbSelected = entry;
+            renderResults();
+            renderDetail();
+          },
+        });
+        row.setAttribute('role', 'option');
+        resultsWrap.appendChild(row);
+      });
+      if (pageCount > 1) resultsWrap.appendChild(makePager(pageCount, filtered.length));
+    }
+
+    function startDownload(entry) {
+      S.wbDownload = { entry: entry, busy: true, progress: 0 };
+      renderDetail();
+      WB.downloadAndImport(entry, {
+        onProgress: function (pct) {
+          if (S.wbDownload && S.wbDownload.entry === entry) {
+            S.wbDownload.progress = pct;
+            renderDetail();
+          }
+        },
+      }, function (ok, err) {
+        S.wbDownload = { entry: entry, busy: false, done: ok, error: ok ? null : err };
+        if (ok) { go('load'); return; }   // matches drag-and-drop import's own landing spot
+        renderDetail();
+      });
+    }
+
+    function renderDetail() {
+      detailWrap.innerHTML = '';
+      var entry = S.wbSelected;
+      if (!entry) return;
+
+      detailWrap.appendChild(UI.section({ title: entry.worldname || entry.filename }));
+
+      var img = document.createElement('img');
+      img.className = 'eden-worldbrowser__preview';
+      img.alt = '';
+      img.src = WB.previewUrl(entry);
+      // Most worlds published in the last 1-2 years have no preview (a known bug on the archive
+      // site itself) — hide the broken-image icon rather than showing it.
+      img.addEventListener('error', function () { img.remove(); });
+      detailWrap.appendChild(img);
+
+      var dl = S.wbDownload && S.wbDownload.entry === entry ? S.wbDownload : null;
+      var actions = UI.el('div', 'eden-section__body');
+      actions.appendChild(UI.button({
+        size: 'sm', tone: 'positive', label: dl && dl.busy ? 'Downloading…' : 'Download',
+        disabled: !!(dl && dl.busy),
+        onClick: dl && dl.busy ? null : function () { startDownload(entry); },
+      }));
+      detailWrap.appendChild(actions);
+
+      if (dl && dl.busy) {
+        var bar = UI.el('div', 'eden-progress');
+        var fill = UI.el('div', 'eden-progress__fill');
+        fill.style.width = (dl.progress || 0) + '%';
+        bar.appendChild(fill);
+        bar.setAttribute('role', 'progressbar');
+        bar.setAttribute('aria-valuemin', '0');
+        bar.setAttribute('aria-valuemax', '100');
+        bar.setAttribute('aria-valuenow', String(dl.progress || 0));
+        detailWrap.appendChild(bar);
+      } else if (dl && dl.error) {
+        detailWrap.appendChild(UI.el('p', 'eden-stack__text', 'Download failed: ' + dl.error));
+      }
+    }
+
+    if (S.wbList) {
+      populateTagOptions(S.wbList);
+      renderResults();
+    } else {
+      status.textContent = 'Loading world list…';
+      WB.fetchManifest(function (err, list) {
+        // The player may have backed out (or the manifest may resolve after a second, cached call
+        // from a re-visit) before this fires — only touch the DOM if this screen is still current.
+        if (S.screen !== 'getworlds' || !detailWrap.isConnected) return;
+        if (err) {
+          status.textContent = 'Could not load the world archive (' + (err.message || err) + ').';
+          return;
+        }
+        S.wbList = list;
+        status.textContent = '';
+        populateTagOptions(list);
+        renderResults();
+      });
+    }
+    renderDetail();
+
+    root.appendChild(centered(win.root));
   }
 
   /** New World — name field, generator-type rail, height format. */
@@ -428,6 +674,103 @@
     S.loadingEl = { pct: pct, fill: fill, bar: bar };
   }
 
+  /**
+   * Deep-link ("Play in browser") flow, driven by `pendingPlayworldId`. Reuses a locally-saved
+   * copy if one already exists (matches renderLoadWorld's own filename convention, `<id>.eden`),
+   * otherwise pulls the entry from the same archive manifest Get Worlds uses and downloads it —
+   * same eden-worldbrowser.js path startDownload() takes, just without the browse/search UI in
+   * front of it. Ends by selecting the world and calling playSelected(), same as clicking Play.
+   */
+  function startAutoPlay(id) {
+    var file = id + '.eden';
+    var existing = worlds().filter(function (w) { return w.file === file; })[0];
+    if (existing) {
+      M()._eden_menu_select(existing.index);
+      playSelected();
+      return;
+    }
+
+    S.apStatus = { message: 'Loading the archive catalog…' };
+    render();
+    var WB = window.EdenWorldBrowser;
+    WB.fetchManifest(function (err, list) {
+      if (S.screen !== 'autoplay') return;   // player backed out (Go to menu) before this resolved
+      if (err) {
+        failAutoPlay('Could not reach the world archive (' + ((err && err.message) || err) + ').');
+        return;
+      }
+      var entry = list.filter(function (e) { return WB.idFor(e) === id; })[0];
+      if (!entry) {
+        failAutoPlay('World "' + id + '" was not found in the archive.');
+        return;
+      }
+      S.apStatus = { message: 'Downloading "' + (entry.worldname || id) + '"…', progress: 0 };
+      render();
+      WB.downloadAndImport(entry, {
+        onProgress: function (pct) {
+          if (S.screen !== 'autoplay' || !S.apStatus) return;
+          S.apStatus.progress = pct;
+          render();
+        },
+      }, function (ok, downloadErr) {
+        if (S.screen !== 'autoplay') return;
+        if (!ok) { failAutoPlay('Download failed: ' + downloadErr); return; }
+        // eden-worldbrowser.js's importFile already triggered eden_storage_reload_worlds(), so the
+        // engine's own list (worlds(), backed by Menu_web.mm) already includes the new file here.
+        var imported = worlds().filter(function (w) { return w.file === file; })[0];
+        if (!imported) {
+          failAutoPlay('The world downloaded but could not be found to play.');
+          return;
+        }
+        M()._eden_menu_select(imported.index);
+        playSelected();
+      });
+    });
+  }
+
+  function failAutoPlay(message) {
+    S.apStatus = { error: message };
+    render();
+  }
+
+  /** Deep-link progress/error screen — see startAutoPlay. Not interactive except on failure. */
+  function renderAutoPlay(root) {
+    var UI = window.EdenUI;
+    var st = S.apStatus || {};
+    var win = UI.window({
+      title: st.error ? 'Could not open this world' : 'Opening world from the archive',
+      variant: 'dialog', scrollbar: false,
+    });
+    var stack = UI.el('div', 'eden-stack');
+
+    if (st.error) {
+      stack.appendChild(UI.el('p', 'eden-stack__text', st.error));
+      stack.appendChild(UI.button({
+        size: 'md', label: 'Go to menu',
+        onClick: function () { S.apStatus = null; go('menu'); },
+      }));
+    } else {
+      var msg = UI.el('p', 'eden-stack__text', st.message || 'Working…');
+      msg.setAttribute('role', 'status');
+      msg.setAttribute('aria-live', 'polite');
+      stack.appendChild(msg);
+      if (typeof st.progress === 'number') {
+        var bar = UI.el('div', 'eden-progress');
+        var fill = UI.el('div', 'eden-progress__fill');
+        fill.style.width = st.progress + '%';
+        bar.appendChild(fill);
+        bar.setAttribute('role', 'progressbar');
+        bar.setAttribute('aria-valuemin', '0');
+        bar.setAttribute('aria-valuemax', '100');
+        bar.setAttribute('aria-valuenow', String(st.progress));
+        stack.appendChild(bar);
+      }
+    }
+
+    win.content.appendChild(stack);
+    root.appendChild(centered(win.root));
+  }
+
   function centered(node) {
     var wrap = window.EdenUI.el('div', 'eden-menu__center');
     wrap.appendChild(node);
@@ -477,6 +820,8 @@
     }
     if (S.screen === 'load') renderLoadWorld(fg);
     else if (S.screen === 'new') renderNewWorld(fg);
+    else if (S.screen === 'getworlds') renderGetWorlds(fg);
+    else if (S.screen === 'autoplay') renderAutoPlay(fg);
     else renderMainMenu(fg);
 
     S.releaseFocus = window.EdenUI.trapFocus(fg);
@@ -518,7 +863,18 @@
   function tick() {
     if (!ready()) return;
     var active = M()._eden_menu_active() !== 0;
-    if (active && !S.open) { S.open = true; S.screen = 'menu'; show(); }
+    if (active && !S.open) {
+      S.open = true;
+      if (pendingPlayworldId && !autoplayStarted) {
+        autoplayStarted = true;
+        S.screen = 'autoplay';
+        show();
+        startAutoPlay(pendingPlayworldId);
+      } else {
+        S.screen = 'menu';
+        show();
+      }
+    }
     if (!active && S.open) { S.open = false; hide(); }
     if (!S.open) return;
 

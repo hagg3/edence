@@ -554,16 +554,53 @@ if(EMSCRIPTEN)
     # per-face-direction vertex buckets — all statically allocated C globals (CLAUDE.md: "hot data
     # are C globals"). This is a 2010 iPhone-era fixed budget, not a leak.
     #
-    # 96 MB leaves headroom above the measured 62 MB for the malloc heap without being so large
-    # that the initial download/instantiate suffers. Revisit once a world actually loads (P4).
+    # MEASURED, project-audit row 14 / E1, 2026-07-31 — `node tools/headless-memory-probe.js`, which
+    # intercepts the module's own emscripten_resize_heap requests rather than reading buffer sizes
+    # back (those only show the size AFTER the growth policy's overshoot). Numbers, with the 2 MB
+    # stack below:
+    #
+    #   linker floor (static data + stack; must fit before main runs) ......  64.28 MB
+    #     = 62.30 MB static data + 2 MB stack. Below this the link fails outright with
+    #       "initial memory too small, N bytes needed" — N is where 64.28 comes from.
+    #   peak heap demand over a full session ......................  112 - 140 MB, run to run
+    #     (create world from the bundled Eden.eden -> play -> quit -> reload from the save file)
+    #
+    # 96 MB IS KEPT, deliberately, after measuring the alternatives — it is not the unmeasured
+    # number it used to be. Raising it does not help: the demand above is not a constant, so a
+    # bigger initial heap does not buy "no growth", it just raises the floor everyone pays,
+    # including the menu-only session and the phone that dies before it ever loads a world. The
+    # sweep (peak resident over two runs each, worst case shown):
+    #     80 MB -> 166 MB   96 MB -> 144 MB   112 MB -> 144 MB   128 MB -> 154 MB
+    #
+    # WHAT ACTUALLY MOVED THE PEAK is the growth policy, not the starting point. Emscripten's
+    # default growMemory takes max(requested, current * 1.2), so the heap walks a geometric ladder
+    # and lands well above the demand that triggered it (96 -> 115.25 -> 138.31 -> 166 MB, for a
+    # demand of ~140). A 16 MB linear step tracks the demand instead, which cut worst-case peak
+    # resident from 166 MB to 144 MB — ~22 MB of a mobile tab's budget, for one flag. The step is
+    # a balance: smaller tracks tighter but each growth rebuilds every JS-side heap view.
+    #
+    # IF THE INITIAL SIZE IS EVER TOO SMALL, NOTHING BREAKS: growth is still on, so an
+    # under-estimate costs a growth event, while an over-estimate is committed memory nobody uses.
+    # When in doubt, err low.
     -sINITIAL_MEMORY=100663296
+    -sMEMORY_GROWTH_LINEAR_STEP=16777216
     # P4: the wasm STACK is separate from INITIAL_MEMORY and defaults to only 64 KB. Terrain::render
-    # declares `vertexObject objVertices[300*6*6]` (10800 * 36 B ≈ 380 KB) as a plain LOCAL, plus the
+    # declares `vertexObject objVertices[300*6*6]` (10800 * 64 B ≈ 690 KB) as a plain LOCAL, plus the
     # mesher's own large frames — the iOS build had a multi-MB thread stack, so these never mattered.
     # On the default 64 KB wasm stack the first in-world Terrain::render() frame overflows and traps
     # as "memory access out of bounds" (measured: OOB in Terrain::render right after game_mode->1).
-    # 8 MB matches the iOS main-thread stack budget with headroom for the deepest engine frame.
-    -sSTACK_SIZE=8388608
+    #
+    # 2 MB. MEASURED, project-audit row 14 / E1, 2026-07-31 — `node tools/headless-memory-probe.js`
+    # paints the stack region and scans the high-water mark per phase (this was 8 MB before, chosen
+    # to match the iOS main-thread budget because nothing had measured it):
+    #     menu idle 4 KB · world generate+load 67 KB · IN-WORLD FRAME LOOP 694 KB · reload 694 KB
+    # 694 KB is essentially objVertices alone, and it is a FIXED-SIZE local in a non-recursive call
+    # graph (max_render_objects is a compile-time 300, Terrain::render does not recurse), so the
+    # peak is deterministic rather than a sample — the deepest frame this engine has is the one
+    # measured. 2 MB is ~2.9x that, measured in the -O0 build whose frames are FATTER than
+    # Release's. Do not trim it closer: an undersized wasm stack in a build with -sASSERTIONS=0
+    # fails as silent memory corruption, not as an error.
+    -sSTACK_SIZE=2097152
     # Creature skinning (pass 27). GL_OES_matrix_palette does not exist in WebGL, so the shim
     # emulates it (src/shim/gl/gl_es1_shim.cpp GROUP 8) and advertises it in glGetString — but the
     # four extension ENTRY POINTS still resolve to NULL inside Classes/PVRTglesExt.cpp, whose
@@ -632,8 +669,12 @@ if(EMSCRIPTEN)
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/menu@/bundle/media/menu"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/menu_text@/bundle/media/menu_text"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/ui@/bundle/media/ui"
-    "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/icons@/bundle/media/icons"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/ipad_menu@/bundle/media/ipad_menu"
+    # media/icons is NOT here (audit row E4, pass 62 — it used to be, packaging 159 KB of iOS app
+    # icons into eden.data). Icon_57/72/114/144.png ARE still shipped and still used — but over
+    # HTTP, by public/manifest.webmanifest and service-worker.js via the public/audio -> ../media
+    # symlink, never through the virtual FS. Nothing in Classes/ or src/ ever asks the bundle for
+    # them, so their copy inside eden.data was download weight that could not be read.
     # A handful of used textures sit directly in media/ (not a subdir) — sky, particles, portal
     # swirl. Individually named rather than preloading all of media/ root (numbers_text.psd,
     # .DS_Store are not assets the engine reads).
@@ -644,6 +685,14 @@ if(EMSCRIPTEN)
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/Flame_256.png@/bundle/media/Flame_256.png"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/Flame_512.png@/bundle/media/Flame_512.png"
     "SHELL:--preload-file ${EDEN_PARENT_DIR}/media/portal_twirl.png@/bundle/media/portal_twirl.png"
+    # report_flag.png lives at the REPO ROOT, not under media/ — so no directory rule above reaches
+    # it, and until pass 62 it was the one texture the engine asks for that this build did not ship
+    # (`Texture2D_web: no data at '/bundle/media/report_flag.png'`, twice per session, in every
+    # headless run since the port began). Found while auditing the opposite question, row E4's
+    # "is everything we ship reachable". Resources::loadMenuTextures pushes it as the last
+    # menutextures entry, so it is reachable whenever the legacy GL menu is (Settings' `legacy_menu`
+    # row keeps that a real, supported choice — see src/seam/Menu_web.mm's header). 21 KB.
+    "SHELL:--preload-file ${EDEN_PARENT_DIR}/report_flag.png@/bundle/media/report_flag.png"
     # Creature skins (pass 27): Moof_Default.png / *_Blink / *_Rage plus the MASKS/ variants that
     # Resources::getSkin recolours from. Same basename-index lookup as every other texture, so
     # this one goes under /bundle/media like the rest. WITHOUT it the models draw as pure black
@@ -705,6 +754,27 @@ if(EMSCRIPTEN)
     # by the public/audio symlink above and src/seam/js/eden_default_world.pre.js. /bundle itself
     # must still exist as a preloaded directory (from the media preloads above) for the .pre.js
     # run dependency to write the fetched file into; nothing needs to preload Eden.eden's bytes.
+
+    # ---- Audit row E4 (pass 62): keep authoring leftovers out of eden.data ----------------------
+    # The directory rules above walk media/ subdirectories wholesale, which is the right shape —
+    # but those directories are the 2010-2014 project's WORKING art folders, not a shipped asset
+    # tree, so they also contain the sources and scratch files the art was made from. Measured
+    # before this rule landed: 7 .psd files (334 KB — Texture2D only ever loads .png), two
+    # .DS_Store, and media/textures' offline atlas generator (AtlasTool.java/.class + its
+    # config*.txt inputs, which nothing at runtime reads). With media/icons dropped above, that is
+    # 514 KB of 6.81 MB — 7.4% of every player's first download, none of it loadable.
+    #
+    # Patterns are fnmatch'd against the SOURCE path (file_packager.py `is_excluded`), so a leading
+    # `*` is required — and note the same matching is why the .pod files below get their own
+    # explicit rules rather than an exclude (see the row-B2 comment above).
+    #
+    # This is a deny-list on purpose: an allow-list of "only *.png" would silently drop a future
+    # asset type (the port has already gained .pod and MASKS/ variants once), whereas a new .psd
+    # left in an art folder is the failure this rule exists to absorb.
+    "SHELL:--exclude-file *.psd"
+    "SHELL:--exclude-file *.DS_Store"
+    "SHELL:--exclude-file *AtlasTool*"
+    "SHELL:--exclude-file *media/textures/config*.txt*"
   )
   if(EDEN_THREADED)
     # D1: real pthreads (fixes C3's world-load-thread races per the plan's reframing — see
@@ -739,8 +809,9 @@ if(EMSCRIPTEN)
   # NOT included here: --closure 1 and -sINCOMING_MODULE_JS_API trimming (both from the audit's
   # Q1 step 2) — closure minification needs the public/*.js <-> Module surface audited for
   # bracket-vs-dot property access first (untested risk, no browser-based CI here to catch a
-  # silently-renamed property), and STACK_SIZE is deliberately left at the Debug-era 8 MB (audit
-  # step 4) rather than guessed smaller — both are follow-ups once this build has been profiled.
+  # silently-renamed property). STACK_SIZE was the other item parked here, "left at the Debug-era
+  # 8 MB rather than guessed smaller"; it is no longer guessed — measured at 694 KB peak and set to
+  # 2 MB, see the -sSTACK_SIZE comment in EDEN_LINK_FLAGS above.
   target_link_options(eden PRIVATE
     ${EDEN_LINK_FLAGS}
     $<$<CONFIG:Release>:-sASSERTIONS=0>

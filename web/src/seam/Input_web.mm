@@ -295,9 +295,10 @@ static int g_toolMode = MODE_BUILD;
 
 // Called once per frame (from eden_ui_tick) with the engine's current hud->mode, BEFORE any click
 // this frame has a chance to overwrite it. MODE_BUILD/MODE_BURN/MODE_PAINT are real tool
-// selections, captured as-is. MODE_NONE only ever arises here from the fire tool's own toggle-off
-// (Classes/Hud.mm's rburn handler: MODE_BURN -> MODE_NONE) since nothing else in this port's key
-// bindings reaches it, so it means "fire deselected" and reverts to the default build tool.
+// selections, captured as-is. MODE_NONE arises either from the fire tool's own toggle-off
+// (Classes/Hud.mm's rburn handler: MODE_BURN -> MODE_NONE) or from eden_click_begin's "empty hand"
+// click-on-nothing below — either way it means "no tool selected right now", so the remembered
+// right-click tool reverts to the default build tool rather than staying stuck on the last one.
 // MODE_MINE/MODE_CAMERA/the pickers are deliberately ignored — they are not right-click tools.
 static void eden_track_tool_mode(int hudMode) {
     if (hudMode == MODE_BUILD || hudMode == MODE_BURN || hudMode == MODE_PAINT) {
@@ -305,6 +306,19 @@ static void eden_track_tool_mode(int hudMode) {
     } else if (hudMode == MODE_NONE) {
         g_toolMode = MODE_BUILD;
     }
+}
+
+// Same crosshair raycast eden_pick_block_at_crosshair uses (see its comment for why FC_DESTROY
+// and the swapped mx/my are correct here) — factored out so eden_click_begin below can ask "is
+// there anything under the crosshair at all" without duplicating the unproject math. A miss
+// (sky, or nothing within range) comes back with x==-1, exactly Util.mm's own "no hit" contract.
+static Point3D eden_crosshair_raycast(void) {
+    Point3D miss; miss.x = -1; miss.y = 0; miss.z = 0;
+    Input* input = Input::getInput();
+    if (!input) return miss;
+    const int cx = (int)(SCREEN_WIDTH / 2.0f);
+    const int cy = (int)(input->scr_height - SCREEN_HEIGHT / 2.0f);
+    return findWorldCoords(cy, cx, FC_DESTROY);
 }
 
 // Left-click always mines. Right-click performs whichever tool is currently selected — normally
@@ -315,10 +329,32 @@ static void eden_track_tool_mode(int hudMode) {
 // fires on M_DOWN then M_RELEASE of one touch, so the begin and end calls below must land on
 // separate engine ticks (JS mousedown/mouseup naturally straddle at least one frame; the headless
 // driver must tick between them too).
+//
+// "Empty hand" mode (2026-08-01): touch's HUD already lets a player tap the active mine icon a
+// second time to drop into MODE_NONE, which Player::processInput's mine/build/burn/paint branch
+// (Classes/Player.mm ~365) simply doesn't match, so a live MODE_NONE touch is inert by
+// construction. Desktop has no icon to re-tap, so a click that lands on nothing (sky, or beyond
+// raycast range) does the same thing a re-tap would: drop into MODE_NONE instead of performing
+// the click. Once in MODE_NONE, every click is swallowed here (never forwarded, never re-picks a
+// tool) until the player explicitly re-selects one via E/C/F — hudTapButtonRect's buttons switch
+// mode unconditionally away from whatever it was, so MODE_NONE exits itself just like touch does.
+//
+// MODE_PAINT is exempt from the miss check: Player::processInput's own point.x==-1 branch
+// (Classes/Player.mm ~423) is what paints the SKY — `mode==MODE_PAINT` there is specifically the
+// "the raycast hit nothing" case, used to recolor the sky / toggle day-night. Treating that miss
+// as "empty hand" would make sky-painting unreachable from the mouse, so a paint click always
+// forwards regardless of what (if anything) is under the crosshair.
 EMSCRIPTEN_KEEPALIVE
 void eden_click_begin(int isBuild) {
     if (!World::getWorld || !World::getWorld->hud) return;
-    World::getWorld->hud->mode = isBuild ? g_toolMode : MODE_MINE;
+    Hud* hud = World::getWorld->hud;
+    if (hud->mode == MODE_NONE) return;
+    const int resolvedMode = isBuild ? g_toolMode : MODE_MINE;
+    if (resolvedMode != MODE_PAINT && eden_crosshair_raycast().x == -1) {
+        hud->mode = MODE_NONE;
+        return;
+    }
+    hud->mode = resolvedMode;
     eden_input_pointer_event(0, kClickIdentity, SCREEN_WIDTH / 2.0f, SCREEN_HEIGHT / 2.0f);
 }
 EMSCRIPTEN_KEEPALIVE
@@ -391,6 +427,19 @@ int eden_hud_in_menu(void) {
     return World::getWorld->hud->inmenu ? 1 : 0;
 }
 
+// Does the current hud->mode want the crosshair hidden? True in "empty hand" (MODE_NONE — see
+// eden_click_begin's click-on-nothing handling above) and in photo/camera mode (MODE_CAMERA,
+// entered via the in-game menu's Take Photo button, `which=5` in hudTapButtonRect) — neither has
+// anything to aim at a block with, same reasoning as eden_update_block_preview's own mode check
+// already excluding both from the block-preview ghost. public/eden-st.html ANDs this with the
+// player's "Crosshair" settings toggle (eden_get_crosshair) each frame.
+EMSCRIPTEN_KEEPALIVE
+int eden_crosshair_hidden_by_mode(void) {
+    if (!World::getWorld || !World::getWorld->hud) return 0;
+    const int m = World::getWorld->hud->mode;
+    return (m == MODE_NONE || m == MODE_CAMERA) ? 1 : 0;
+}
+
 // 1-9 hotbar and wheel scroll. Eden's actual block picker is a scrolling grid (Hud::
 // handlePickBlock, NUM_DISPLAY_BLOCKS=35 cells addressed by a `static int hudBlocks[]` that is
 // file-static to Hud.mm and not reachable from here) opened via the 'E' tap above, not a 9-slot
@@ -453,13 +502,7 @@ void eden_set_hotbar_slot_type(int slot, int type) {
 EMSCRIPTEN_KEEPALIVE
 int eden_pick_block_at_crosshair(void) {
     if (!World::getWorld || !World::getWorld->hud || !World::getWorld->terrain) return TYPE_NONE;
-    Input* input = Input::getInput();
-    if (!input) return TYPE_NONE;
-    // Same crosshair math as eden_update_block_preview() below: screen centre, in the
-    // BOTTOM-LEFT-ORIGIN, Y-UP space itouch/findWorldCoords expect.
-    const int cx = (int)(SCREEN_WIDTH / 2.0f);
-    const int cy = (int)(input->scr_height - SCREEN_HEIGHT / 2.0f);
-    Point3D point = findWorldCoords(cy, cx, FC_DESTROY);
+    Point3D point = eden_crosshair_raycast();
     if (point.x == -1) return TYPE_NONE;
     int type = World::getWorld->terrain->getLand(point.x, point.z, point.y);
     if (type == TYPE_NONE || type == -1) return TYPE_NONE;

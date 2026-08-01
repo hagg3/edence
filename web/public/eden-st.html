@@ -121,6 +121,10 @@
      above: reuses eden-settings.js's stylesheet, must exist before the rAF loop below polls it. -->
 <script src="eden-loaderror.js"></script>
 
+<!-- "Get Worlds" data layer: fetches the hagg3.github.io/edenarchive static manifest and unzips
+     downloads client-side. Loaded BEFORE eden-menu.js, which is the only thing that calls it. -->
+<script src="eden-worldbrowser.js"></script>
+
 <!-- The rebuilt main menu / Load World / New World screens. An opaque overlay ON TOP of the
      engine's own GL menu, which keeps running underneath — see eden-menu.js's header, and
      web/src/seam/Menu_web.mm for why this is an overlay rather than a --wrap. The "Legacy menu"
@@ -900,7 +904,8 @@
     // stylesheet rule itself (display: none), which never shows the crosshair at all.
     // Audit row E5: this ran unconditionally every frame — a per-frame layout-invalidating style
     // write even on the (overwhelming majority of) frames where nothing changed. Guard on change.
-    const wantsCrosshair = pointerLocked && !wants && !!Module._eden_get_crosshair();
+    const wantsCrosshair = pointerLocked && !wants && !!Module._eden_get_crosshair() &&
+      !Module._eden_crosshair_hidden_by_mode();
     if (wantsCrosshair !== crosshairVisible) {
       crosshairVisible = wantsCrosshair;
       crosshairEl.style.display = wantsCrosshair ? 'block' : 'none';
