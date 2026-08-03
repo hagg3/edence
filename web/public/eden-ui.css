@@ -1089,7 +1089,7 @@
   top: calc(26 * var(--u) + min(calc(270 * var(--u) * 0.42), 26vw));
   transform: translateX(-50%);
   font-family: var(--eden-font-display);
-  font-size: calc(9 * var(--u));
+  font-size: calc(14 * var(--u));
   letter-spacing: 0.08em;
   color: #fff;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);

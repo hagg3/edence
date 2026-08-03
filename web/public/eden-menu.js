@@ -189,6 +189,7 @@
       onBack: function () { go('menu'); },
     });
 
+    win.actions.appendChild(importButton());
     win.actions.appendChild(UI.button({
       size: 'sm', label: 'Delete', onClick: function () { confirmDelete(win); },
     }));
@@ -251,6 +252,50 @@
     });
 
     root.appendChild(centered(win.root));
+  }
+
+  /**
+   * Import — same path as the "Import .eden file" row buried in Settings > Storage
+   * (eden-settings.js), surfaced here too since Load World is where it's actually useful. Both
+   * call the same window.EdenStorage.importFile.
+   */
+  function importButton() {
+    var UI = window.EdenUI;
+    var ES = window.EdenStorage;
+    var btn = UI.button({ size: 'sm', icon: 'folder-open', label: 'Import' });
+    if (!ES) { btn.disabled = true; return btn; }
+    // button() appends the label as a bare text node (no wrapper span) — grab it directly so
+    // the "Importing…" swap doesn't clobber the icon or the file input appended below.
+    var labelNode = Array.prototype.filter.call(btn.childNodes, function (n) {
+      return n.nodeType === 3;
+    })[0];
+
+    var fileInput = UI.el('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.eden,.gz';
+    fileInput.style.display = 'none';
+    btn.appendChild(fileInput);
+
+    function runImport(f) {
+      if (!f) return;
+      btn.disabled = true;
+      if (labelNode) labelNode.textContent = 'Importing…';
+      ES.importFile(f, function (ok, err) {
+        btn.disabled = false;
+        if (labelNode) labelNode.textContent = 'Import';
+        if (!ok) { window.alert('Import failed: ' + err); return; }
+        S.selected = -1;
+        render();
+      });
+    }
+
+    fileInput.addEventListener('change', function () {
+      var f = fileInput.files && fileInput.files[0];
+      fileInput.value = '';
+      runImport(f);
+    });
+    btn.addEventListener('click', function () { fileInput.click(); });
+    return btn;
   }
 
   /**
