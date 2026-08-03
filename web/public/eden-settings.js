@@ -361,7 +361,7 @@
       var importBtn = UI.button({ size: 'sm', label: 'Choose file…' });
       var fileInput = UI.el('input');
       fileInput.type = 'file';
-      fileInput.accept = '.eden';
+      fileInput.accept = '.eden,.gz';
       fileInput.style.display = 'none';
       fileInput.addEventListener('change', function () {
         var f = fileInput.files && fileInput.files[0];
@@ -371,7 +371,7 @@
       importBtn.addEventListener('click', function () { fileInput.click(); });
       var importRow = UI.listRow({
         title: 'Import .eden file',
-        sub: 'Choose a file, or drag and drop one anywhere on this tab.',
+        sub: 'Choose a .eden or .eden.gz file, or drag and drop one anywhere on this tab.',
         actions: importBtn,
       });
       importRow.appendChild(fileInput);

@@ -1083,6 +1083,20 @@
   image-rendering: pixelated;
 }
 
+.eden-menu__edition {
+  position: absolute;
+  left: 50%;
+  top: calc(26 * var(--u) + min(calc(270 * var(--u) * 0.42), 26vw));
+  transform: translateX(-50%);
+  font-family: var(--eden-font-display);
+  font-size: calc(9 * var(--u));
+  letter-spacing: 0.08em;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 /* Full-width rows rather than `left:50% + translateX(-50%)`: an absolutely positioned element
    with a left offset shrink-to-fits against the REMAINING width (here 50vw), which silently
    wrapped the third home tile onto a second row on a 1280px window. Spanning edge to edge and

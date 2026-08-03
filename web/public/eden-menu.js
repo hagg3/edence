@@ -142,6 +142,7 @@
 
     var logo = A.img(A.NAMES.logo, 'Eden', 'eden-menu__logo');
     root.appendChild(logo);
+    root.appendChild(UI.el('div', 'eden-menu__edition', 'Community Edition'));
 
     var tiles = UI.el('div', 'eden-menu__tiles');
     tiles.appendChild(UI.button({
@@ -190,6 +191,9 @@
 
     win.actions.appendChild(UI.button({
       size: 'sm', label: 'Delete', onClick: function () { confirmDelete(win); },
+    }));
+    win.actions.appendChild(UI.button({
+      size: 'sm', icon: 'download', label: 'Export', onClick: function () { confirmExport(); },
     }));
     win.actions.appendChild(UI.button({
       size: 'sm', label: 'Share', placeholder: true,
@@ -281,6 +285,61 @@
         if (release) release();
         render();
       },
+    }));
+    stack.appendChild(UI.button({
+      size: 'md', label: 'Cancel',
+      onClick: function () { scrim.remove(); if (release) release(); },
+    }));
+    dlg.content.appendChild(stack);
+    scrim.appendChild(dlg.root);
+    S.root.appendChild(scrim);
+    UI.bindButtonSounds(scrim);
+    var release = UI.trapFocus(scrim);
+  }
+
+  /**
+   * Export — download the selected world's raw .eden file, with a choice between the file exactly
+   * as stored and a gzip-compressed copy (see eden-storage.js's exportWorldAt/deflateGzip; there is
+   * no reusable encoder for the engine's own RLE variant — docs/eden-file-format.md's "RLE variant"
+   * is decode-only and bundled-default-world-only — so gzip is the compressed option here).
+   */
+  function confirmExport() {
+    var UI = window.EdenUI;
+    var ES = window.EdenStorage;
+    if (S.selected < 0 || !ES) return;
+    var name = worldName(S.selected);
+    var target = S.selected;
+
+    var scrim = UI.scrim({
+      onDismiss: function () { scrim.remove(); if (release) release(); },
+    });
+    scrim.style.zIndex = 'var(--eden-z-alert)';
+    var dlg = UI.window({ title: 'Export world', variant: 'dialog', scrollbar: false, role: 'alertdialog' });
+    var stack = UI.el('div', 'eden-stack');
+    stack.appendChild(UI.el('p', 'eden-stack__text',
+      'Download "' + name + '" as a .eden file you can keep or move to another browser.'));
+
+    var busy = false;
+    function doExport(compress) {
+      if (busy) return;
+      busy = true;
+      ES.exportWorldAt(target, compress, function (ok, err) {
+        busy = false;
+        scrim.remove();
+        if (release) release();
+        if (!ok) window.alert('Export failed' + (err ? ': ' + err : '.'));
+      });
+    }
+
+    stack.appendChild(UI.button({
+      size: 'md', tone: 'positive', icon: 'download', label: 'Download uncompressed',
+      onClick: function () { doExport(false); },
+    }));
+    stack.appendChild(UI.button({
+      size: 'md', icon: 'download', label: 'Download compressed (.gz)',
+      disabled: !ES.canCompress(),
+      title: ES.canCompress() ? '' : 'Not supported in this browser',
+      onClick: function () { doExport(true); },
     }));
     stack.appendChild(UI.button({
       size: 'md', label: 'Cancel',

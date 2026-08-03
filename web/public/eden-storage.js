@@ -150,23 +150,67 @@
     if (!file) { cb && cb(false, 'no file'); return; }
     var reader = new FileReader();
     reader.onload = function () {
-      try {
-        if (typeof FS === 'undefined') throw new Error('FS unavailable');
-        var name = file.name || ('import-' + Date.now());
-        if (!/\.eden$/i.test(name)) name += '.eden';
-        FS.writeFile(MOUNT_PATH + '/' + name, new Uint8Array(reader.result));
-        if (mounted) {
-          try { FS.syncfs(false, function (err) { if (err) reportSyncError(err); }); }
-          catch (e) { reportSyncError(e); }
-        }
-        if (ready() && M()._eden_storage_reload_worlds) M()._eden_storage_reload_worlds();
-        cb && cb(true, null);
-      } catch (e) {
-        cb && cb(false, e.message || String(e));
-      }
+      finishImport(file.name || ('import-' + Date.now()), new Uint8Array(reader.result), cb);
     };
     reader.onerror = function () { cb && cb(false, 'file read failed'); };
     reader.readAsArrayBuffer(file);
+  }
+
+  // A world exported via the "Compressed" option (see exportWorldAt) is a plain gzip member wrapped
+  // around the raw .eden bytes — not the engine's own RLE variant (docs/eden-file-format.md's "RLE
+  // variant" is decode-only, bundled-default-world-only, and has no encoder anywhere in this repo or
+  // in eden-world-editor to reuse). Gzip is the browser-native, round-trip-safe choice: detect it
+  // either by the `.gz` name (own export) or the gzip magic bytes (someone renamed it), inflate with
+  // the same DecompressionStream every modern browser already ships, then import the raw bytes as
+  // normal. Detected by magic bytes rather than name alone so a re-named .eden.gz dropped onto the
+  // Storage tab's file input still round-trips.
+  function isGzip(bytes) {
+    return bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+  }
+
+  function finishImport(name, bytes, cb) {
+    if (isGzip(bytes)) {
+      if (typeof DecompressionStream === 'undefined') {
+        cb && cb(false, 'This browser cannot decompress gzip worlds (no DecompressionStream support).');
+        return;
+      }
+      name = name.replace(/\.gz$/i, '');
+      inflateGzip(bytes).then(function (raw) {
+        writeWorldFile(name, raw, cb);
+      }, function (e) {
+        cb && cb(false, 'gzip decompress failed: ' + (e && e.message || e));
+      });
+      return;
+    }
+    writeWorldFile(name, bytes, cb);
+  }
+
+  function writeWorldFile(name, bytes, cb) {
+    try {
+      if (typeof FS === 'undefined') throw new Error('FS unavailable');
+      if (!/\.eden$/i.test(name)) name += '.eden';
+      FS.writeFile(MOUNT_PATH + '/' + name, bytes);
+      if (mounted) {
+        try { FS.syncfs(false, function (err) { if (err) reportSyncError(err); }); }
+        catch (e) { reportSyncError(e); }
+      }
+      if (ready() && M()._eden_storage_reload_worlds) M()._eden_storage_reload_worlds();
+      cb && cb(true, null);
+    } catch (e) {
+      cb && cb(false, e.message || String(e));
+    }
+  }
+
+  function inflateGzip(bytes) {
+    var ds = new DecompressionStream('gzip');
+    var stream = new Blob([bytes]).stream().pipeThrough(ds);
+    return new Response(stream).arrayBuffer().then(function (buf) { return new Uint8Array(buf); });
+  }
+
+  function deflateGzip(bytes) {
+    var cs = new CompressionStream('gzip');
+    var stream = new Blob([bytes]).stream().pipeThrough(cs);
+    return new Response(stream).arrayBuffer().then(function (buf) { return new Uint8Array(buf); });
   }
 
   // Row #18 (perf-audit §6): "the single best answer to my browser cleared my storage" —
@@ -175,27 +219,57 @@
   // same IDBFS-backed MEMFS mount importFile() writes into, so export/import round-trip through
   // exactly the format docs/eden-file-format.md describes — no engine call needed, this is a pure
   // file copy out of the mount.
-  function exportWorldAt(index) {
-    if (!ready() || typeof FS === 'undefined') return false;
+  function downloadBytes(bytes, filename) {
+    var blob = new Blob([bytes], { type: 'application/octet-stream' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+  }
+
+  // `compress: true` gzips the raw .eden bytes before handing them to the browser's normal download
+  // flow — same file, smaller download, and losslessly reversible by importFile's gzip detection
+  // above. Kept synchronous-shaped (returns true/false immediately) for the uncompressed path since
+  // that's what the Storage tab's existing caller expects; compression is inherently async
+  // (CompressionStream), so that path takes `cb(ok, errorOrNull)` instead — callers that only care
+  // about the uncompressed case can still ignore the third argument.
+  function exportWorldAt(index, compress, cb) {
+    if (typeof compress === 'function') { cb = compress; compress = false; }
+    if (!ready() || typeof FS === 'undefined') { cb && cb(false, 'not ready'); return false; }
     var worlds = listWorlds();
     var w = worlds[index];
-    if (!w) return false;
+    if (!w) { cb && cb(false, 'no such world'); return false; }
     try {
       var data = FS.readFile(MOUNT_PATH + '/' + w.file);
-      var blob = new Blob([data], { type: 'application/octet-stream' });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url;
-      a.download = w.file;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      if (!compress) {
+        downloadBytes(data, w.file);
+        cb && cb(true, null);
+        return true;
+      }
+      if (typeof CompressionStream === 'undefined') {
+        cb && cb(false, 'This browser cannot compress worlds (no CompressionStream support).');
+        return false;
+      }
+      deflateGzip(data).then(function (gz) {
+        downloadBytes(gz, w.file + '.gz');
+        cb && cb(true, null);
+      }, function (e) {
+        cb && cb(false, 'gzip compress failed: ' + (e && e.message || e));
+      });
       return true;
     } catch (e) {
       console.warn('[eden-storage] export failed:', e);
+      cb && cb(false, e.message || String(e));
       return false;
     }
+  }
+
+  function canCompress() {
+    return typeof CompressionStream !== 'undefined';
   }
 
   function formatBytes(n) {
@@ -229,6 +303,7 @@
     deleteWorldAt: deleteWorldAt,
     importFile: importFile,
     exportWorldAt: exportWorldAt,
+    canCompress: canCompress,
     formatBytes: formatBytes,
     formatDate: formatDate,
     estimateQuota: estimateQuota
