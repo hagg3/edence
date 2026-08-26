@@ -324,18 +324,16 @@ void Menu::loadWorlds(){
 		
 		
 	}
-	if(world_list==NULL){
-		WorldNode* new_world;
-		new_world=(WorldNode*)malloc(sizeof(WorldNode));
-		memset(new_world,0,sizeof(WorldNode));
-		new_world->display_name=settings->getNewWorldName();
-		new_world->file_name=[NSString stringWithFormat:@"%@.eden",genhash()];
-		[new_world->file_name retain];
-		[new_world->display_name retain];
-        addWorld(new_world);
-		if(selected_world)
-		fnbar->setStatus(selected_world->display_name ,9999);
-	}
+	// An empty Documents folder used to synthesise one placeholder world here (a name from
+	// settings->getNewWorldName() and a fresh genhash() file name) so the stock iOS carousel was
+	// never empty. Removed 2026-08-06 on a user report: that entry looks exactly like a saved
+	// world but has no file behind it, so tapping it drops into loadWorld()'s create-a-new-world
+	// branch and stops on the Flat/Normal question -- which read as "loading forever". The list is
+	// now honest: nothing appears until the player creates, imports or downloads a world, and both
+	// front-ends already have a real empty state for that (public/eden-menu.js's "No worlds yet"
+	// card; the GL carousel simply draws nothing, its layout is already NULL-guarded).
+	// selected_world stays NULL in that case -- every deref of it reachable from an empty list is
+	// guarded; see Menu::refreshfn/activate and the layout block below.
 }
 void Menu::addWorld(WorldNode* node){
 	if(world_list_end==NULL){
@@ -662,6 +660,11 @@ BOOL Menu::loadShared(SharedListNode* sharedNode){
 	
 }
 void Menu::refreshfn(){
+ // selected_world is legitimately NULL now whenever no world exists (see loadWorlds).
+ if(selected_world==NULL){
+     fnbar->setStatus(@"" ,9999);
+     return;
+ }
  fnbar->setStatus(selected_world->display_name ,9999);
 	
 }

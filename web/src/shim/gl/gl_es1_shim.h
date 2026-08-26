@@ -46,7 +46,7 @@
 //        (non-PVRT) file — Model.mm uses only CPVRTModelPOD::ReadFromFile (data parsing,
 //        no GL). TODO P1: confirm the linker drops these via function-level dead-code
 //        elimination (-ffunction-sections -Wl,--gc-sections); if not, these PVRT files may
-//        need excluding/stubbing too (flagged as an open risk in PORT-STATUS.md, NOT solved
+//        need excluding/stubbing too (flagged as an open risk in archive/PORT-STATUS-2026-08-13.md, NOT solved
 //        here since it can't be verified without emcc).
 //
 // GROUPS BELOW mirror the plan's D2 description and rendering.md's pass structure so this
@@ -74,7 +74,7 @@ extern "C" {
 // entirely). Values are the standard Khronos GL/GLES1 constants, stable since OpenGL 1.x and
 // unchanged across every vendor's ES1 headers. TODO P1: cross-check verbatim against a real
 // GLES/gl.h once emsdk/an SDK snapshot is available locally (none was found in this repo or
-// on this machine to diff against — see PORT-STATUS.md "Open questions").
+// on this machine to diff against — see archive/PORT-STATUS-2026-08-13.md "Open questions").
 // ---------------------------------------------------------------------------------------
 #define GL_MODELVIEW                   0x1700
 #define GL_PROJECTION                  0x1701

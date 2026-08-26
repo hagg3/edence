@@ -271,7 +271,7 @@ NSData *UIImagePNGRepresentation(UIImage *image);                               
 + (UIColor *)colorWithRed:(float)r green:(float)g blue:(float)b alpha:(float)a; // TODO P2
 @end
 
-// UIView: only exists because Classes/EAGLView.h (kept unmodified, see PORT-STATUS.md "Design
+// UIView: only exists because Classes/EAGLView.h (kept unmodified, see archive/PORT-STATUS-2026-08-13.md "Design
 // decision: seam .mm replacements") declares `@interface EAGLView : UIView <...>`. No engine
 // (non-seam) file after VKeyboard.mm's reclassification (see foundation-usage.md) calls a real
 // UIView method — this is here purely so that inheritance chain parses.
@@ -291,7 +291,7 @@ NSData *UIImagePNGRepresentation(UIImage *image);                               
 @end
 
 // ---- EAGLContext — needed only because Classes/EAGLView.h (kept unmodified — see
-// PORT-STATUS.md "Design decision: seam .mm replacements") declares an `EAGLContext *context`
+// archive/PORT-STATUS-2026-08-13.md "Design decision: seam .mm replacements") declares an `EAGLContext *context`
 // ivar/property. Real behavior (if any is even needed) belongs to Stage P2's WebGL2 context
 // setup (src/seam/EAGLView_web.*) — this is just enough for the untouched original header to
 // parse for the 3 non-seam engine files that still `#import "EAGLView.h"` (Globals.mm,

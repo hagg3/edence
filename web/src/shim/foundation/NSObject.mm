@@ -9,6 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#include <mutex>
+#endif
 
 // --- Retain counts live here, NOT in an ivar -------------------------------------------
 // See the layout comment on @interface NSObject (NSObject.h): NSObject must declare zero
@@ -19,15 +22,46 @@
 // retained past their initial reference ever get an entry) and, critically, makes constant
 // strings free: they are never inserted, always report 1, and can never reach 0.
 //
-// NOT thread-safe. That is correct for now — per CLAUDE.md convention #4 the only non-main
-// thread is the world-load pthread, and under plan decision D1 the engine runs on a single
-// worker thread. TODO P1/D1: if real pthreads land (SharedArrayBuffer), guard this with a
-// mutex or switch to atomics, and revisit whether an object header word beats a side table.
+// THREADING (audit row 36/C1, pass 63) — this table is the ONE piece of the Foundation shim that
+// genuinely needs a lock, and the only one that gets one. Everywhere else the threaded build
+// reaches for per-thread state instead (the ObjC dispatch caches in objc_runtime.cpp, the pool
+// stack in NSAutoreleasePool.mm); this table cannot go that way, because retain and release for
+// the SAME object may legitimately happen on different threads — Classes/World.mm hands its
+// `NSString *name` from the main thread to loadWorldThread, which passes it on into
+// Terrain::loadTerrain. A per-thread count would let each side independently drive it to zero.
+//
+// A std::mutex is affordable here in a way it would NOT have been on the message-dispatch path:
+// every operation below is already an unordered_map hash + probe, so the lock is a small addition
+// to an existing cost rather than a new cost on a bare pointer compare. It is also not the engine's
+// hot loop — retain/release traffic is Foundation-object churn (strings, file handles, pool
+// contents), not per-vertex or per-block work.
+//
+// Compiled out entirely without -pthread: `EdenRetainLock` is an empty struct there, so the
+// single-threaded build keeps exactly the codegen it had.
+//
+// Still open (deliberately, and NOT needed for the world-load thread): if off-thread MESHING ever
+// retains/releases Foundation objects at frame rate, revisit this — an atomic count in an object
+// header word beats a locked side table at that volume. The reason the side table exists at all
+// is NSObject's zero-ivar layout constraint (see above), so that change is a real design change,
+// not a tweak.
 namespace {
 std::unordered_map<const void *, int> &edenRetainTable() {
     static std::unordered_map<const void *, int> table;
     return table;
 }
+
+#if defined(__EMSCRIPTEN_PTHREADS__)
+std::mutex &edenRetainTableMutex() {
+    static std::mutex m;
+    return m;
+}
+struct EdenRetainLock {
+    std::lock_guard<std::mutex> guard;
+    EdenRetainLock() : guard(edenRetainTableMutex()) {}
+};
+#else
+struct EdenRetainLock {};
+#endif
 } // namespace
 
 // Constant strings are immortal: clang emits them as static data, so they were never
@@ -71,6 +105,7 @@ std::unordered_map<const void *, int> &edenRetainTable() {
 }
 
 - (id)retain {
+    EdenRetainLock lock;
     std::unordered_map<const void *, int> &table = edenRetainTable();
     std::unordered_map<const void *, int>::iterator it = table.find(self);
     if (it == table.end()) {
@@ -82,15 +117,22 @@ std::unordered_map<const void *, int> &edenRetainTable() {
 }
 
 - (oneway void)release {
-    std::unordered_map<const void *, int> &table = edenRetainTable();
-    std::unordered_map<const void *, int>::iterator it = table.find(self);
-    if (it == table.end()) {
-        [self dealloc]; // implicit count of 1 → drops to 0
-        return;
+    // The lock is scoped to the table access ALONE, and -dealloc runs outside it. -dealloc takes
+    // the same (non-recursive) mutex to erase its own entry, so calling it from inside this scope
+    // would self-deadlock the moment the threaded build is enabled — and would do so only on the
+    // path where an object actually dies, i.e. rarely enough to look like a random hang.
+    bool shouldDealloc = false;
+    {
+        EdenRetainLock lock;
+        std::unordered_map<const void *, int> &table = edenRetainTable();
+        std::unordered_map<const void *, int>::iterator it = table.find(self);
+        if (it == table.end()) {
+            shouldDealloc = true; // implicit count of 1 → drops to 0
+        } else if (--it->second <= 1) {
+            table.erase(it); // back down to the implicit 1
+        }
     }
-    if (--it->second <= 1) {
-        table.erase(it); // back down to the implicit 1
-    }
+    if (shouldDealloc) [self dealloc];
 }
 
 - (id)autorelease {
@@ -99,14 +141,18 @@ std::unordered_map<const void *, int> &edenRetainTable() {
 }
 
 - (NSUInteger)retainCount {
+    EdenRetainLock lock;
     std::unordered_map<const void *, int> &table = edenRetainTable();
     std::unordered_map<const void *, int>::iterator it = table.find(self);
     return it == table.end() ? 1 : (NSUInteger)it->second;
 }
 
 - (void)dealloc {
-    edenRetainTable().erase(self); // never leave a stale entry for a recycled address
-    object_dispose(self);
+    {
+        EdenRetainLock lock;
+        edenRetainTable().erase(self); // never leave a stale entry for a recycled address
+    }
+    object_dispose(self); // outside the lock: it frees, and must not run under the table mutex
 }
 
 - (Class)class {

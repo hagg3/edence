@@ -79,7 +79,7 @@ void fmh_readColumnFromDefault(int cx,int cz){
     
     
     Terrain* ter=World::getWorld->terrain;
-    TerrainChunk* columns[CHUNKS_PER_COLUMN];
+    TerrainChunk* columns[CHUNKS_PER_COLUMN_MAX];
     ColumnIndex* colIndex=NULL;
 	int n= twoToOne(cx,cz);
 	if(n==0){
@@ -127,6 +127,12 @@ void fmh_readColumnFromDefault(int cx,int cz){
     }
     
     [saveFile seekToFileOffset:colIndex->chunk_offset];
+    // How many RLE bands the BUNDLED map actually stores per column -- derived from its own header,
+    // not from the world being played. Eden.eden is a 64z (4-band) file and is deliberately NOT
+    // regenerated for 256z: the offline TerrainGen2 bake would need ~4 GB and would produce a
+    // differently-shaped world needing an art pass (see the 256z plan, Stage 2 item 6). A 256z
+    // world seeded from the default map therefore gets those 4 bands and air above them.
+    const int bandsInDefault=(sfh->version>=FILE_VERSION_256Z)?CHUNKS_PER_COLUMN_MAX:4;
     for(int cy=0;cy<CHUNKS_PER_COLUMN ;cy++){
         int bounds[6];
         
@@ -152,9 +158,15 @@ void fmh_readColumnFromDefault(int cx,int cz){
         columns[cy]=chunk;
         
         
-        BOOL rle=true;
+        BOOL rle=(cy<bandsInDefault);
+        if(!rle){
+            // Above the bundled map's top band: air, and no read at all (there is nothing there
+            // to read -- the next bytes belong to the next column).
+            memset(chunk->pblocks,0,CHUNK_SIZE3*sizeof(block8));
+            memset(chunk->pcolors,0,CHUNK_SIZE3*sizeof(color8));
+        }
         if(rle){
-            
+
             block8 tblocks[CHUNK_SIZE3];
             color8 tcolors[CHUNK_SIZE3];
             color8 buf[CHUNK_SIZE3*3];

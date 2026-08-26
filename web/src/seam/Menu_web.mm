@@ -296,6 +296,33 @@ int eden_menu_take_pending_world_type(void) {
     return v;
 }
 
+// -----------------------------------------------------------------------------------------------
+// World height (64z / 256z "New Dawn") -- 256z Stage 3 item 4
+// -----------------------------------------------------------------------------------------------
+// Same "park a choice up front, one-shot take" pattern as world type above, consumed from
+// Classes/FileManager.mm's probeWorldHeight() instead of a seam file, because probeWorldHeight is
+// the one place that already decides a not-yet-existing world's height (see its own comment).
+// 64z remains the default: eden_menu_take_pending_world_height() returns -1 (nothing pending)
+// unless the New World screen explicitly set 256.
+static int g_pending_world_height = -1;   // -1 none, 64 or 256
+
+EMSCRIPTEN_KEEPALIVE
+void eden_menu_set_pending_world_height(int height) {
+    g_pending_world_height = (height == 256) ? 256 : 64;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void eden_menu_clear_pending_world_height(void) { g_pending_world_height = -1; }
+
+/** Consumed by FileManager::probeWorldHeight() (Classes/FileManager.mm). Returns -1 when nothing
+ *  is pending, in which case the caller stays at the 64z default. */
+EMSCRIPTEN_KEEPALIVE
+int eden_menu_take_pending_world_height(void) {
+    int v = g_pending_world_height;
+    g_pending_world_height = -1;
+    return v;
+}
+
 /** Open the engine's settings screen (which the DOM settings panel mirrors via
  *  eden_settings_menu_open()). Same flag the GL menu's Options button sets. */
 EMSCRIPTEN_KEEPALIVE

@@ -20,10 +20,22 @@
 // ivar offsets, and (3) super_class arriving as a name string. Those three are where a
 // from-memory implementation of "the GNU runtime" would have been wrong.
 //
-// THREADING: registration runs entirely in static constructors, before main, on one thread.
-// Dispatch afterwards is read-mostly except for the method cache. Per CLAUDE.md convention #4 the
-// only other thread in this engine is the world-load pthread; if D1's PROXY_TO_PTHREAD build ever
-// sends messages from it, the cache below needs a lock (marked at its definition).
+// THREADING — resolved for the threaded build (audit row 36/C1, pass 63). The old note here said
+// "if D1's PROXY_TO_PTHREAD build ever sends messages from it, the cache below needs a lock."
+// It does send messages from it — Classes/World.mm's `loadWorldThread` opens with
+// `[[NSAutoreleasePool alloc] init]` and `Terrain::loadTerrain` goes on to use NSString,
+// NSFileHandle and NSBundle — so this is now a live constraint rather than a hypothetical. The
+// resolution is NOT a lock; see the note above methodCache(). In one paragraph:
+//
+//   * Everything the dispatch path READS is immutable after static-ctor time. Registration
+//     (`__objc_exec_class`) runs only from static constructors, which Emscripten runs once, on
+//     the main thread, before main() — worker pthreads share that memory and never re-run them.
+//     Nothing in this tree calls sel_registerName/objc_allocateClassPair/class_addMethod at
+//     runtime (grep-verified across Classes/, *.mm and web/src/), so classesByName(),
+//     internedNames(), canonicalSelectors(), resolvedClasses() and every method list are
+//     read-only by the time a second thread exists. Concurrent reads of a settled
+//     std::unordered_map are safe.
+//   * The only dispatch-path WRITES are the two caches, and both are per-thread under -pthread.
 #include "objc_abi.h"
 
 #include <stdio.h>
@@ -302,11 +314,39 @@ void drainPending() {
 }
 
 // --- Dispatch ----------------------------------------------------------------------------
+// PER-THREAD CACHES, not locked caches (audit row 36/C1, pass 63). Both caches below are
+// `EDEN_OBJC_TLS`, which is `thread_local` in the threaded build and nothing at all in the
+// single-threaded one — so the ST build's codegen is byte-for-byte what it was.
+//
+// Why per-thread beats a mutex here, and it is not close: this is the hot path of every single
+// `[obj msg]` in the engine — Hud.mm alone has 275 sends and per-frame sends run into the
+// thousands (that count is why the inline cache below exists at all). A mutex would put an
+// atomic RMW pair on every one of them, on the main thread, to protect against a background
+// thread that sends a few hundred messages during a world load. Per-thread caches put ZERO
+// instructions on the hot path: each thread simply misses into the shared, immutable method
+// lists the first time it sends a given (class, selector) pair, and hits its own cache after.
+//
+// The cost is duplication, and it is provably harmless: two threads that both look up the same
+// (cls, sel) each `new` their own eden_objc_slot with IDENTICAL contents, because the method
+// list they read it from is immutable. Nothing anywhere compares slots by identity — clang loads
+// field index 4 (`method`) and calls it, and `owner`/`cachedFor`/`version` are written but never
+// read (objc_abi.h's own note on the struct). So the duplicate is a few dozen bytes per
+// (thread, class, selector) actually used off the main thread, bounded and small — the world
+// load touches a handful of Foundation classes, not the whole engine.
+//
+// If a future thread ever DOES need to see main-thread cache state, the answer is still not a
+// lock on this path — it is that the underlying method lists are already shared, so the second
+// thread reconstructs the same answer on its own.
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#define EDEN_OBJC_TLS thread_local
+#else
+#define EDEN_OBJC_TLS
+#endif
+
 // Method cache, keyed on (class, interned selector name). Both are 32-bit under wasm32, so the
 // packed 64-bit key is exact — no collisions, no need to re-verify on hit.
-// NOT THREAD-SAFE: see this file's header note on threading before messaging from another thread.
 std::unordered_map<unsigned long long, eden_objc_slot *> &methodCache() {
-  static std::unordered_map<unsigned long long, eden_objc_slot *> m;
+  static EDEN_OBJC_TLS std::unordered_map<unsigned long long, eden_objc_slot *> m;
   return m;
 }
 
@@ -329,8 +369,11 @@ struct InlineCacheEntry {
 };
 const unsigned kInlineCacheSize = 4096;  // power of two
 const unsigned kInlineCacheMask = kInlineCacheSize - 1;
+// EDEN_OBJC_TLS: 32 KB of table per thread in the threaded build (see the note above
+// methodCache()). With -sPTHREAD_POOL_SIZE=4 that is 160 KB of a ~100 MB heap — cheap next to
+// putting a lock on the send path.
 InlineCacheEntry *inlineCache() {
-  static InlineCacheEntry table[kInlineCacheSize] = {};
+  static EDEN_OBJC_TLS InlineCacheEntry table[kInlineCacheSize] = {};
   return table;
 }
 inline unsigned inlineCacheIndex(unsigned long long key) {

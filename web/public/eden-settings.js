@@ -54,10 +54,33 @@
     return window.__edenModuleReady && M() && typeof M()._eden_settings_schema === 'function';
   }
 
+  // THE CANONICAL COPY of this helper — eden-menu.js, eden-storage.js, eden-loaderror.js and
+  // eden-console.js each carry an identical one and point back here for the reasoning.
+  //
+  // `new Uint8Array(...)` around the subarray is NOT redundant, and removing it breaks the
+  // threaded build in a way that looks nothing like a string bug (audit row 36/C1, pass 63).
+  // In an EDEN_THREADED build the wasm memory is a SharedArrayBuffer, so `HEAPU8` is a view onto
+  // shared memory — and `TextDecoder.decode()` REFUSES those outright:
+  //     TypeError: Failed to execute 'decode' on 'TextDecoder':
+  //               The provided ArrayBufferView value must not be shared.
+  // (The spec forbids it because the decoder could otherwise observe another thread mutating the
+  // bytes mid-decode.) The constructor copies the bytes into a fresh, non-shared buffer first,
+  // which is both allowed and what we want anyway.
+  //
+  // WHY THIS MATTERED SO MUCH MORE THAN IT LOOKS: the throw happened inside `getSetting`, which
+  // eden-gamepad.js polls from `trackCursorNeed`, which eden_main.cpp calls at the tail of EVERY
+  // `eden_frame_tick` via `Module.__edenFramePost`. So the exception unwound out of the engine's
+  // own frame callback and the main loop stopped after tick 0 — presenting as a black canvas with
+  // a live WebGL2 context and a healthy-looking DOM, i.e. exactly the failure signature
+  // web/CLAUDE.md warns is "a renderer bug and is not one". Found by counting engine frames.
+  //
+  // Cost in the single-threaded build: one small copy per C-string read. These are UI-rate reads
+  // of short strings (setting keys, world names), not per-vertex work — kept unconditional so
+  // both builds run the same code path rather than diverging on a `crossOriginIsolated` check.
   function utf8(ptr) {
     var H = M().HEAPU8, end = ptr;
     while (H[end]) end++;
-    return new TextDecoder().decode(H.subarray(ptr, end));
+    return new TextDecoder().decode(new Uint8Array(H.subarray(ptr, end)));
   }
 
   // The schema is the key -> index map, so nothing here ever passes a string into wasm (which
@@ -95,6 +118,7 @@
     Experiments: 'flask-conical',
     Keys: 'keyboard',
     Storage: 'hard-drive',
+    Reset: 'rotate-ccw',
   };
   function iconForGroup(g) { return GROUP_ICONS[g] || 'settings'; }
 
@@ -198,6 +222,7 @@
     var gs = groupsOf(S.schema);
     gs.push('Keys');      // not schema-driven — see renderKeysBody (Phase 5, JS-owned keybinds)
     gs.push('Storage');   // not schema-driven — see renderStorageBody
+    gs.push('Reset');     // not schema-driven — see renderResetBody (audit row 20/G2)
     return gs;
   }
 
@@ -211,6 +236,8 @@
       renderStorageBody(pad);
     } else if (S.group === 'Keys') {
       renderKeysBody(pad);
+    } else if (S.group === 'Reset') {
+      renderResetBody(pad);
     } else {
       for (var i = 0; i < S.schema.length; i++) {
         if (S.schema[i].group !== S.group) continue;
@@ -306,6 +333,46 @@
     var resetWrap = UI.el('div', 'eden-section__body');
     resetWrap.appendChild(reset);
     pad.appendChild(resetWrap);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Reset tab (audit row 20/G2 — "unify settings + keybinds"). The storage split (C table for
+  // engine-backed rows, JS localStorage blob for keybinds — see the Keys tab's own header comment
+  // for why that split is real and staying) was never the complaint; the missing SHARED reset was.
+  // The Keys tab already had its own local reset, every other row had none at all, so "Reset
+  // settings" meant something different depending which tab you were on. One button here resets
+  // both halves together, in the same unified shell every other tab already lives in.
+  // ---------------------------------------------------------------------------------------------
+  function renderResetBody(pad) {
+    var UI = window.EdenUI;
+    pad.appendChild(UI.el('div', 'eden-section__desc',
+      'Resets every setting on every tab, including key bindings, back to defaults. ' +
+      'Saved worlds are not affected.'));
+    var confirming = false, confirmTimer = null;
+    var btn = UI.button({
+      size: 'sm', label: 'Reset all settings & keybinds',
+      onClick: function () {
+        if (!confirming) {
+          confirming = true;
+          btn.textContent = 'Confirm reset?';
+          btn.classList.add('eden-btn--danger');
+          confirmTimer = setTimeout(function () {
+            confirming = false;
+            btn.textContent = 'Reset all settings & keybinds';
+            btn.classList.remove('eden-btn--danger');
+          }, 4000);
+          return;
+        }
+        clearTimeout(confirmTimer);
+        if (ready()) M()._eden_settings_reset_all();
+        if (window.EdenKeybinds) window.EdenKeybinds.resetDefaults();
+        pad.textContent = '';
+        renderResetBody(pad);
+      },
+    });
+    var wrap = UI.el('div', 'eden-section__body');
+    wrap.appendChild(btn);
+    pad.appendChild(wrap);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -424,11 +491,61 @@
         if (ES && ES.deleteWorldAt(index)) { pad.textContent = ''; renderStorageBody(pad); }
       });
 
+      // 256z Stage 3 item 5: the space-reclaim action, only offered for a 256z world (converting
+      // a 64z world is a no-op the engine would refuse anyway). Destructive -- discards anything
+      // above y=63, so it gets the same two-click confirm as Delete, then shows the FULL report
+      // (blocks discarded, creatures dropped, etc.) rather than a bare success toast, because a
+      // silent "it worked" would hide exactly the information this warning exists to surface.
+      var convertBtn = null;
+      if (w.height === 256) {
+        convertBtn = UI.button({ size: 'sm', label: 'Convert to 64z' });
+        var convertConfirming = false, convertResetTimer = null;
+        convertBtn.addEventListener('click', function () {
+          if (!convertConfirming) {
+            convertConfirming = true;
+            convertBtn.textContent = 'Confirm?';
+            convertBtn.classList.add('eden-btn--danger');
+            convertResetTimer = setTimeout(function () {
+              convertConfirming = false;
+              convertBtn.textContent = 'Convert to 64z';
+              convertBtn.classList.remove('eden-btn--danger');
+            }, 4000);
+            return;
+          }
+          clearTimeout(convertResetTimer);
+          convertBtn.disabled = true;
+          convertBtn.textContent = 'Converting…';
+          var r = ES ? ES.convertTo64zAt(index) : { ok: false, error: 'not available' };
+          if (!r.ok) {
+            window.alert('Convert failed: ' + (r.error || 'unknown error'));
+            pad.textContent = '';
+            renderStorageBody(pad);
+            return;
+          }
+          var lines = [r.columns + ' columns converted.'];
+          if (r.blocksDiscarded) lines.push(r.blocksDiscarded + ' blocks above y=63 discarded (' + r.columnsAffected + ' columns affected).');
+          if (r.doorsOrphaned) lines.push(r.doorsOrphaned + ' door/portal halves at the cut cleared.');
+          if (r.creaturesDropped) lines.push(r.creaturesDropped + ' creatures above y=63 dropped.');
+          if (r.creaturesRelocated) lines.push(r.creaturesRelocated + ' creatures relocated to a lower slot.');
+          if (r.creaturesOverflow) lines.push(r.creaturesOverflow + ' creatures could not be relocated (no free slot).');
+          if (r.posClamped) lines.push('Player position clamped into the 64z ceiling.');
+          if (r.homeClamped) lines.push('Home point clamped into the 64z ceiling.');
+          window.alert('Converted to 64z.\n\n' + lines.join('\n'));
+          pad.textContent = '';
+          renderStorageBody(pad);
+        });
+      }
+
+      // w.height (Storage_web.mm) is 64 or 256 -- a 256z ("New Dawn") world costs roughly 4x the
+      // memory of a 64z one once loaded (~413 MB of wasm heap vs. ~128 MB, measured pass 67), which
+      // is real risk on a memory-constrained device (the iOS Safari ceiling that produced audit row
+      // A11), so it's called out here rather than only at the moment of loading it.
       pad.appendChild(UI.listRow({
         title: w.name,
         sub: (ES ? ES.formatBytes(w.bytes) : w.bytes + ' B') + ' · edited ' +
-          (ES ? ES.formatDate(w.mtime) : w.mtime),
-        actions: [exportBtn, del],
+          (ES ? ES.formatDate(w.mtime) : w.mtime) +
+          (w.height === 256 ? ' · 256z (uses much more memory to load)' : ''),
+        actions: convertBtn ? [exportBtn, convertBtn, del] : [exportBtn, del],
       }));
     });
   }

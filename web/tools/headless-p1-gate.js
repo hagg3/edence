@@ -1,5 +1,5 @@
 // Checked-in version of the "headless logic check" recipe documented in web/CLAUDE.md and
-// PORT-STATUS.md ("(cd build-st && node eden.js) — expect `[eden-gl] no canvas` then three
+// archive/PORT-STATUS-2026-08-13.md ("(cd build-st && node eden.js) — expect `[eden-gl] no canvas` then three
 // `[eden-p1] tick N: World::update returned` lines; anything else is a regression"). Before this
 // file, that check only existed as prose someone had to re-type from memory each session
 // (perf-audit row #17 / §9's "no test harness in the repo" gap) — this makes it a runnable,

@@ -6,7 +6,7 @@
 //
 // Mounts /documents (the REAL FileManager's save directory — see docs/save-load.md) on IndexedDB
 // via Emscripten's IDBFS, so world saves survive a reload instead of vanishing with the MEMFS they
-// used to live in only (docs/PORT-STATUS.md's #1 open item). {autoPersist:true} (see
+// used to live in only (docs/archive/PORT-STATUS-2026-08-13.md's #1 open item). {autoPersist:true} (see
 // web/emsdk/.../src/library_idbfs.js) means every file close-after-write, mkdir, unlink or rename
 // under /documents queues its own debounced IndexedDB sync — no engine-side save hook, no --wrap,
 // nothing on the C++ side needs to know this file exists.
@@ -21,7 +21,7 @@
 //      _eden_storage_delete_world_at(i) (src/seam/Storage_web.mm) — INDEX based, like every other
 //      wasm call in this port, so nothing here needs _malloc/_free on the export list.
 //
-// Guarded throughout on `typeof indexedDB`: node's headless `eden.js` (docs/RESUME-HERE.md
+// Guarded throughout on `typeof indexedDB`: node's headless `eden.js` (docs/STATUS.md
 // "Running it") has none, and must keep working exactly as before — MEMFS, session-only.
 (function () {
   'use strict';
@@ -124,7 +124,9 @@
   function utf8(ptr) {
     var H = M().HEAPU8, end = ptr;
     while (H[end]) end++;
-    return new TextDecoder().decode(H.subarray(ptr, end));
+    // The Uint8Array copy is load-bearing in the EDEN_THREADED build (shared memory cannot be
+    // handed to TextDecoder) — full reasoning on the canonical copy in eden-settings.js.
+    return new TextDecoder().decode(new Uint8Array(H.subarray(ptr, end)));
   }
 
   function listWorlds() {
@@ -136,6 +138,18 @@
   function deleteWorldAt(index) {
     if (!ready()) return false;
     return M()._eden_storage_delete_world_at(index) !== 0;
+  }
+
+  // 256z Stage 3 item 5: space-reclaim action for a 256z ("New Dawn") world. Destructive (see
+  // FileManager::convertWorldTo64's own header for exactly what it discards), so this returns the
+  // full report rather than a bool — the Storage tab shows it before/instead of a bare success
+  // toast. `index` is the same list-position convention as deleteWorldAt/exportWorldAt.
+  function convertTo64zAt(index) {
+    if (!ready() || !M()._eden_storage_convert_to_64z_at) {
+      return { ok: false, error: 'not available' };
+    }
+    try { return JSON.parse(utf8(M()._eden_storage_convert_to_64z_at(index))); }
+    catch (e) { return { ok: false, error: 'malformed response' }; }
   }
 
   // Row #18 (perf-audit §6, promoted from pass 35's "quick and dirty test hook" — the mechanism
@@ -301,6 +315,7 @@
     isPersistent: function () { return mounted; },
     listWorlds: listWorlds,
     deleteWorldAt: deleteWorldAt,
+    convertTo64zAt: convertTo64zAt,
     importFile: importFile,
     exportWorldAt: exportWorldAt,
     canCompress: canCompress,

@@ -20,6 +20,15 @@ CGRect padbounds;
 CGRect joystick_pos,default_pos;
 Vector pos;
 
+// Web port audit row 17/G1 (touch-draggable controls card): while true, Joystick::update below
+// no-ops entirely — no movement input, no joystick_pos tracking — so the web port's "move
+// controls" mode (web/src/seam/Input_web.mm) can freely rewrite padbounds.origin from a drag
+// gesture without fighting this frame's own touch handling, and without the player's character
+// drifting from a stray touch while they are repositioning the pad rather than playing. render()
+// below is unaffected, so the pad (and joystick_pos, wherever it was left) stays visible while
+// this is on, which is what lets the player see what they're dragging.
+bool joystickCustomizeMode=false;
+
 Joystick::Joystick(){
 	padbounds.origin.x=20;padbounds.origin.y=20;
 	padbounds.size.width=88;
@@ -34,6 +43,7 @@ Joystick::Joystick(){
 static const int usage_id=999;
 
 BOOL Joystick::update(float etime){
+	if(joystickCustomizeMode)return FALSE;
 	Input* input=Input::getInput();
 	//Hud* hud=World::getWorld->hud;
     itouch* touches=input->getTouches();

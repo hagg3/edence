@@ -5,11 +5,26 @@
 #import "NSAutoreleasePool.h"
 #include <vector>
 
-// TODO P1 (threading): this is NOT actually thread-local yet — engine is single-GL-thread
-// (CLAUDE.md convention #4) plus one pthread world-load thread (Classes/World.mm:339) that,
-// per that same convention, must NOT touch Foundation/GL. If that invariant ever changes,
-// this needs a real thread-local stack (e.g. via pthread_getspecific under EDEN_THREADED).
-static std::vector<NSAutoreleasePool *> g_poolStack;
+// THE POOL STACK IS PER-THREAD (audit row 36/C1, pass 63) — as it is in real Foundation, and as
+// the file header's old TODO said it would have to become "if that invariant ever changes."
+// It changed. The threaded build makes Classes/World.mm's world-load pthread real, and that
+// thread's FIRST statement is `[[NSAutoreleasePool alloc] init]` (Classes/World.mm:317,
+// loadWorldThread) — so two threads push and pop this stack concurrently. A single shared
+// std::vector would corrupt on the concurrent push_back, and worse, `+currentPool` on the load
+// thread would hand back the MAIN thread's frame pool, so every NSString the loader autoreleased
+// would be drained by the render thread's next frame boundary — a use-after-free that would
+// present as terrain corruption, not as a threading bug.
+//
+// `thread_local` only under -pthread, so the single-threaded build's codegen is unchanged (a
+// plain static, no TLS indirection on -autorelease's path). Each thread gets its own lazily
+// created fallback root pool via +currentPool below, which is the correct behaviour anyway:
+// the load thread's pool must not be the main thread's.
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#define EDEN_POOL_TLS thread_local
+#else
+#define EDEN_POOL_TLS
+#endif
+static EDEN_POOL_TLS std::vector<NSAutoreleasePool *> g_poolStack;
 
 // NON-POD IVARS ARE NOT SAFE IN THIS PORT — see the long note in NSUserDefaults.mm for the
 // measurement and the mechanism. Short version: class_createInstance() is `calloc`, and the

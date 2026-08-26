@@ -12,13 +12,25 @@ of the root project's Xcode/iOS SDK dependency.
 cd web && source ./emsdk/emsdk_env.sh
 cmake --build build-st -j8     # -DEDEN_THREADED=OFF — single-threaded, the one actually
                                 # used/runnable day to day
-cmake --build build -j8        # EDEN_THREADED default (ON) — real pthreads + OffscreenCanvas +
-                                # PROXY_TO_PTHREAD + COOP/COEP; currently STALE, points at an
-                                # old absolute repo path, won't configure — a known gap, not
-                                # the daily driver
 cmake --build build-rel -j8    # release build (see sizes below), reachable via
                                 # eden-st.html?build=rel
+emcmake cmake -B build-thr -DCMAKE_BUILD_TYPE=Debug -DEDEN_THREADED=ON && \
+  cmake --build build-thr -j8  # the THREADED build (audit row 36/C1, pass 63), reachable via
+                                # eden-st.html?build=thr
 ```
+`EDEN_THREADED` defaults **OFF** (audit row A1) and is `-pthread -sPTHREAD_POOL_SIZE=4`
+— **not** `PROXY_TO_PTHREAD`/OffscreenCanvas, whatever older prose says: engine, GL and
+DOM all stay on the browser main thread, and the flag exists to make `pthread_create`
+real (the world-load thread) and to enable a future meshing pool. The OffscreenCanvas
+plan was measured, not reasoned, into the ground — see the `if(EDEN_THREADED)` block in
+`CMakeLists.txt` and `../../WORKING/c1-threaded-build-handoff.md`.
+
+That build's wasm memory is a `SharedArrayBuffer`, so its page must be **cross-origin
+isolated** (`COOP: same-origin` + `COEP: require-corp`). `tools/serve.js` sends both;
+`python3 -m http.server` does not. GitHub Pages cannot send response headers at all, so
+`public/eden-coi.js` + `service-worker.js` synthesise them for a `?build=thr` navigation
+and reload once (pass 65). `node tools/serve.js <port> --no-coi` withholds the real
+headers to exercise that path locally, and `?coi=off` disables it entirely.
 `EDEN_THREADED` (`CMakeLists.txt:39`) is a **build flag, not a source fork** —
 deliberately kept that way so engine code stays thread-agnostic. See
 [execution-flow.md](execution-flow.md) for how the single-threaded build's world-load

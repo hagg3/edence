@@ -6,6 +6,7 @@
 #import "NSFileHandle.h"
 #import "NSString.h"
 #import "NSData.h"
+#include "Constants.h"   // g_save_inplace_threshold — the shared save-strategy threshold
 
 @implementation NSFileHandle
 
@@ -29,6 +30,21 @@ static void eden_backup_before_overwrite(NSString *path) {
     const char *p = [path UTF8String];
     FILE *src = fopen(p, "rb");
     if (!src) return; // nothing to back up yet (first save of this world)
+    // 256z Stage 3 / B5: this slot is a whole-file duplicate, so it costs exactly what
+    // FileManager::saveWorld()'s scratch copy costs -- tools/headless-save-io-probe.js measured
+    // BOTH firing on the same save, 3x the world file written per save on a 279 MB specimen.
+    // Above the same threshold that puts saveWorld on its in-place path there is nothing to
+    // duplicate onto: the disk cannot hold 2x a multi-gigabyte world and the rollback journal
+    // saveWorld writes covers the failure this slot was protecting against. Below it, unchanged.
+    // (`g_save_inplace_threshold` is Classes/Constants.h; Classes/ is on this target's include
+    // path -- see CMakeLists.txt's target_include_directories.)
+    fseeko(src, 0, SEEK_END);
+    off_t existing = ftello(src);
+    if (existing >= 0 && (unsigned long long)existing >= g_save_inplace_threshold) {
+        fclose(src);
+        return;
+    }
+    fseeko(src, 0, SEEK_SET);
     NSString *bakPath = [path stringByAppendingString:@".bak"];
     const char *bak = [bakPath UTF8String];
     FILE *dst = fopen(bak, "wb");

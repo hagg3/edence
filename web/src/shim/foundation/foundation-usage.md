@@ -23,7 +23,7 @@ command lines if they need re-running after engine changes).
 `description`, `copy`, `dealloc`. Backing: intrusive refcount on a shim `NSObject` base;
 real `@interface`/`@implementation` under the GNU objc runtime (D3a), not a fake C++ mimic —
 the engine uses genuine bracket-message-send syntax throughout, so this only works if a real
-ObjC frontend/runtime is present (see PORT-STATUS.md "P0.1 risk").
+ObjC frontend/runtime is present (see archive/PORT-STATUS-2026-08-13.md "P0.1 risk").
 
 ### NSAutoreleasePool — P1
 `alloc`/`init`/`release`/`drain` (9 total mentions). One is used per-frame in
@@ -127,7 +127,7 @@ without re-reading the two call sites when P4 starts).
 `fileHandleForReadingAtPath:`, `fileHandleForWritingAtPath:`, `fileHandleForUpdatingAtPath:`,
 `seekToFileOffset:`, `seekToEndOfFile`, `readDataOfLength:`, `readDataToEndOfFile`,
 `writeData:`, `closeFile`, `offsetInFile`. This is THE append-only `.eden` format I/O
-(`docs/eden-file-format.md`, `docs/save-load.md`) — `WORKING/PORT-STATUS.md`/plan D1 calls out
+(`docs/eden-file-format.md`, `docs/save-load.md`) — `WORKING/archive/PORT-STATUS-2026-08-13.md`/plan D1 calls out
 OPFS `FileSystemSyncAccessHandle` as the eventual backing (synchronous seek/read/write,
 matching this API almost 1:1). **This pass**: header + a P1-only backing over plain
 `fopen`/`fseek`/`fread`/`fwrite` (works under Emscripten's default MEMFS, enough to link and
@@ -216,7 +216,7 @@ Grepped across `Classes/*.mm` + `Lighting.mm`: `UIImage`(61), `CGRect`(50), `CGP
   without a real image decoder) with every method `// TODO P2`.
 - `VKeyboard.mm` additionally calls `[G_EAGL_VIEW insertSubview:atIndex:]` — a real `UIView`
   method. Because of this one call, `VKeyboard.mm` was reclassified from "Aux UIKit: verify"
-  to **seam-excluded** in this pass (see `WORKING/PORT-STATUS.md` — a native `<input>` overlay at
+  to **seam-excluded** in this pass (see `WORKING/archive/PORT-STATUS-2026-08-13.md` — a native `<input>` overlay at
   the JS/HTML layer replaces it, matching the original's "real OS text field over the GL view"
   approach in spirit). `statusbar.mm` and `Gamepad.mm` were verified clean (no `UIView`
   subclassing/`addSubview` calls) and stay classified as ordinary engine files.

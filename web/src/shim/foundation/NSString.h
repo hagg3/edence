@@ -33,7 +33,7 @@
 //     (some runtime targets ignore it and hard-require the name `NXConstantString` — if so,
 //     rename the class and add an NSConstantString alias).
 // Until a real link runs, treat this file as designed-but-unproven. See web-port-plan.md
-// "D3 refinement" and docs/PORT-STATUS.md.
+// "D3 refinement" and docs/archive/PORT-STATUS-2026-08-13.md.
 #ifndef EDEN_SHIM_NSSTRING_H
 #define EDEN_SHIM_NSSTRING_H
 

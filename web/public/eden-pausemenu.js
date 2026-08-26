@@ -77,6 +77,34 @@
   // gets the player there in one click instead of Settings -> tab-click.
   function openControls() { openSettingsFromHere('Keys'); }
 
+  // Audit row 17/G1 (touch half — "on-screen controls being draggable"): puts the joystick pad
+  // into an explicit, opt-in "move controls" mode (window.EdenJoystickCustomize, eden-input.js)
+  // rather than a long-press during normal play, so there is no ambiguity with actually walking.
+  // A floating "Done" button (independent of this panel, which is already closed by the time the
+  // player is dragging) is the only way out, mirroring eden-st.html's fullscreenBtn pattern for a
+  // page-chrome control that isn't part of the design-system window stack.
+  var moveControlsDoneBtn = null;
+  function endMoveControls() {
+    window.EdenJoystickCustomize.stop();
+    if (moveControlsDoneBtn) {
+      moveControlsDoneBtn.parentNode.removeChild(moveControlsDoneBtn);
+      moveControlsDoneBtn = null;
+    }
+  }
+  function openMoveControls() {
+    if (ready()) M()._eden_play_menu_button_sound(1);
+    hide();
+    S.open = false;
+    window.EdenJoystickCustomize.start();
+    showToast('Drag the joystick to move it');
+    moveControlsDoneBtn = window.EdenUI.button({
+      size: 'md', tone: 'positive', label: 'Done', onClick: endMoveControls,
+    });
+    moveControlsDoneBtn.style.cssText =
+      'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:12;';
+    document.body.appendChild(moveControlsDoneBtn);
+  }
+
   function build() {
     var UI = window.EdenUI;
     var A = window.EdenAssets;
@@ -109,6 +137,10 @@
     stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconCamera, label: 'Take Photo', onClick: takePhoto }));
     stack.appendChild(UI.button({ size: 'md', iconImg: A.NAMES.iconSettings, label: 'Settings', onClick: function () { openSettingsFromHere(); } }));
     stack.appendChild(UI.button({ size: 'md', icon: 'keyboard', label: 'Controls', onClick: openControls }));
+    // Touch-only: there is no "on-screen joystick" to reposition on the desktop profile.
+    if (ready() && M()._eden_effective_input_is_touch()) {
+      stack.appendChild(UI.button({ size: 'md', icon: 'hand', label: 'Move Controls', onClick: openMoveControls }));
+    }
     stack.appendChild(UI.button({ size: 'md', tone: 'danger', iconImg: A.NAMES.iconQuit, label: 'Quit to Menu', onClick: quitToMenu }));
     win.content.appendChild(stack);
 

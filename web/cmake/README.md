@@ -1,7 +1,7 @@
 # Toolchain — building the Eden web port
 
 Status: **not yet run**. `emcc` is not installed on this machine (only `cmake` 4.4, `node`,
-`python3` are present — see `../../WORKING/PORT-STATUS.md`). This file pins down the exact commands
+`python3` are present — see `../../WORKING/archive/PORT-STATUS-2026-08-13.md`). This file pins down the exact commands
 so a future session with `emsdk` available can go straight to building instead of
 re-researching the invocation.
 
@@ -45,7 +45,7 @@ cmake --build build-singlethread
 
 ## 3. Known-unresolved before this will actually succeed
 
-See `../../WORKING/PORT-STATUS.md` "Open questions / risks" for the full list; the two biggest:
+See `../../WORKING/archive/PORT-STATUS-2026-08-13.md` "Open questions / risks" for the full list; the two biggest:
 
 - **P0.1 (Objective-C link)**: `-fobjc-runtime=gnustep-2.0` needs a real GNU objc runtime
   library to link against under Emscripten — this repo does not vendor one, and whether

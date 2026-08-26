@@ -1,10 +1,10 @@
 // DebugState_web.mm — TEMPORARY debug probe for the "menu layout is broken" investigation
-// (web/docs/PORT-STATUS.md "Known open issue: menu layout", opened Pass 18).
+// (web/docs/archive/PORT-STATUS-2026-08-13.md "Known open issue: menu layout", opened Pass 18).
 //
 // *** DELETE THIS FILE (and its CMakeLists.txt EDEN_SEAM_SOURCES entry) once the layout bug is
 // fixed or the investigation moves on. *** It exists only so a live browser session can read
 // Menu.mm's actual runtime rect/flag state directly via JS, instead of inferring state from
-// screenshots (Pass 20 hit a false positive doing the latter — see PORT-STATUS.md "Pass 20").
+// screenshots (Pass 20 hit a false positive doing the latter — see archive/PORT-STATUS-2026-08-13.md "Pass 20").
 // Same "temporary probe, delete after" pattern as Pass 17/18's throwaway fprintf instrumentation.
 //
 // Exposed as EMSCRIPTEN_KEEPALIVE `eden_debug_menu_state()`, callable from JS as
@@ -303,6 +303,39 @@ extern "C" const char *eden_debug_recolor_state(int color) {
              paintTex ? (unsigned)paintTex->name : 0u, doorTex,
              skinsFilled, masksFilled, realStoredSkinCounter, storedMaskCounter);
     return buf;
+}
+
+// 256z ("New Dawn") runtime-height probe (Stage 2). The world height is a per-world runtime value
+// now (Classes/Constants.h), and every downstream size derives from it -- so the one thing a test
+// must be able to ask is "which height did this world actually open at, and did the derived
+// per-file quantities follow?". creature_slots in particular is derived from the FILE, not the
+// version (the sibling world editor writes v5 saves with no creature block at all), so it is the
+// number most worth asserting. tools/headless-256z-test.js drives this.
+EMSCRIPTEN_KEEPALIVE
+extern "C" const char *eden_debug_world_format(void) {
+    static char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"height\":%d,\"bands\":%d,\"column_bytes\":%d,\"creature_slots\":%d,"
+             "\"t_blocks\":%d,\"xz_stride\":%d}",
+             g_world_height, g_chunks_per_column, g_column_bytes, g_max_creatures_saved,
+             g_t_blocks, g_xz_stride);
+    return buf;
+}
+
+// B5 (256z Stage 3): force the save strategy for a test. Above g_save_inplace_threshold saveWorld
+// writes the world file in place behind a rollback journal; below it, it runs on a whole-file
+// scratch copy. Real worlds pick a path by their size, which would make the in-place path
+// untestable without a multi-hundred-megabyte fixture -- so a test sets the threshold to 0
+// ("always in place") or to a huge number ("never") and drives an ordinary small world through
+// both. Diagnostics-only, like everything else in this file. tools/headless-save-inplace-test.js.
+EMSCRIPTEN_KEEPALIVE
+extern "C" void eden_debug_set_save_inplace_threshold(double bytes) {
+    eden_set_save_inplace_threshold(bytes < 0 ? 0ull : (unsigned long long)bytes);
+}
+
+EMSCRIPTEN_KEEPALIVE
+extern "C" double eden_debug_get_save_inplace_threshold(void) {
+    return (double)g_save_inplace_threshold;
 }
 
 } // extern "C"

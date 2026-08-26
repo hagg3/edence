@@ -105,6 +105,12 @@ them — the ordering in `World::update` is the arbitration.
   skipped), builds a doubly-linked `WorldNode` list with preview textures
   (`<name>.png`), arrows to page, tap to load. Create (with `VKeyboard` name entry;
   flat-vs-default via `a_genFlat`), delete (confirm via `Alert`), rename.
+  **An empty Documents folder means an empty list** — `selected_world` is `NULL` and every
+  deref reachable from that state is guarded (`refreshfn`, `activate`, the layout block).
+  Stock behaviour was to synthesise one placeholder `WorldNode` so the carousel was never
+  empty; that was removed 2026-08-06 because a placeholder is indistinguishable from a saved
+  world but has no file behind it, so tapping it lands in `loadWorld()`'s create-a-world branch
+  and parks on the Flat/Normal question — which the player reads as "loading forever".
 - **`Menu_background`** — the animated menu backdrop.
 - **`SettingsMenu`** — sound/music toggles, controls (lefty/joystick), autojump,
   health, creatures on/off; persisted via `NSUserDefaults` (confidence: medium —

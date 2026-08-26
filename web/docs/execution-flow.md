@@ -13,14 +13,21 @@ replacements:
 - The frame loop is Emscripten's rAF-driven main loop, not a display-link callback.
 
 ## Threading
-`EDEN_THREADED` (`CMakeLists.txt:39`) defaults to **ON** — real pthreads +
-OffscreenCanvas + `PROXY_TO_PTHREAD` + COOP/COEP — but that `build/` tree is currently
-**stale and won't configure** (it points at an old absolute repo path); it is not
-exercised day to day. The build actually used and runnable (`build-st`,
-`-DEDEN_THREADED=OFF`) is **single-threaded end to end**, runnable under `node
-eden.js` for headless checks. `EDEN_THREADED` is a build flag, not a source fork —
-deliberately kept that way so the engine code stays thread-agnostic. See
-[build-and-toolchain.md](build-and-toolchain.md) for both build commands.
+`EDEN_THREADED` defaults to **OFF** (audit row A1). The build used day to day and under
+`node eden.js` for headless checks (`build-st`) is therefore **single-threaded end to
+end**. `EDEN_THREADED` is a build flag, not a source fork — deliberately kept that way
+so the engine code stays thread-agnostic. See
+[build-and-toolchain.md](build-and-toolchain.md) for all three build commands.
+
+`-DEDEN_THREADED=ON` (`build-thr`, audit row 36/C1, pass 63) is `-pthread
+-sPTHREAD_POOL_SIZE=4` and **nothing else**: engine, GL and DOM all stay on the browser
+main thread, so root's "all GL work on the main thread" holds unchanged. It is NOT the
+`PROXY_TO_PTHREAD` + OffscreenCanvas design this section used to describe — that plan
+died on the 72 `_eden_*` exports `public/*.js` calls synchronously from the main thread
+(each one a silent data race under proxying), and the flags were cut down to a strict
+subset of it. What the flag buys today: the engine's own world-load `pthread_create` is
+a genuine background thread (worst main-thread block during a load, Debug: 47 ms → 8 ms),
+and a meshing pool becomes possible. Off-thread meshing itself is not written.
 
 Root's "the only other thread is the world-load pthread" does not apply to
 `build-st`. The engine's one native thread (`World.mm`'s `pthread_create` →

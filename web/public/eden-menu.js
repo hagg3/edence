@@ -46,7 +46,7 @@
     releaseFocus: null,
     loadingEl: null,
     newWorldType: 1,     // 1 = flat, 0 = normal. Index 0 of the generator rail.
-    heightFormat: 0,     // 0 = Legacy 64z (the only one the engine can do)
+    heightFormat: 0,     // 0 = Legacy 64z (default), 1 = New Dawn 256z
     selected: -1,
     // Get Worlds screen state — kept here (not screen-local) so the manifest fetch and any
     // in-flight download survive a re-render, e.g. after a search-box keystroke.
@@ -81,7 +81,9 @@
   function utf8(ptr) {
     var H = M().HEAPU8, end = ptr;
     while (H[end]) end++;
-    return new TextDecoder().decode(H.subarray(ptr, end));
+    // The Uint8Array copy is load-bearing in the EDEN_THREADED build (shared memory cannot be
+    // handed to TextDecoder) — full reasoning on the canonical copy in eden-settings.js.
+    return new TextDecoder().decode(new Uint8Array(H.subarray(ptr, end)));
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -117,10 +119,27 @@
 
   function subtitleFor(w) {
     var ES = window.EdenStorage;
-    // "06/08/2025 — 18:49   64z" in the mockup. Every world this engine writes is 64z (the height
-    // format is frozen — see this file's header), so the suffix is honest, not decorative.
+    // "06/08/2025 — 18:49   64z" in the mockup. This engine only ever WRITES 64z worlds (the New
+    // World height choice is still a placeholder — see this file's header), but as of the 256z
+    // read/play/save support landing (docs/eden-file-format.md), an imported or converted world
+    // can genuinely be 256z, and w.meta.height (Storage_web.mm) reports which one it really is —
+    // hardcoding "64z" here would silently mislabel it.
     if (!w.meta || !ES) return '64z';
-    return ES.formatDate(w.meta.mtime) + '   64z';
+    return ES.formatDate(w.meta.mtime) + '   ' + (w.meta.height === 256 ? '256z' : '64z');
+  }
+
+  // 256z ("New Dawn") worlds resident-cost ~4x a 64z world (~413 MB of wasm heap vs. ~128 MB,
+  // measured pass 67) -- fine on desktop, but the same ceiling that produced audit row A11's
+  // iOS Safari OOM, and nothing warns the player before they hit it. Warn, don't refuse: a hard
+  // block would also stop a desktop player who's perfectly able to run it. Gated to the touch
+  // profile (eden_profile_name(), src/seam/DisplayProfile_web.mm) since desktop is confirmed fine
+  // and a warning that fires on every desktop load of a big world would just be noise.
+  function warnIfTall(w) {
+    if (!w || !w.meta || w.meta.height !== 256) return;
+    if (utf8(M()._eden_profile_name()) !== 'touch') return;
+    if (typeof showToast === 'function') {
+      showToast('This is a tall (256z) world — it needs much more memory and may not load on this device.');
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -132,6 +151,9 @@
   }
 
   function playSelected() {
+    var idx = M()._eden_menu_selected_index();
+    var picked = worlds().filter(function (w) { return w.index === idx; })[0];
+    warnIfTall(picked);
     if (M()._eden_menu_play()) render();   // re-render into the loading state
   }
 
@@ -424,6 +446,11 @@
     searchInput.placeholder = 'Search name, author, tag…';
     searchInput.value = S.wbQuery;
     searchInput.setAttribute('aria-label', 'Search worlds');
+    // Audit row 34/C6 (touch text entry): a search query is not a sentence — autocapitalize/
+    // autocorrect only fight the player on names/tags that don't match a dictionary word.
+    searchInput.autocapitalize = 'off';
+    searchInput.autocorrect = 'off';
+    searchInput.spellcheck = false;
     searchInput.addEventListener('input', function () {
       S.wbQuery = searchInput.value;
       S.wbPage = 0;
@@ -655,6 +682,12 @@
     nameInput.placeholder = 'Enter text...';
     nameInput.maxLength = 60;      // the C-side name buffer is 128 bytes; 60 chars is safe in UTF-8
     nameInput.id = 'eden-new-world-name';
+    // Audit row 34/C6 (touch text entry): a world name is often not a real word (or is several
+    // short ones) — autocapitalize/autocorrect/spellcheck would fight the player and, on some
+    // mobile keyboards, autocorrect can silently substitute a different word entirely.
+    nameInput.autocapitalize = 'off';
+    nameInput.autocorrect = 'off';
+    nameInput.spellcheck = false;
     // The shared-world service only accepts A-Z/0-9/space/' (tools/eden2/UploadMap2.java strips
     // anything else on upload) — filter live so a name never silently gets mangled later.
     nameInput.addEventListener('input', function () {
@@ -670,6 +703,10 @@
       // Park the generator choice so showAlertWorldType() consumes it instead of raising a modal
       // the player has already answered on this screen (see Menu_web.mm's world-type section).
       M()._eden_menu_set_pending_world_type(S.newWorldType);
+      // Same one-shot parking for height: consumed by FileManager::probeWorldHeight() the moment
+      // this world is first loaded (Play, right after create). 64z stays the default -- this only
+      // ever requests 256 when the player picked "New Dawn 256z" above.
+      M()._eden_menu_set_pending_world_height(S.heightFormat === 1 ? 256 : 64);
       writeNameBuffer(nameInput.value.trim());
       var idx = M()._eden_menu_create_world();
       if (idx < 0) return;
@@ -717,8 +754,8 @@
 
     pad.appendChild(UI.section({
       title: 'Height format',
-      desc: 'New Dawn worlds have a much greater height limit but lack support for older ' +
-        'versions and create a larger file size.',
+      desc: 'New Dawn worlds have a much greater height limit but create a larger file size ' +
+        'and cannot be opened by builds that only understand the legacy 64-block format.',
     }));
     var seg = UI.el('div', 'eden-seg eden-section__body');
     seg.setAttribute('role', 'radiogroup');
@@ -728,15 +765,15 @@
       onClick: function () { S.heightFormat = 0; render(); },
     });
     legacy.setAttribute('role', 'radio');
-    legacy.setAttribute('aria-checked', 'true');
-    legacy.classList.add('is-active');
+    legacy.setAttribute('aria-checked', S.heightFormat === 0 ? 'true' : 'false');
+    if (S.heightFormat === 0) legacy.classList.add('is-active');
     var newDawn = UI.button({
       size: 'md', label: 'New Dawn 256z',
-      placeholder: true,
-      placeholderNote: 'The 256-block height format is not implemented in this build',
+      onClick: function () { S.heightFormat = 1; render(); },
     });
     newDawn.setAttribute('role', 'radio');
-    newDawn.setAttribute('aria-checked', 'false');
+    newDawn.setAttribute('aria-checked', S.heightFormat === 1 ? 'true' : 'false');
+    if (S.heightFormat === 1) newDawn.classList.add('is-active');
     seg.appendChild(legacy);
     seg.appendChild(newDawn);
     pad.appendChild(seg);

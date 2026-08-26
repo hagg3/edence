@@ -32,19 +32,64 @@
 #define M_STUMPY 4
 #define M_CHARGER 5
 #define M_STALKER 6
-#define MAX_CREATURES_SAVED 200
-
 #define CHUNK_SIZE 16
 #define CHUNK_SIZE2 (CHUNK_SIZE*CHUNK_SIZE)
 #define CHUNK_SIZE3 (CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE)
 #define NOISE_CONSTANT ((128/CHUNK_SIZE)*CHUNK_SIZE)
 #define T_SIZE ((int)( ((300/CHUNK_SIZE)*CHUNK_SIZE)))
 #define T_RADIUS (T_SIZE/CHUNK_SIZE/2)
-#define T_HEIGHT ((64/CHUNK_SIZE)*CHUNK_SIZE)
-#define T_BLOCKS (T_SIZE*T_SIZE*T_HEIGHT)
 #define T_SEALEVEL 2
-#define CHUNKS_PER_COLUMN (T_HEIGHT/CHUNK_SIZE)
 #define CHUNKS_PER_SIDE (T_SIZE/CHUNK_SIZE)
+
+// ---- world height: RUNTIME, per world (256z "New Dawn" support, 2026-08-06) ----
+// T_HEIGHT/T_BLOCKS/CHUNKS_PER_COLUMN/MAX_CREATURES_SAVED were compile-time constants
+// (64 / 288*288*64 / 4 / 200) until this build learned to read the 256-block-tall .eden
+// variant, which stores 16 chunk-bands per column instead of 4. They now expand to
+// globals set once per world entry by eden_set_world_height(), BEFORE
+// Terrain::allocateMemory() sizes the per-world arrays. Every use site was already
+// symbolic, so this is a mechanical substitution -- the exceptions are fixed-size
+// declarations, which must use the *_MAX forms below (see docs/world-and-terrain.md
+// "Runtime world height" and WORKING/256z-format-backport-plan-2026-08-05.md).
+// A 64z world must keep costing exactly what it cost before: the defaults here ARE the
+// old constants, and nothing sets 256 unless a loaded file's header says version>=5.
+#define T_HEIGHT_DEFAULT 64
+#define T_HEIGHT_MAX 256
+#define CHUNKS_PER_COLUMN_MAX (T_HEIGHT_MAX/CHUNK_SIZE)
+#define MAX_CREATURES_SAVED_MAX 400
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int g_world_height;        // 64 or 256
+extern int g_chunks_per_column;   // g_world_height/CHUNK_SIZE  (4 or 16)
+extern int g_xz_stride;           // T_SIZE*g_world_height -- blockarray/lightarray x stride
+extern int g_t_blocks;            // T_SIZE*T_SIZE*g_world_height
+extern int g_column_bytes;        // on-disk column record: 32768 or 131072
+extern int g_max_creatures_saved; // creature slots in the save file, DERIVED from the file
+void eden_set_world_height(int height);
+void eden_set_creature_slots(int slots);
+
+// ---- save strategy: the size at which the whole-file copy stops (256z Stage 3, B5) ----
+// Every save used to run on a scratch whole-file COPY of the world (copyItemAtPath: -> .savetmp),
+// committed with one rename. Measured against a real 279 MB 256z specimen with NOTHING edited
+// (web/tools/headless-save-io-probe.js): 558 MB read + 558 MB written per save -- 2x the file
+// each way -- against ~155 KB of actually-changed bytes, plus a transient allocation of the
+// ENTIRE file (the read buffer), which on a 32-bit wasm heap cannot succeed at all for the
+// multi-GB worlds the 256z format allows. A file at or above this many bytes is saved IN PLACE
+// with a small rollback journal instead (FileManager::saveWorld); below it, nothing changes.
+// A runtime global rather than a bare #define at the use site so a test can force either path
+// on a small world -- see web/tools/headless-save-inplace-test.js.
+#define EDEN_SAVE_INPLACE_THRESHOLD_DEFAULT (16ull*1024*1024)
+extern unsigned long long g_save_inplace_threshold;
+void eden_set_save_inplace_threshold(unsigned long long bytes);
+#ifdef __cplusplus
+}
+#endif
+
+#define T_HEIGHT (g_world_height)
+#define T_BLOCKS (g_t_blocks)
+#define CHUNKS_PER_COLUMN (g_chunks_per_column)
+#define MAX_CREATURES_SAVED (g_max_creatures_saved)
 #define BLOCK_SIZE 1.0f
 
 #define LIGHT_RADIUS 5.0f

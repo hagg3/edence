@@ -408,7 +408,7 @@ static int nest_count;
 extern Vector minTranDist;
  static float scale=1/16.0f;
 static int renderlistc[nguys];
-extern EntityData creatureData[MAX_CREATURES_SAVED];
+extern EntityData creatureData[MAX_CREATURES_SAVED_MAX];  //max-sized, live count is MAX_CREATURES_SAVED
 EntityData inventory;
 void SortModels(){
     

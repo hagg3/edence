@@ -166,7 +166,7 @@ void eden_input_pointer_event(int phase, int identity, float x, float y) {
 
 // ---------------------------------------------------------------------------------------------
 // Pass 23: desktop keyboard/mouse controls (WASD/mouse-look/click mine-build/hotbar/pointer-lock).
-// Full spec: web/docs/PORT-STATUS.md "Next tasks (pass 23) §1". These are additional small
+// Full spec: web/docs/archive/PORT-STATUS-2026-08-13.md "Next tasks (pass 23) §1". These are additional small
 // entry points alongside eden_input_pointer_event above, not a replacement for it — the DOM
 // mousedown/move/up + touch listeners in public/eden-st.html keep driving the menu/HUD-button
 // hit-testing UI exactly as before; these only cover gameplay input that has no natural touch
@@ -719,6 +719,65 @@ EMSCRIPTEN_KEEPALIVE
 int eden_get_fly_mode(void) {
     extern bool FLY_MODE;
     return FLY_MODE ? 1 : 0;
+}
+
+// Audit row 17/G1 (touch-draggable controls card): a "move controls" mode for the on-screen
+// joystick pad, driven from eden-input.js's existing touch pipeline rather than a new one — the
+// page tracks the drag itself (same touchstart/touchmove/touchend it already has) and only pushes
+// the resulting rect origin here. Classes/Joystick.mm's joystickCustomizeMode flag is the actual
+// feature (Joystick::update no-ops while it's on, so this can't fight a real touch's movement
+// input); the three exports below are just the platform-specific wiring a JS drag gesture needs,
+// which is why they live in this seam file and not in Classes/ (web/CLAUDE.md rule 2).
+EMSCRIPTEN_KEEPALIVE
+void eden_joystick_set_customize_mode(int on) {
+    extern bool joystickCustomizeMode;
+    joystickCustomizeMode = (on != 0);
+    // Entering mid-walk must not leave a stale nonzero walk_dir latched forever — Joystick::update
+    // is the only thing that would otherwise zero it (on the next frame with no touch in the pad),
+    // and it is about to stop running entirely.
+    if (joystickCustomizeMode && World::getWorld && World::getWorld->player) {
+        World::getWorld->player->setSpeed(MakeVector(0, 0, 0), 0);
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int eden_joystick_get_customize_mode(void) {
+    extern bool joystickCustomizeMode;
+    return joystickCustomizeMode ? 1 : 0;
+}
+
+// origin = padbounds.origin, i.e. the pad's top-left corner in the engine's POINT space (same
+// space Input_web.mm's touch coordinates already arrive in — see toEnginePoint() in
+// eden-viewport.js). Plain float returns rather than out-params: nothing else in this port's JS
+// exports asks the JS side to allocate wasm memory for a pointer, and two scalar getters are
+// simpler for eden-input.js to call than managing a malloc'd float* just to read two numbers back.
+// Clamping to stay on-screen is the CALLER's job (JS knows the live ENGINE_WIDTH/HEIGHT and the
+// pad's own size; this file has no reason to duplicate that).
+EMSCRIPTEN_KEEPALIVE
+float eden_joystick_get_origin_x(void) { extern CGRect padbounds; return padbounds.origin.x; }
+EMSCRIPTEN_KEEPALIVE
+float eden_joystick_get_origin_y(void) { extern CGRect padbounds; return padbounds.origin.y; }
+EMSCRIPTEN_KEEPALIVE
+float eden_joystick_get_pad_size(void) { extern CGRect padbounds; return padbounds.size.width; }
+
+EMSCRIPTEN_KEEPALIVE
+void eden_joystick_set_origin(float x, float y) {
+    // Live-browser finding (audit row 17/G1, 2026-08-04): padbounds is the translucent pad ring
+    // Joystick::render() draws first; the solid knob it draws second is joystick_pos, which
+    // Joystick::update() only ever resets to default_pos (Classes/Joystick.mm's ctor: a FIXED rect
+    // that happens to equal padbounds' original (20,20) because both start at the same size, not
+    // because anything keeps them in sync). Moving only padbounds here left the ring following the
+    // drag while the knob stayed glued to the pre-move spot, on-screen AND after Done (update()'s
+    // "no touch active" branch keeps re-snapping joystick_pos to the stale default_pos every
+    // frame) — visibly two disconnected controls. Move both, and keep joystick_pos matching so the
+    // knob tracks live during the drag instead of only jumping once the player next touches it.
+    extern CGRect padbounds, default_pos, joystick_pos;
+    padbounds.origin.x = x;
+    padbounds.origin.y = y;
+    default_pos.origin.x = x;
+    default_pos.origin.y = y;
+    joystick_pos.origin.x = x;
+    joystick_pos.origin.y = y;
 }
 
 } // extern "C"

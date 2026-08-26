@@ -106,7 +106,7 @@ EM_JS(void, eden_audio_js_init, (), {
 
     A.getCtx = function() {
         if (!A.ctx) {
-            // `window` doesn't exist under the headless `node eden.js` drive (see PORT-STATUS.md
+            // `window` doesn't exist under the headless `node eden.js` drive (see archive/PORT-STATUS-2026-08-13.md
             // "Headless driving") — World::World() -> Resources() -> SimpleAudioEngine::sharedEngine()
             // runs this unconditionally at startup, so a bare `window.AudioContext` reference here
             // threw ReferenceError on every headless run, not just ones that touch audio.

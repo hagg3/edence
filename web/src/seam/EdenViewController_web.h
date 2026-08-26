@@ -4,7 +4,7 @@
 //
 // UNLIKE EAGLView_web.mm (which is forced to reuse the original Classes/EAGLView.h — see that
 // file's header comment for why), NOTHING outside Classes/EdenViewController.mm itself
-// includes "EdenViewController.h" (grep-confirmed, see docs/PORT-STATUS.md). So this seam
+// includes "EdenViewController.h" (grep-confirmed, see docs/archive/PORT-STATUS-2026-08-13.md). So this seam
 // replacement is free to be a plain C++ class instead of an Objective-C UIViewController
 // subclass — there is no nib/storyboard on the web, no CADisplayLink-vs-NSTimer fallback
 // dance (Classes/EdenViewController.mm:135-181, all iOS-runtime-version-detection cruft with

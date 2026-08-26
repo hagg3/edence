@@ -2001,4 +2001,77 @@ void eden_gl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void*
     eden_gl_restore_bindings();
 }
 
+// ---- Audit row 21/I6: headless state-tracking self-test ----------------------------------
+// GROUP 2b's real draw-path dirty-caches (g_uniCache/g_skinCache/g_attrCache, the setup-call
+// elision eden_gl_stat() reports) only run once a live WebGL context exists — headless-gl was
+// rejected (see this file's own header), so nothing here can drive an actual draw call under
+// `node eden.js`, and that half of "the GL shim's state tracking" genuinely needs a live browser
+// pass, not a fabricated node-side stub of it.
+//
+// What IS fully exercised by `node eden.js` and was previously untested (per the audit's own
+// finding — "nothing covers the GL shim's state tracking... where a regression is both likely
+// and silent") is the GUARDED/no-context bookkeeping every headless boot already depends on:
+// Graphics::initGraphics() calls real glGenBuffers/glBindBuffer/glBufferData during
+// World::World(), with no canvas to receive them (GROUP 2b's whole reason to exist), and the
+// engine's own code trusts the fake object names it gets back to be nonzero and distinct
+// (TerrainChunk.mm tests its vertexBuffer handles against 0). A regression here (e.g. the fake
+// counter starting at 0, or two calls aliasing the same name) would silently corrupt every
+// chunk's buffer bookkeeping in exactly the headless configuration this project's own test suite
+// runs under — and nothing asserted it.
+#ifdef EDEN_DIAGNOSTICS
+extern "C" EMSCRIPTEN_KEEPALIVE
+int eden_gl_selftest_run(void) {
+    if (eden_gl_have_context()) {
+        // Called from a live browser tab, not `node eden.js` — the guarded path this test
+        // exists to cover is not engaged here, so there is nothing meaningful to assert.
+        std::fprintf(stderr, "[eden-gl-selftest] SKIP: a real context is current (not headless)\n");
+        return 1;
+    }
+    if (eden_gl_context_is_lost()) {
+        std::fprintf(stderr, "[eden-gl-selftest] FAIL: context reported lost before any was ever created\n");
+        return 0;
+    }
+
+    GLuint bufs[3] = {0, 0, 0};
+    eden_gl_glGenBuffers(3, bufs);
+    if (!bufs[0] || !bufs[1] || !bufs[2]) {
+        std::fprintf(stderr, "[eden-gl-selftest] FAIL: glGenBuffers handed back a zero name "
+                              "(%u, %u, %u) — TerrainChunk.mm treats 0 as \"no buffer yet\"\n",
+                      bufs[0], bufs[1], bufs[2]);
+        return 0;
+    }
+    if (bufs[0] == bufs[1] || bufs[1] == bufs[2] || bufs[0] == bufs[2]) {
+        std::fprintf(stderr, "[eden-gl-selftest] FAIL: glGenBuffers aliased two names "
+                              "(%u, %u, %u) — two chunks would silently share one buffer\n",
+                      bufs[0], bufs[1], bufs[2]);
+        return 0;
+    }
+
+    GLuint texs[2] = {0, 0};
+    eden_gl_glGenTextures(2, texs);
+    if (!texs[0] || !texs[1] || texs[0] == texs[1]) {
+        std::fprintf(stderr, "[eden-gl-selftest] FAIL: glGenTextures handed back zero/aliased "
+                              "names (%u, %u)\n", texs[0], texs[1]);
+        return 0;
+    }
+
+    // Buffers and textures deliberately SHARE one counter in guarded mode (see g_fake_object_name's
+    // own comment) — real GL keeps them in separate namespaces, but nothing here ever reaches a
+    // real driver, so a buffer name and a texture name colliding is expected, not a bug; only
+    // aliasing WITHIN one call's own outputs (checked above) would be.
+
+    eden_gl_glDeleteBuffers(3, bufs);  // must not crash the guarded path
+    eden_gl_glDeleteTextures(2, texs);
+
+    if (eden_gl_have_context()) {
+        std::fprintf(stderr, "[eden-gl-selftest] FAIL: guard opened mid-test with no context created\n");
+        return 0;
+    }
+
+    std::fprintf(stderr, "[eden-gl-selftest] PASS: guarded object-name generation is nonzero, "
+                          "distinct, and delete does not crash\n");
+    return 1;
+}
+#endif
+
 } // extern "C"

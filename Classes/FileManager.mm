@@ -14,6 +14,12 @@
 #import "TerrainGen2.h"
 #import "FileArchive.h"
 #import "FileManagerHelper.h"
+#import "World.h"
+
+#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <cstdio>
 
 //#import "TestFlight.h"
 
@@ -23,6 +29,13 @@
 // there is no existing call site to intercept, this is a new one loadWorld() makes directly. Only
 // linked when the web seam sources are built; a from-scratch iOS build would need its own stub.
 extern "C" void eden_report_load_failure(const char* world_file_name, const char* reason);
+
+// Web port hook (web/src/seam/Menu_web.mm): the DOM New World screen's height picker parks its
+// choice here the same way it already does for flat/normal (eden_menu_take_pending_world_type),
+// so probeWorldHeight() below can answer something other than the 64z default for a world that
+// doesn't exist yet. "Take" semantics: one-shot, -1 means nothing pending. Only linked when the
+// web seam sources are built; a from-scratch iOS build would need its own stub.
+extern "C" int eden_menu_take_pending_world_height(void);
 
 
 
@@ -40,6 +53,28 @@ static BOOL writeDirectory;
 static NSString* imgHash;
 static int file_version;
 
+// ---- the post-directory sign trailer (`NewFormat256z` worlds) --------------------------------
+// A 2026-08 game update appends in-game SIGN records inside the chunk-directory region, after the
+// real ColumnIndex entries and before EOF, every row tagged x = 0xffffffff so twoToOne() maps it
+// to its "invalid, skip" value 0. readDirectory() below has always dropped those rows on read, by
+// construction -- but fwriteDirectory() rebuilds the directory from the `indexes` hashmap alone,
+// which those rows were never put into, so any save that rewrote the directory silently destroyed
+// every sign in the world. (Pre-existing bug, independent of B5; see
+// WORKING/newformat256z-sign-trailer-2026-08-24.md for the trace and the byte layout.)
+// Fix: capture the CONTIGUOUS RUN of gate-failing rows at the END of the directory verbatim and
+// re-emit it after the real entries on every rewrite. Rows that fail the gate *interior* to the
+// real entries are still dropped, exactly as before -- those are corruption, not a trailer.
+// Nothing here parses a sign; the trailer is an opaque blob, which is all round-tripping needs
+// (sign records hold world block coordinates, never file offsets, so relocating columns during a
+// rewrite cannot invalidate them).
+static unsigned char* dir_trailer=NULL;
+static unsigned long long dir_trailer_len=0;
+// Cap so a wholly-corrupt directory (every row failing the gate) can't be buffered in full. 1 MiB
+// is a multiple of sizeof(ColumnIndex), so it can never split a row, and holds ~8,700 signs. The
+// sibling world editor caps its equivalent at 64 KiB; ours being larger only means we preserve
+// more, never less.
+#define DIR_TRAILER_MAX (1024*1024)
+
 const int defaultRegionSkyColors[4][4]={
      {COLOR_BWG1,COLOR_BLUE1,COLOR_GREEN1,COLOR_RED1},
     {COLOR_ORANGE2,COLOR_NORMAL_BLUE,COLOR_NORMAL_BLUE,COLOR_NORMAL_BLUE},
@@ -51,7 +86,9 @@ int regionSkyColors[4][4]={
     {COLOR_NORMAL_BLUE,COLOR_NORMAL_BLUE,COLOR_NORMAL_BLUE,COLOR_ORANGE1},
     {COLOR_PURPLE1,COLOR_NORMAL_BLUE,COLOR_NORMAL_BLUE,COLOR_RED5}};
 
-EntityData creatureData[MAX_CREATURES_SAVED];
+// Sized for the maximum (400 slots, the measured New Dawn creature block); the live count is
+// the runtime MAX_CREATURES_SAVED, derived per file. Model.mm externs this array.
+EntityData creatureData[MAX_CREATURES_SAVED_MAX];
 FileManager::FileManager(){
 	single=this;
     genflat=FALSE;
@@ -65,7 +102,8 @@ FileManager::FileManager(){
 	oldOffsetX=oldOffsetZ=chunkOffsetX=chunkOffsetZ=-1;
 	indexes=hashmap_new();
     indexes_hmm=indexes;
-    
+    shortSpans=hashmap_new();
+
     fmh_init(this);
 	
 	
@@ -102,6 +140,10 @@ BOOL FileManager::deleteWorld(NSString* name){
     }
    // removeFromIndex(name);
 	NSString* file_name=[NSString stringWithFormat:@"%@/%@",documents,name];
+	// B5: a leftover rollback journal must not outlive the world it belongs to -- a new world
+	// created under the same file name would otherwise be "recovered" back into that stale tail
+	// on its first load. Same reason the scratch/backup slots go here.
+	[fm removeItemAtPath:[file_name stringByAppendingString:@".savejrnl"] error:NULL];
 	
 	
 	if([fm fileExistsAtPath:file_name]){
@@ -117,11 +159,15 @@ BOOL FileManager::deleteWorld(NSString* name){
 }
 void FileManager::LoadCreatures(){
     printg("start load:%d\n",1);
-   
+
+    // Start from "no creature in any slot" every time: creatureData is a file-scope array that
+    // outlives the world, MAX_CREATURES_SAVED is now per-file (and legitimately 0 for a save whose
+    // writer emitted no creature block at all), so anything not overwritten below would otherwise
+    // be the PREVIOUS world's creatures.
+    for(int i=0;i<MAX_CREATURES_SAVED_MAX;i++){
+        creatureData[i].type=-1;
+    }
     if(sfh->version<3){
-        for(int i=0;i<MAX_CREATURES_SAVED;i++){
-            creatureData[i].type=-1;
-        }
     }else{
         [saveFile seekToFileOffset:sfh->directory_offset-sizeof(EntityData)*MAX_CREATURES_SAVED];
         for(int i=0;i<MAX_CREATURES_SAVED;i++){
@@ -370,6 +416,125 @@ void FileManager::writeGenToDisk(){
 
 }
 
+// ---- B5: saving a large world without duplicating it ----------------------------------------
+// Below g_save_inplace_threshold nothing here changes: the save runs on a whole-file scratch copy
+// and is committed by one rename, which is fully atomic (pass 37). That copy is O(file size) in
+// time AND in peak memory, so above the threshold the save runs directly on the real file and a
+// small ROLLBACK JOURNAL stands in for the scratch copy.
+//
+// What the journal has to cover. A save writes: the 192-byte header; the dirty columns, each at
+// its own already-allocated offset; then -- only when a column is NEW -- an appended column record
+// starting at (directory_offset - creature block), which overwrites the old creature block and the
+// front of the old directory, followed by the creature block and the directory at their new,
+// higher offsets. Everything destructive is therefore at or above (directory_offset - creature
+// block); every in-place column write is strictly below it. So journalling the header plus the
+// file's tail from that point is enough to put the file back exactly as the last successful save
+// left it -- and it is O(number of columns), not O(file size): ~410 KB for a 3.97 GB specimen.
+//
+// The residual, and it is a real downgrade from the copy path: a crash between the journal and
+// the commit CAN leave an individual dirty column half-old/half-new. Those bytes are terrain the
+// player was editing in that instant; the file still loads, the directory is still valid, and no
+// other column is touched. Journalling the dirty columns too would restore full atomicity at the
+// cost of re-reading and re-writing every dirty column each save (up to ~42 MB at 256z), which is
+// most of the cost this row exists to remove. Documented trade, not an oversight -- docs/save-load.md.
+#define SAVE_JOURNAL_VERSION 1
+static const char kSaveJournalMagic[8]="EDNJRNL";
+typedef struct{
+	char magic[8];
+	unsigned int version;
+	unsigned int reserved;
+	unsigned long long orig_length;
+	unsigned long long region_offset;
+	unsigned long long region_length;
+	unsigned char world_header[sizeof(WorldFileHeader)];
+}SaveJournalHeader;
+
+static NSString* journalPathFor(NSString* file_name){
+	return [file_name stringByAppendingString:@".savejrnl"];
+}
+static unsigned long long fileByteLength(NSString* path){
+	NSFileHandle* fh=[NSFileHandle fileHandleForReadingAtPath:path];
+	if(fh==NULL)return 0;
+	unsigned long long len=[fh seekToEndOfFile];
+	[fh closeFile];
+	return len;
+}
+// Writes the journal in ONE createFileAtPath: so it is never observed half-built through a handle,
+// and so it never trips the shim's own backup-before-overwrite. Must complete before saveWorld
+// touches the world file. Answers FALSE if anything went wrong, in which case the caller falls
+// back to the copy path rather than writing unprotected.
+static BOOL writeSaveJournal(NSString* file_name,unsigned long long orig_length,
+							 unsigned long long dir_offset){
+	NSFileManager* fm=[NSFileManager defaultManager];
+	NSString* jrnl=journalPathFor(file_name);
+	[fm removeItemAtPath:jrnl error:NULL];
+	unsigned long long creatures=(unsigned long long)sizeof(EntityData)*MAX_CREATURES_SAVED;
+	unsigned long long region_off=(dir_offset>creatures)?(dir_offset-creatures):0;
+	if(region_off>orig_length)return FALSE;   // header disagrees with the file; don't guess
+	unsigned long long region_len=orig_length-region_off;
+	NSFileHandle* src=[NSFileHandle fileHandleForReadingAtPath:file_name];
+	if(src==NULL)return FALSE;
+	NSData* hdr=[src readDataOfLength:sizeof(WorldFileHeader)];
+	[src seekToFileOffset:region_off];
+	NSData* region=[src readDataOfLength:(NSUInteger)region_len];
+	[src closeFile];
+	if([hdr length]<sizeof(WorldFileHeader)||[region length]<region_len)return FALSE;
+	SaveJournalHeader jh;
+	memset(&jh,0,sizeof(jh));
+	memcpy(jh.magic,kSaveJournalMagic,sizeof(jh.magic));
+	jh.version=SAVE_JOURNAL_VERSION;
+	jh.orig_length=orig_length;
+	jh.region_offset=region_off;
+	jh.region_length=region_len;
+	memcpy(jh.world_header,[hdr bytes],sizeof(WorldFileHeader));
+	NSMutableData* out=[NSMutableData dataWithCapacity:(NSUInteger)(sizeof(jh)+region_len)];
+	[out appendBytes:&jh length:sizeof(jh)];
+	[out appendData:region];
+	if(![fm createFileAtPath:jrnl contents:out attributes:nil])return FALSE;
+	printg("save: journalled %llu B of tail (offset %llu) before writing %s in place\n",
+		   region_len,region_off,[file_name UTF8String]);
+	return TRUE;
+}
+// Roll a world file back to the last successful save if one was interrupted. Idempotent: the
+// journal is only removed once the restore has fully landed, so a crash DURING recovery just
+// means recovery runs again next time. A journal that is itself short or malformed means the
+// crash happened while the journal was being written -- i.e. before the world file had been
+// touched at all -- so it is discarded and the file is left alone.
+void FileManager::recoverInterruptedSave(NSString* file_name){
+	NSFileManager* fm=[NSFileManager defaultManager];
+	NSString* jrnl=journalPathFor(file_name);
+	if(![fm fileExistsAtPath:jrnl])return;
+	NSFileHandle* jf=[NSFileHandle fileHandleForReadingAtPath:jrnl];
+	if(jf==NULL){[fm removeItemAtPath:jrnl error:NULL];return;}
+	NSData* jhd=[jf readDataOfLength:sizeof(SaveJournalHeader)];
+	SaveJournalHeader jh;
+	BOOL ok=([jhd length]==sizeof(SaveJournalHeader));
+	if(ok){
+		memcpy(&jh,[jhd bytes],sizeof(jh));
+		ok=(memcmp(jh.magic,kSaveJournalMagic,sizeof(jh.magic))==0
+			&&jh.version==SAVE_JOURNAL_VERSION
+			&&jh.region_offset+jh.region_length==jh.orig_length);
+	}
+	NSData* region=ok?[jf readDataOfLength:(NSUInteger)jh.region_length]:NULL;
+	if(ok&&[region length]!=jh.region_length)ok=FALSE;
+	[jf closeFile];
+	if(!ok){
+		printg("save: discarding an incomplete journal for %s (world file untouched)\n",[file_name UTF8String]);
+		[fm removeItemAtPath:jrnl error:NULL];
+		return;
+	}
+	NSFileHandle* wf=[NSFileHandle fileHandleForUpdatingAtPath:file_name];
+	if(wf==NULL){[fm removeItemAtPath:jrnl error:NULL];return;}
+	[wf seekToFileOffset:jh.region_offset];
+	[wf writeData:region];
+	[wf truncateFileAtOffset:jh.orig_length];
+	[wf seekToFileOffset:0];
+	[wf writeData:[NSData dataWithBytes:jh.world_header length:sizeof(WorldFileHeader)]];
+	[wf closeFile];
+	[fm removeItemAtPath:jrnl error:NULL];
+	printg("save: rolled %s back to its last complete save (%llu B) after an interrupted one\n",
+		   [file_name UTF8String],jh.orig_length);
+}
 void FileManager::saveWorld(Vector warp){
     //[TestFlight passCheckpoint:[NSString stringWithFormat:@"header_size:%d",(int)sizeof(WorldFileHeader)]];
     printf("sizeof(WFH)=%d",(int)sizeof(WorldFileHeader));
@@ -417,13 +582,68 @@ void FileManager::saveWorld(Vector warp){
 	// pattern convertFile() already uses for format migration (:1302-1339), just applied to the
 	// ordinary save path now that Classes/ is editable (was blocked on this before 2026-07-25).
 	// Any crash before the rename leaves file_name byte-identical to the last successful save.
+	//
+	// B5 (2026-08-25): that scratch copy is O(file size) in time and in peak memory, which does not
+	// survive contact with a 256z world — so it now only runs BELOW g_save_inplace_threshold. At or
+	// above it the save writes straight into file_name, protected by writeSaveJournal()'s small
+	// rollback journal instead (see the block comment above this function). Anything that makes the
+	// journal unwritable falls back to the copy path rather than writing unprotected.
 	NSString* temp_name=[file_name stringByAppendingString:@".savetmp"];
 	NSFileManager* fm=[NSFileManager defaultManager];
 	BOOL existed=[fm fileExistsAtPath:file_name];
+	BOOL inPlace=FALSE;
+	unsigned long long existing=existed?fileByteLength(file_name):0;
+	if(existed&&existing>=g_save_inplace_threshold){
+		if(!writeSaveJournal(file_name,existing,sfh->directory_offset)){
+			// Bail rather than fall through to the copy path: a file this big is exactly the one
+			// whose whole-file copy cannot be relied on to succeed, and finishing the save with
+			// neither a scratch copy nor a journal is the one outcome that can leave the world
+			// unloadable. The last complete save stays on disk untouched, every chunk keeps its
+			// `modified` flag, and the next save retries. (Chunks are re-marked by endDynamics
+			// only; nothing above this point has cleared them.)
+			NSLog(@"saveWorld: could not journal %@ -- SKIPPING this save, last one left intact",file_name);
+			free(sfh);
+			return;
+		}
+		inPlace=TRUE;
+	}
 	[fm removeItemAtPath:temp_name error:NULL]; // drop any orphan from a previous crashed save
-	if(!existed){
-        sfh->version=2;
-		sfh->directory_offset=sizeof(WorldFileHeader);
+	if(inPlace){
+		// Nothing to seed: the file we are about to write IS the file that already holds every
+		// column this save won't touch.
+		//
+		// Do reclaim the whole-file backup slots, though. A world that grew past the threshold
+		// leaves behind whatever the LAST below-threshold save wrote (NSFileHandle.mm's
+		// "<path>.bak" / ".savetmp.bak" copy), and nothing above the threshold ever refreshes it:
+		// it is a full second copy of the world, permanently, of exactly the worlds least able to
+		// afford one -- and LoadFailure_web.mm's Restore button would offer it as if it were the
+		// previous save when it can in fact be arbitrarily old. Above the threshold the durability
+		// story is the rollback journal, not a copy slot, so the stale slot goes. (Caught by the
+		// live-Safari run of this change, not by any headless test -- a world only crosses the
+		// threshold with real play behind it.)
+		[fm removeItemAtPath:[temp_name stringByAppendingString:@".bak"] error:NULL];
+		[fm removeItemAtPath:[file_name stringByAppendingString:@".bak"] error:NULL];
+	}else if(!existed){
+        // Historically an unconditional 2 (every brand-new world starts there and gets bumped to
+        // FILE_VERSION by the "file_version<FILE_VERSION_256Z" stamp below) -- but readDirectory()
+        // a few lines down calls deriveColumnSpans(), which for an EMPTY directory falls back to
+        // deciding the creature-block size from sfh->version right here, before that later stamp
+        // ever runs. A brand-new 256z world (FileManager::loadWorld already set file_version to
+        // FILE_VERSION_256Z for it) needs THAT decision to see 256z too, or its first save silently
+        // gets a 200-slot 64z-shaped creature block under a version-5 header.
+        sfh->version=(file_version>=FILE_VERSION_256Z)?file_version:2;
+        // saveCreatures() below has two paths: version<3 treats directory_offset as NOT yet
+        // accounting for the creature block and bumps it there (the historical "brand new world"
+        // case, always true before this file's version could BE anything but 2 on a first save);
+        // version>=3 trusts directory_offset ALREADY points past the creature block, which is only
+        // true after that one-time bump has happened once. A version stamped 256z straight out of
+        // the gate skips the version<3 branch entirely, so it has to arrive with directory_offset
+        // already correct instead -- otherwise saveCreatures() seeks to a negative (wrapped-huge)
+        // offset, the seek silently fails, and the creature block lands at byte 192 with
+        // directory_offset left pointing AT it instead of past it (readDirectory then reads the
+        // creature block as 1500+ garbage "columns").
+        sfh->directory_offset=sizeof(WorldFileHeader)+
+            (sfh->version>=FILE_VERSION_256Z?(unsigned long long)sizeof(EntityData)*MAX_CREATURES_SAVED_MAX:0);
 
 		[fm createFileAtPath:temp_name
 					contents:[NSData dataWithBytesNoCopy:sfh
@@ -434,11 +654,20 @@ void FileManager::saveWorld(Vector warp){
 	}else{
         // Seed the scratch copy with the CURRENT on-disk file so every column this save doesn't
         // touch keeps its valid data at its existing offset — this save only rewrites what changed.
-        [fm copyItemAtPath:file_name toPath:temp_name error:NULL];
+        // If that copy fails (no space for a second whole world, most likely) the scratch is empty
+        // or absent, and carrying on would write a save containing ONLY this session's dirty
+        // columns and then rename it over the real world. That was reachable before B5 too; it is
+        // checked now because the fix costs one BOOL.
+        if(![fm copyItemAtPath:file_name toPath:temp_name error:NULL]){
+            NSLog(@"saveWorld: could not stage a scratch copy of %@ -- SKIPPING this save, last one left intact",file_name);
+            [fm removeItemAtPath:temp_name error:NULL];
+            free(sfh);
+            return;
+        }
     }
 
 
-	saveFile=[NSFileHandle fileHandleForUpdatingAtPath:temp_name];
+	saveFile=[NSFileHandle fileHandleForUpdatingAtPath:inPlace?file_name:temp_name];
 
     
 	count=0;
@@ -483,14 +712,20 @@ void FileManager::saveWorld(Vector warp){
   
 	//hashmap_iterate(ter.chunkMap, saveChunk, NULL);
 	saveCreatures();
-    
-    sfh->version=FILE_VERSION;
-    file_version=FILE_VERSION;
+
+    // B4: this used to stamp FILE_VERSION (4) unconditionally, which would have re-labelled a 256z
+    // world as 64z while its columns were still being written at the 256z stride -- and would have
+    // normalised a v6 file to v5's meaning without knowing what v6 changes. A file that arrived
+    // >=5 keeps its own version; everything else is stamped 4 exactly as before.
+    if(file_version<FILE_VERSION_256Z){
+        sfh->version=FILE_VERSION;
+        file_version=FILE_VERSION;
+    }else{
+        sfh->version=file_version;
+    }
     NSData* dh=[NSData dataWithBytesNoCopy:sfh length:sizeof(WorldFileHeader) freeWhenDone:FALSE];
      
     
-	[saveFile seekToFileOffset:0];
-    [saveFile writeData:dh];
 	if(writeDirectory){
 		
 		
@@ -498,11 +733,21 @@ void FileManager::saveWorld(Vector warp){
 		fwriteDirectory();
 		NSLog(@"wrote %d colidx's",count);
 	}
+	// The header is written LAST because it is the only thing that says where the directory is:
+	// on the in-place path it is the nearest thing this format has to a commit record, and on the
+	// copy path the ordering costs nothing. (It used to be written before fwriteDirectory().)
+	[saveFile seekToFileOffset:0];
+    [saveFile writeData:dh];
 	cur_dir_offset=sfh->directory_offset;
 	readDirectory();
 	free(sfh);
 	[saveFile closeFile];
 
+	if(inPlace){
+		// Commit. Everything is written, flushed and closed; removing the journal is the point
+		// after which recoverInterruptedSave() will no longer roll this save back.
+		[fm removeItemAtPath:journalPathFor(file_name) error:NULL];
+	}else{
 	// The atomic swap: temp_name is now a fully-written, closed, valid save. Replace file_name with
 	// it in one rename() — the point at which a crash can no longer produce a half-written world.
 	// (removeItemAtPath first, then moveItemAtPath, matching convertFile()'s existing pattern above
@@ -511,10 +756,14 @@ void FileManager::saveWorld(Vector warp){
 	if(![fm moveItemAtPath:temp_name toPath:file_name error:NULL]){
 		NSLog(@"saveWorld: FAILED to swap in %@ from %@ -- previous save left untouched",file_name,temp_name);
 	}
+	}
 
 	//[file writeData:[[NSData
 
 }
+// Rows actually WRITTEN by the pass below -- `count` is incremented for every row considered,
+// including the ones the offset check rejects, so it cannot be used to find the directory's end.
+static int dir_rows_written=0;
 int saveColIdx(any_t passedIn,any_t colToSave){
 	count++;
 	ColumnIndex* colIndex=(ColumnIndex*)colToSave;
@@ -527,6 +776,7 @@ int saveColIdx(any_t passedIn,any_t colToSave){
 	NSData* dh=[NSData dataWithBytesNoCopy:colIndex length:sizeof(ColumnIndex)
 				freeWhenDone:FALSE];
 	[saveFile writeData:dh];
+	dir_rows_written++;
 	}else{
 		NSLog(@"WTF MATE");
 	}
@@ -534,30 +784,164 @@ int saveColIdx(any_t passedIn,any_t colToSave){
 }
 void FileManager::fwriteDirectory(){
 	[saveFile seekToFileOffset:sfh->directory_offset];
+	dir_rows_written=0;
 	hashmap_iterate(indexes, saveColIdx, NULL);
-		
-	
+	// Re-emit whatever readDirectory captured past the real entries (sign records on a
+	// NewFormat256z world; nothing at all on every other world) -- see dir_trailer's comment.
+	if(dir_trailer&&dir_trailer_len){
+		NSData* dt=[NSData dataWithBytesNoCopy:dir_trailer length:(NSUInteger)dir_trailer_len
+					freeWhenDone:FALSE];
+		[saveFile writeData:dt];
+		printg("directory: re-emitted %llu B sign trailer after %d column rows\n",
+			dir_trailer_len,dir_rows_written);
+	}
+	// The directory is read TO EOF, so any byte left past what we just wrote is parsed as another
+	// directory row next time. Nothing shrinks the directory today, but the in-place save path
+	// (B5) writes into the real file rather than into a fresh scratch copy, where a stale tail is
+	// no longer impossible -- make the file end exactly where the directory does.
+	[saveFile truncateFileAtOffset:sfh->directory_offset
+		+(unsigned long long)dir_rows_written*sizeof(ColumnIndex)+dir_trailer_len];
 }
 void FileManager::readDirectory(){
 	this->clearDirectory();
+	if(dir_trailer){free(dir_trailer);dir_trailer=NULL;}
+	dir_trailer_len=0;
+	// The run of gate-failing rows seen since the last row that PASSED the gate. It only becomes
+	// the trailer if the file ends while it is still open; a later valid row proves it was
+	// interior garbage and resets it (dropped, as before).
+	unsigned char* pending=NULL;
+	unsigned long long pending_len=0;
+	BOOL pending_over=FALSE;
 	[saveFile seekToFileOffset:sfh->directory_offset];
-	while(TRUE){		
-		NSData* data=[saveFile readDataOfLength:sizeof(ColumnIndex)];		
+	while(TRUE){
+		NSData* data=[saveFile readDataOfLength:sizeof(ColumnIndex)];
 		if(data==NULL||[data length]<sizeof(ColumnIndex))break;
 		count++;
 		ColumnIndex* colIdx=(ColumnIndex*)malloc(sizeof(ColumnIndex));
 		[data getBytes:colIdx length:sizeof(ColumnIndex)];
 		int n=twoToOne(colIdx->x, colIdx->z);
 		if(n!=0){
+		pending_len=0; pending_over=FALSE;
 		hashmap_put(indexes,n, (any_t)colIdx);
            // printg("reading dir\n");
         }else {
+			if(!pending_over){
+				if(pending_len+sizeof(ColumnIndex)<=DIR_TRAILER_MAX){
+					if(!pending)pending=(unsigned char*)malloc(DIR_TRAILER_MAX);
+					if(pending){
+						memcpy(pending+pending_len,colIdx,sizeof(ColumnIndex));
+						pending_len+=sizeof(ColumnIndex);
+					}else pending_over=TRUE;
+				}else pending_over=TRUE;
+			}
 			free(colIdx);
 		}
 
-		 
-		
+
+
 	}
+	if(pending_over){
+		printg("directory: trailing unaddressable rows exceed %d B -- NOT preserving them\n",DIR_TRAILER_MAX);
+	}else if(pending_len){
+		dir_trailer=(unsigned char*)malloc((size_t)pending_len);
+		if(dir_trailer){
+			memcpy(dir_trailer,pending,(size_t)pending_len);
+			dir_trailer_len=pending_len;
+			printg("directory: captured a %llu B post-directory trailer (signs) to re-emit on rewrite\n",dir_trailer_len);
+		}
+	}
+	if(pending)free(pending);
+    this->deriveColumnSpans();
+}
+
+// ---- 256z support: derive the creature-block size and the per-column spans FROM THE FILE ----
+// Two facts about a .eden that the header does not state and that this engine used to take as
+// compile-time constants:
+//
+//  * how many creature slots sit between the last column and the directory. The version implies
+//    200 (v>=3) or 400 (the one measured New Dawn world), but the sibling world editor's own
+//    worldgen writes v5 files with NO creature block at all, so the version is not trustworthy.
+//    The gap is computable: directory_offset - (highest chunk_offset + one column record).
+//  * how long each column record actually is. Normally SIZEOF_COLUMN, but the measured New Dawn
+//    specimen contains one column of 107,072 B (= 131,072 - 24,000, i.e. one creature block short,
+//    consistent with its writer appending a column one creature-block too early). Reading that
+//    column at full stride silently pulls in the next column's bytes, so spans are derived from
+//    the gap to the next-highest offset and short ones are recorded here.
+//
+// Both derivations are pure arithmetic over the directory we just read -- no extra file I/O.
+static int cmp_offsets(const void* a,const void* b){
+    unsigned long long x=*(const unsigned long long*)a, y=*(const unsigned long long*)b;
+    return x<y?-1:(x>y?1:0);
+}
+struct SpanCollect{ unsigned long long* offsets; int n; };
+static int collectOffset(any_t passedIn,any_t item){
+    SpanCollect* sc=(SpanCollect*)passedIn;
+    ColumnIndex* ci=(ColumnIndex*)item;
+    sc->offsets[sc->n++]=ci->chunk_offset;
+    return MAP_OK;
+}
+struct SpanAssign{ unsigned long long* offsets; int n; unsigned long long dirEnd; map_t out; };
+static int assignSpan(any_t passedIn,any_t item){
+    SpanAssign* sa=(SpanAssign*)passedIn;
+    ColumnIndex* ci=(ColumnIndex*)item;
+    // binary search for this column's offset, then span = next offset (or the end of the block-data
+    // region) - this offset.
+    int lo=0,hi=sa->n-1,at=-1;
+    while(lo<=hi){
+        int mid=(lo+hi)/2;
+        if(sa->offsets[mid]==ci->chunk_offset){at=mid;break;}
+        if(sa->offsets[mid]<ci->chunk_offset)lo=mid+1; else hi=mid-1;
+    }
+    if(at<0)return MAP_OK;
+    unsigned long long next=(at+1<sa->n)?sa->offsets[at+1]:sa->dirEnd;
+    if(next<=ci->chunk_offset)return MAP_OK;
+    unsigned long long span=next-ci->chunk_offset;
+    if(span<SIZEOF_COLUMN){
+        int n=twoToOne(ci->x,ci->z);
+        if(n!=0){
+            unsigned long long* stored=(unsigned long long*)malloc(sizeof(unsigned long long));
+            *stored=span;
+            hashmap_put(sa->out,n,(any_t)stored);
+            printg("short column record at (%d,%d): %llu B of %llu\n",ci->x,ci->z,span,SIZEOF_COLUMN);
+        }
+    }
+    return MAP_OK;
+}
+void FileManager::clearColumnSpans(){
+    hashmap_remove_all(shortSpans,TRUE);
+}
+void FileManager::deriveColumnSpans(){
+    this->clearColumnSpans();
+    int n=hashmap_length(indexes);
+    if(n<=0){
+        // Empty directory: nothing to derive from, fall back to what the version implies.
+        eden_set_creature_slots((sfh->version>=FILE_VERSION_256Z?400:200));
+        return;
+    }
+    unsigned long long* offsets=(unsigned long long*)malloc(sizeof(unsigned long long)*n);
+    SpanCollect sc={offsets,0};
+    hashmap_iterate(indexes,collectOffset,&sc);
+    qsort(offsets,sc.n,sizeof(unsigned long long),cmp_offsets);
+
+    // Creature block = whatever is left between the end of the last column and the directory.
+    unsigned long long lastEnd=offsets[sc.n-1]+SIZEOF_COLUMN;
+    int slots=(sfh->version>=FILE_VERSION_256Z?400:200);
+    if(sfh->directory_offset>=lastEnd){
+        unsigned long long gap=sfh->directory_offset-lastEnd;
+        if(gap%sizeof(EntityData)==0&&gap/sizeof(EntityData)<=MAX_CREATURES_SAVED_MAX){
+            slots=(int)(gap/sizeof(EntityData));
+        }else{
+            printg("creature-block gap %llu B is not a whole number of %d-byte slots -- assuming %d\n",
+                   gap,(int)sizeof(EntityData),slots);
+        }
+    }
+    eden_set_creature_slots(slots);
+
+    SpanAssign sa={offsets,sc.n,sfh->directory_offset-(unsigned long long)sizeof(EntityData)*slots,shortSpans};
+    hashmap_iterate(indexes,assignSpan,&sa);
+    free(offsets);
+    printg("directory: %d columns, %d creature slots, %d short spans\n",
+           sc.n,slots,hashmap_length(shortSpans));
 }
 void FileManager::clearDirectory(){
 	hashmap_remove_all(indexes,TRUE);
@@ -916,7 +1300,20 @@ void FileManager::readColumn(int cx,int cz,NSFileHandle* rcfile){
             printg("attempting to load col from file for bgthread\n");
 */
 		[rcfile seekToFileOffset:colIndex->chunk_offset];
-        TerrainChunk* columns[CHUNKS_PER_COLUMN];
+        TerrainChunk* columns[CHUNKS_PER_COLUMN_MAX];
+        // How many bands this record really holds. Normally all of them; a column recorded in
+        // shortSpans is physically shorter than SIZEOF_COLUMN (see deriveColumnSpans) and the
+        // bands past its end must be zero-filled rather than read, or we'd read the neighbour's.
+        int bandsInFile=CHUNKS_PER_COLUMN;
+        {
+            unsigned long long* span=NULL;
+            hashmap_get(shortSpans,n,(any_t*)&span);
+            if(span!=NULL){
+                bandsInFile=(int)(*span/(CHUNK_SIZE3*(sizeof(block8)+sizeof(color8))));
+                if(bandsInFile<0)bandsInFile=0;
+                if(bandsInFile>CHUNKS_PER_COLUMN)bandsInFile=CHUNKS_PER_COLUMN;
+            }
+        }
          for(int cy=0;cy<CHUNKS_PER_COLUMN ;cy++){
             int bounds[6];
             
@@ -1002,12 +1399,16 @@ void FileManager::readColumn(int cx,int cz,NSFileHandle* rcfile){
                  }
                 
                  
-             }else{
+             }else if(cy<bandsInFile){
                  NSData* data=[rcfile readDataOfLength:(CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE*sizeof(block8))];
                  [data getBytes:chunk->pblocks length:(CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE*sizeof(block8))];
-                 
+
                  NSData* data2=[rcfile readDataOfLength:(CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE*sizeof(color8))];
                  [data2 getBytes:chunk->pcolors length:(CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE*sizeof(color8))];
+             }else{
+                 // Band the file does not contain (short record) -- air, not a neighbour's bytes.
+                 memset(chunk->pblocks,0,CHUNK_SIZE3*sizeof(block8));
+                 memset(chunk->pcolors,0,CHUNK_SIZE3*sizeof(color8));
              }
             
            /*
@@ -1374,6 +1775,286 @@ extern bool SUPPORTS_OGL2;
 extern float P_ZFAR;
   static int last_spawn_location=-1;
 
+int FileManager::probeWorldHeight(NSString* name,BOOL fromArchive){
+    if(!worldExists(cpstring(name),fromArchive)){
+        // A world that doesn't exist yet is 64z by default -- unless the New World screen parked
+        // an explicit 256z choice for it (see eden_menu_take_pending_world_height's header). This
+        // is what makes "new worlds stay 64z unless the player explicitly picks 256z" true by
+        // construction rather than by every caller remembering to ask.
+        return (eden_menu_take_pending_world_height()==T_HEIGHT_MAX)?T_HEIGHT_MAX:T_HEIGHT_DEFAULT;
+    }
+    NSString* file_name=[NSString stringWithFormat:@"%@/%@",documents,name];
+    // Earliest point on the load path that touches this specific file (World::loadWorld calls this
+    // before allocateMemory), so it is where an interrupted in-place save gets rolled back --
+    // before anything reads the header it would otherwise trust. Idempotent and free when there is
+    // no journal, which is the normal case.
+    this->recoverInterruptedSave(file_name);
+    NSFileHandle* fh=[NSFileHandle fileHandleForReadingAtPath:file_name];
+    if(fh==NULL)return T_HEIGHT_DEFAULT;
+    NSData* headerData=[fh readDataOfLength:sizeof(WorldFileHeader)];
+    int height=T_HEIGHT_DEFAULT;
+    if([headerData length]==sizeof(WorldFileHeader)){
+        const WorldFileHeader* h=(const WorldFileHeader*)[headerData bytes];
+        if(h->version>=FILE_VERSION_256Z&&h->version<=FILE_VERSION_256Z_MAX)height=T_HEIGHT_MAX;
+    }
+    [fh closeFile];
+    return height;
+}
+
+// ---- 256z Stage 3 item 5: in-app "Convert to 64z" (Settings -> Storage tab) ----
+//
+// A from-scratch C++ port of web/tools/eden-convert.js's `analyseAndConvertTo64` (Stage 1), not a
+// call into it -- that tool is a standalone Node script (fs.readSync/writeSync over a plain fd)
+// with no wasm/engine dependency, which is exactly what makes it independently trustworthy as a
+// recovery/authoring tool outside the browser. This function is the SAME algorithm restated over
+// NSFileHandle so the Storage tab can do it without shelling out to Node, which doesn't exist in a
+// browser. Keep the two in sync by hand if the format's rules ever change; the shared source of
+// truth for what the algorithm must do is docs/eden-file-format.md +
+// WORKING/256z-format-backport-plan-2026-08-05.md, not either implementation.
+//
+// What it does, in order: read the header and directory, derive the creature-block size and each
+// column's real span exactly like Stage 2's own readDirectory/deriveColumnSpans do, then stream
+// each column out truncated to 4 bands (discarding bands 4-15, counting non-air blocks lost and
+// clearing any door/portal half orphaned at the z=63 cut), relocate/drop creatures at or above
+// z=64, clamp player/home y into [0,63], and write a fresh directory + header stamped version 4.
+// Everything lands in a scratch file first; the original is only replaced after the scratch file
+// is fully written and closed, same temp+rename pattern saveWorld() uses.
+//
+// Known gap, shared with eden-convert.js (neither implements this): the NewFormat256z post-
+// directory SIGN TRAILER (WORKING/newformat256z-sign-trailer-2026-08-24.md) is not preserved here
+// -- a world with signs loses them on conversion. Signs are not parsed/rendered anywhere in this
+// build yet, so this is a data-preservation gap, not a functional regression.
+ConvertTo64Report FileManager::convertWorldTo64(NSString* name){
+    ConvertTo64Report report; memset(&report,0,sizeof(report));
+
+    if(!worldExists(cpstring(name),FALSE)){
+        snprintf(report.error,sizeof(report.error),"world does not exist");
+        return report;
+    }
+    // This does raw file surgery behind the engine's back; the currently-open world has its own
+    // live NSFileHandle and in-memory directory/creature state that this function knows nothing
+    // about. Refuse rather than race it -- the player can convert after returning to the menu.
+    if(World::getWorld&&World::getWorld->doneLoading!=0&&World::getWorld->terrain
+       &&World::getWorld->terrain->world_name
+       &&[World::getWorld->terrain->world_name isEqualToString:name]){
+        snprintf(report.error,sizeof(report.error),
+                 "cannot convert the world that is currently open -- return to the main menu first");
+        return report;
+    }
+
+    NSString* file_name=[NSString stringWithFormat:@"%@/%@",documents,name];
+    NSFileHandle* fh=[NSFileHandle fileHandleForReadingAtPath:file_name];
+    if(fh==NULL){
+        snprintf(report.error,sizeof(report.error),"could not open %s",[file_name UTF8String]);
+        return report;
+    }
+    NSData* headerData=[fh readDataOfLength:sizeof(WorldFileHeader)];
+    if([headerData length]!=sizeof(WorldFileHeader)){
+        [fh closeFile];
+        snprintf(report.error,sizeof(report.error),"truncated header (save file too short)");
+        return report;
+    }
+    WorldFileHeader header; memcpy(&header,[headerData bytes],sizeof(WorldFileHeader));
+    if(header.version<FILE_VERSION_256Z){
+        [fh closeFile];
+        snprintf(report.error,sizeof(report.error),
+                 "world is already 64z (header version %d)",header.version);
+        return report;
+    }
+    if(header.version>FILE_VERSION_256Z_MAX){
+        [fh closeFile];
+        snprintf(report.error,sizeof(report.error),
+                 "unsupported world format (header version %d, newer than this build knows how to read)",header.version);
+        return report;
+    }
+    unsigned long long fileSize=[fh seekToEndOfFile];
+    if(header.directory_offset<sizeof(WorldFileHeader)||header.directory_offset>fileSize){
+        [fh closeFile];
+        snprintf(report.error,sizeof(report.error),
+                 "directory offset outside file bounds (corrupt or truncated save)");
+        return report;
+    }
+
+    const unsigned long long BAND_BYTES=(unsigned long long)CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE*2;
+    const unsigned long long COL_256=BAND_BYTES*16;
+    const unsigned long long COL_64=BAND_BYTES*4;
+    const unsigned long long ENTITY_SIZE=sizeof(EntityData);
+    const unsigned long long DIR_ENTRY_SIZE=sizeof(ColumnIndex);
+    const int OUT_SLOTS=200; // MAX_CREATURES_SAVED at 64z, Stage 2's own default
+
+    // ---- read the directory (same struct, same on-disk shape readDirectory() trusts) ----
+    unsigned long long dirBytes=fileSize-header.directory_offset;
+    long dirCount=(long)(dirBytes/DIR_ENTRY_SIZE);
+    struct Entry{int x,z; unsigned long long offset,span,newOffset;};
+    std::vector<Entry> entries; entries.reserve(dirCount>0?dirCount:0);
+    [fh seekToFileOffset:header.directory_offset];
+    for(long i=0;i<dirCount;i++){
+        NSData* d=[fh readDataOfLength:DIR_ENTRY_SIZE];
+        if([d length]!=DIR_ENTRY_SIZE)break;
+        ColumnIndex ci; memcpy(&ci,[d bytes],sizeof(ci));
+        Entry e; e.x=ci.x; e.z=ci.z; e.offset=ci.chunk_offset; e.span=0; e.newOffset=0;
+        entries.push_back(e);
+    }
+
+    // ---- derive the creature-block size from the file, exactly like Stage 2 item 4 ----
+    unsigned long long creatureBytes=0;
+    if(header.version>=3){
+        if(entries.empty()){
+            creatureBytes=400ULL*ENTITY_SIZE; // no columns to derive from: assume the measured default
+        }else{
+            unsigned long long lastEnd=0;
+            for(size_t i=0;i<entries.size();i++)lastEnd=std::max(lastEnd,entries[i].offset);
+            lastEnd+=COL_256;
+            long long gap=(long long)header.directory_offset-(long long)lastEnd;
+            if(gap<0||(unsigned long long)gap%ENTITY_SIZE!=0)creatureBytes=400ULL*ENTITY_SIZE;
+            else creatureBytes=(unsigned long long)gap;
+        }
+    }
+
+    // ---- per-column spans: the gap to the NEXT column, never assumed to be a full record ----
+    std::vector<Entry*> sorted; sorted.reserve(entries.size());
+    for(size_t i=0;i<entries.size();i++)sorted.push_back(&entries[i]);
+    std::sort(sorted.begin(),sorted.end(),[](Entry* a,Entry* b){return a->offset<b->offset;});
+    unsigned long long blockDataEnd=header.directory_offset-creatureBytes;
+    for(size_t i=0;i<sorted.size();i++){
+        unsigned long long next=(i+1<sorted.size())?sorted[i+1]->offset:blockDataEnd;
+        long long span=(long long)std::min(COL_256,next-sorted[i]->offset);
+        sorted[i]->span=(unsigned long long)std::max((long long)0,span);
+    }
+    // The bundled RLE template (or a damaged file) has columns nowhere near a clean 131072-byte
+    // stride; this is byte surgery only and would silently mangle either. No --force override here
+    // -- an in-app action refusing outright is safer than a UI checkbox for "I know what I'm doing".
+    int odd=0;
+    for(size_t i=0;i+1<sorted.size();i++)if(sorted[i]->span!=COL_256)odd++;
+    if(odd>1){
+        [fh closeFile];
+        snprintf(report.error,sizeof(report.error),
+                 "%d of %d columns are not a clean 131072 B record -- looks like a damaged file, not a user save",
+                 odd,(int)sorted.size());
+        return report;
+    }
+
+    report.columns=(int)sorted.size();
+
+    // ---- write the scratch output ----
+    NSString* temp_name=[file_name stringByAppendingString:@".64zconv"];
+    NSFileManager* nsfm=[NSFileManager defaultManager];
+    [nsfm removeItemAtPath:temp_name error:NULL]; // drop any orphan from a previous failed attempt
+    // fileHandleForWritingAtPath: (not ...ForUpdatingAtPath:) deliberately: temp_name does not exist
+    // yet (just removed above), so its eager backup-before-overwrite is a no-op, whereas the
+    // Updating variant's DEFERRED backup would fire on our first write and leave a stray
+    // "<temp_name>.bak" of the empty scratch file behind.
+    NSFileHandle* wh=[NSFileHandle fileHandleForWritingAtPath:temp_name];
+    if(wh==NULL){
+        [fh closeFile];
+        snprintf(report.error,sizeof(report.error),"could not create scratch file %s",[temp_name UTF8String]);
+        return report;
+    }
+    [wh seekToFileOffset:sizeof(WorldFileHeader)]; // header is written last, once directory_offset is known
+
+    std::vector<unsigned char> col(COL_256);
+    for(size_t i=0;i<sorted.size();i++){
+        Entry* e=sorted[i];
+        std::fill(col.begin(),col.end(),0); // short spans read as air, never a neighbour's bytes
+        if(e->span>0){
+            [fh seekToFileOffset:e->offset];
+            NSData* d=[fh readDataOfLength:(NSUInteger)e->span];
+            memcpy(col.data(),[d bytes],[d length]);
+        }
+        int lost=0;
+        for(unsigned long long b=4;b<16;b++){
+            unsigned long long base=b*BAND_BYTES;
+            for(unsigned long long j=0;j<BAND_BYTES/2;j++)if(col[base+j]!=0)lost++;
+        }
+        if(lost>0){report.blocksDiscarded+=lost; report.columnsAffected++;}
+
+        // A door/portal bottom half retained at world y=63 whose top half lived at y=64 is orphaned
+        // by the cut -- clear it rather than leave a half-door standing.
+        unsigned long long topBand=3*BAND_BYTES, aboveBand=4*BAND_BYTES;
+        for(int lx=0;lx<CHUNK_SIZE;lx++){
+            for(int lz=0;lz<CHUNK_SIZE;lz++){
+                int cc=CC(lx,lz,15);
+                unsigned char bottom=col[topBand+cc];
+                unsigned char above=col[aboveBand+CC(lx,lz,0)];
+                BOOL orphan=((bottom>=TYPE_DOOR1&&bottom<=TYPE_DOOR4)&&above==TYPE_DOOR_TOP)||
+                            ((bottom>=TYPE_PORTAL1&&bottom<=TYPE_PORTAL4)&&above==TYPE_PORTAL_TOP);
+                if(orphan){
+                    col[topBand+cc]=0;
+                    col[topBand+4096+cc]=0; // paint byte for the same voxel
+                    report.doorsOrphaned++;
+                }
+            }
+        }
+        e->newOffset=[wh offsetInFile];
+        NSData* outCol=[NSData dataWithBytesNoCopy:col.data() length:(NSUInteger)COL_64 freeWhenDone:FALSE];
+        [wh writeData:outCol];
+    }
+
+    // ---- creatures: keep slot positions, relocate survivors from slots >= 200, drop y >= 64 ----
+    std::vector<unsigned char> srcCre(creatureBytes);
+    if(creatureBytes>0){
+        unsigned long long start=header.directory_offset-creatureBytes;
+        if(start>=sizeof(WorldFileHeader)){
+            [fh seekToFileOffset:start];
+            NSData* d=[fh readDataOfLength:(NSUInteger)creatureBytes];
+            memcpy(srcCre.data(),[d bytes],std::min((NSUInteger)creatureBytes,[d length]));
+        }
+    }
+    [fh closeFile];
+    long srcSlots=(long)(creatureBytes/ENTITY_SIZE);
+    std::vector<unsigned char> outCre(OUT_SLOTS*ENTITY_SIZE,0);
+    std::vector<int> freeSlots;
+    for(int i=0;i<OUT_SLOTS;i++){
+        EntityData* dst=(EntityData*)(outCre.data()+i*ENTITY_SIZE);
+        if(i<srcSlots){
+            const EntityData* src=(const EntityData*)(srcCre.data()+i*ENTITY_SIZE);
+            memcpy(dst,src,ENTITY_SIZE);
+            if(dst->type!=-1&&dst->pos.y>=64){dst->type=-1; report.creaturesDropped++; freeSlots.push_back(i);}
+            else if(dst->type==-1)freeSlots.push_back(i);
+        }else{dst->type=-1; freeSlots.push_back(i);}
+    }
+    for(long i=OUT_SLOTS;i<srcSlots;i++){
+        const EntityData* src=(const EntityData*)(srcCre.data()+i*ENTITY_SIZE);
+        if(src->type==-1)continue;
+        if(src->pos.y>=64){report.creaturesDropped++; continue;}
+        if(freeSlots.empty()){report.creaturesOverflow++; continue;}
+        int dstSlot=freeSlots.back(); freeSlots.pop_back();
+        memcpy(outCre.data()+dstSlot*ENTITY_SIZE,src,ENTITY_SIZE);
+        report.creaturesRelocated++;
+    }
+    [wh writeData:[NSData dataWithBytesNoCopy:outCre.data() length:outCre.size() freeWhenDone:FALSE]];
+
+    // ---- directory: original slot order, patched offsets ----
+    unsigned long long directoryOffset=[wh offsetInFile];
+    std::vector<unsigned char> dirBuf(entries.size()*DIR_ENTRY_SIZE);
+    for(size_t i=0;i<entries.size();i++){
+        ColumnIndex ci; ci.x=entries[i].x; ci.z=entries[i].z; ci.chunk_offset=entries[i].newOffset;
+        memcpy(dirBuf.data()+i*DIR_ENTRY_SIZE,&ci,sizeof(ci));
+    }
+    if(!dirBuf.empty())[wh writeData:[NSData dataWithBytesNoCopy:dirBuf.data() length:dirBuf.size() freeWhenDone:FALSE]];
+
+    // ---- header: patched copy of the original, player/home clamped into the 64z ceiling ----
+    WorldFileHeader outHeader=header;
+    outHeader.directory_offset=directoryOffset;
+    outHeader.version=FILE_VERSION;
+    if(!(outHeader.pos.y<63)){outHeader.pos.y=63; report.posClamped=TRUE;}
+    if(outHeader.pos.y<0){outHeader.pos.y=0; report.posClamped=TRUE;}
+    if(!(outHeader.home.y<63)){outHeader.home.y=63; report.homeClamped=TRUE;}
+    if(outHeader.home.y<0){outHeader.home.y=0; report.homeClamped=TRUE;}
+    [wh seekToFileOffset:0];
+    [wh writeData:[NSData dataWithBytesNoCopy:&outHeader length:sizeof(outHeader) freeWhenDone:FALSE]];
+    [wh closeFile];
+
+    // ---- commit: only now does the original get replaced ----
+    [nsfm removeItemAtPath:file_name error:NULL];
+    if(![nsfm moveItemAtPath:temp_name toPath:file_name error:NULL]){
+        snprintf(report.error,sizeof(report.error),"converted successfully but could not replace the original file");
+        return report;
+    }
+    report.ok=TRUE;
+    return report;
+}
+
 void FileManager::loadWorld(NSString* name,BOOL fromArchive){
    
     
@@ -1387,6 +2068,10 @@ void FileManager::loadWorld(NSString* name,BOOL fromArchive){
         imgHash=NULL;
     }
     World::getWorld->player->reset();
+    // Belt and braces: probeWorldHeight() normally gets here first, but nothing structurally
+    // guarantees every caller went through it, and rolling back twice is a no-op.
+    if(worldExists(cpstring(name),fromArchive))
+        this->recoverInterruptedSave([NSString stringWithFormat:@"%@/%@",documents,name]);
 	if(!worldExists(cpstring(name),fromArchive)){
      
         
@@ -1517,9 +2202,19 @@ void FileManager::loadWorld(NSString* name,BOOL fromArchive){
 		//printg("player pos init save: %f %f %f",player.pos.x,player.pos.y,player.pos.z);
 		//NSLog(@"chunkOffsets: %d %d",chunkOffsetX,chunkOffsetZ);
         player->yaw=tempyaw;
-        file_version=2;
+        // g_world_height is already whatever World::loadWorld's probeWorldHeight() call decided
+        // (64 by default, 256 only if the New World screen parked that choice -- see
+        // eden_menu_take_pending_world_height above). A 256z new world is stamped straight to
+        // FILE_VERSION_256Z so saveWorld() below preserves it instead of normalising to 4, and
+        // gets the wider creature block before the clearing loop below runs.
+        if(g_world_height>=T_HEIGHT_MAX){
+            file_version=FILE_VERSION_256Z;
+            eden_set_creature_slots(MAX_CREATURES_SAVED_MAX);
+        }else{
+            file_version=2;
+        }
 		//[ter updateAllImportantChunks];
-		
+
         for(int i=0;i<MAX_CREATURES_SAVED;i++){
             creatureData[i].type=-1;
         }
@@ -1553,6 +2248,19 @@ void FileManager::loadWorld(NSString* name,BOOL fromArchive){
 		sfh=(WorldFileHeader*)[headerData bytes];
         file_version=sfh->version;
         printg("FILE VERSION: %d\n",file_version);
+        // 256z ("New Dawn") worlds stamp version 5 or 6 -- same header layout, but 16 chunk-bands
+        // per column (131072-byte stride) instead of 4 (32768). Those two are READ and PLAYED as of
+        // 2026-08-06 (Stage 2): World::loadWorld has already probed this header and called
+        // eden_set_world_height(256), so SIZEOF_COLUMN/CHUNKS_PER_COLUMN below are already the 256z
+        // values. Anything ABOVE 6 is a format nobody here has seen; it is inside the 1..1000 range
+        // so it would sail past the legacy-convert branch below, read at some stride we guessed,
+        // and be overwritten by the first autosave. Refuse it instead -- that is Stage 0's whole
+        // point and it stays, just narrowed from ">=5" to "above what we know".
+        if(sfh->version>FILE_VERSION_256Z_MAX&&sfh->version<=1000){
+            [saveFile closeFile];
+            eden_report_load_failure([name UTF8String],"unsupported world format (newer than any .eden version this build knows how to read)");
+            return;
+        }
         if(sfh->version<1||sfh->version>1000){  //old legacy convert code, no longer really supported
             [saveFile closeFile];
            

@@ -61,7 +61,7 @@
 // original modal wait; nothing else advances it. `eden_world_type_choice` (below) is the async
 // callback the dialog's buttons invoke; it does exactly what `Alert.mm`'s delegate did, just later.
 // NOTE: this EM_ASM touches `document` directly, which only exists because the sole runnable host
-// today is eden-st.html's single-threaded, main-thread build (see RESUME-HERE.md) — `public/
+// today is eden-st.html's single-threaded, main-thread build (see STATUS.md) — `public/
 // index.html`'s worker/OffscreenCanvas path (D1) is still unimplemented scaffolding. If/when that
 // path is finished, this call needs to become a postMessage to the main thread instead.
 void alert_init() {}
@@ -91,7 +91,12 @@ EM_JS(void, eden_js_alert_dialog, (int dialogId, const char* titleC, const char*
   // page's trackCursorNeed() loop only re-grabs on a picker-close EDGE, so it will not fight this.
   if (document.exitPointerLock && document.pointerLockElement) document.exitPointerLock();
   var overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;inset:0;z-index:20;display:flex;' +
+  // z-index MUST sit above --eden-z-menu (25) and --eden-z-panel (30) — see the z-index scale in
+  // public/eden-ui.css. This was a literal 20 until 2026-08-06, i.e. UNDER the DOM menu, and that
+  // was not cosmetic: the engine parks `loading` on the answer to this dialog, so a modal the
+  // player cannot see or click is an unrecoverable "loading forever" hang. Verified in real Safari
+  // (elementFromPoint over both buttons returned DIV.eden-stack, the menu, not the button).
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:var(--eden-z-alert,40);display:flex;' +
     'align-items:center;justify-content:center;background:rgba(0,0,0,.55);' +
     'font:14px/1.4 monospace;';
   var box = document.createElement('div');
@@ -162,12 +167,15 @@ void showAlertWorldType() {
     if (pending >= 0) { eden_world_type_choice(pending); return; }
   }
   EM_ASM({
-    // Headless (`node eden.js`, see PORT-STATUS.md "Headless driving") has no `document` — fall
+    // Headless (`node eden.js`, see archive/PORT-STATUS-2026-08-13.md "Headless driving") has no `document` — fall
     // back to the old auto-answer-Normal behavior so a scripted drive through the create-world
     // path doesn't ReferenceError; a real browser always takes the dialog path below.
     if (typeof document === 'undefined') { Module._eden_world_type_choice(0); return; }
     var overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:20;display:flex;' +
+    // Above --eden-z-menu (25): this dialog is the one thing standing between the player and a
+    // world load, and at z-index 20 it rendered UNDERNEATH the DOM menu. See the note on the
+    // alert overlay above; this one is the instance that was actually reported as a hang.
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:var(--eden-z-alert,40);display:flex;' +
       'align-items:center;justify-content:center;background:rgba(0,0,0,.55);' +
       'font:14px/1.4 monospace;';
     var box = document.createElement('div');

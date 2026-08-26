@@ -28,7 +28,9 @@
   function utf8(ptr) {
     var H = M().HEAPU8, end = ptr;
     while (H[end]) end++;
-    return new TextDecoder().decode(H.subarray(ptr, end));
+    // The Uint8Array copy is load-bearing in the EDEN_THREADED build (shared memory cannot be
+    // handed to TextDecoder) — full reasoning on the canonical copy in eden-settings.js.
+    return new TextDecoder().decode(new Uint8Array(H.subarray(ptr, end)));
   }
 
   // Reloading is how both buttons below get back to a clean boot (main() re-mounts IDBFS, the

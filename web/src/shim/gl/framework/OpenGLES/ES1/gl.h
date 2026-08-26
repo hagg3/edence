@@ -4,7 +4,7 @@
 // (web/CMakeLists.txt, BEFORE any system GL headers) purely so that literal include
 // resolves — to our D2 shim instead. Angle-bracket includes are safe to redirect this way
 // (unlike quoted includes, which always check the including file's own directory first —
-// see docs/PORT-STATUS.md "Design decision: header shadowing" for why this only works for
+// see docs/archive/PORT-STATUS-2026-08-13.md "Design decision: header shadowing" for why this only works for
 // angle-bracket Apple-framework-style includes, not the project's own quoted "X.h" includes).
 #ifndef EDEN_TRAMPOLINE_OPENGLES_ES1_GL_H
 #define EDEN_TRAMPOLINE_OPENGLES_ES1_GL_H

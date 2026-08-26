@@ -26,6 +26,46 @@ EAGLView* G_EAGL_VIEW;
 
 int g_offcx,g_offcz;
 
+// Runtime world height -- see Constants.h. Defaults are the pre-2026-08-06 compile-time
+// constants, so anything that never calls eden_set_world_height() behaves exactly as before
+// (that includes the offline TerrainGen2 bake, which is 64z by construction).
+int g_world_height=T_HEIGHT_DEFAULT;
+int g_chunks_per_column=T_HEIGHT_DEFAULT/CHUNK_SIZE;
+int g_xz_stride=T_SIZE*T_HEIGHT_DEFAULT;
+int g_t_blocks=T_SIZE*T_SIZE*T_HEIGHT_DEFAULT;
+int g_column_bytes=CHUNK_SIZE3*(T_HEIGHT_DEFAULT/CHUNK_SIZE)*2;
+int g_max_creatures_saved=200;
+void eden_set_world_height(int height){
+    if(height!=64&&height!=256){
+        printf("eden_set_world_height: refusing unsupported height %d, staying at %d\n",height,g_world_height);
+        return;
+    }
+    g_world_height=height;
+    g_chunks_per_column=height/CHUNK_SIZE;
+    g_xz_stride=T_SIZE*height;
+    g_t_blocks=T_SIZE*T_SIZE*height;
+    g_column_bytes=CHUNK_SIZE3*g_chunks_per_column*2;
+    printf("world height set to %d (%d bands, %d B per column record)\n",
+           g_world_height,g_chunks_per_column,g_column_bytes);
+}
+// The creature block is sized from the FILE, not from its version: the sibling world editor
+// writes v5 saves with no creature block at all, and the one measured New Dawn specimen has
+// 400 slots where the version alone would only tell us ">=5". 0 is a legal answer and means
+// "this file has nowhere to put creatures" -- LoadCreatures/saveCreatures then do nothing,
+// which is exactly the pre-version-3 behaviour they already implement.
+void eden_set_creature_slots(int slots){
+    if(slots<0)slots=0;
+    if(slots>MAX_CREATURES_SAVED_MAX)slots=MAX_CREATURES_SAVED_MAX;
+    g_max_creatures_saved=slots;
+}
+// B5: see Constants.h. 0 would mean "always save in place" and is legal (the tests use it);
+// there is deliberately no upper clamp, so "never save in place" stays expressible too.
+unsigned long long g_save_inplace_threshold=EDEN_SAVE_INPLACE_THRESHOLD_DEFAULT;
+void eden_set_save_inplace_threshold(unsigned long long bytes){
+    g_save_inplace_threshold=bytes;
+    printf("save: whole-file-copy threshold set to %llu B\n",g_save_inplace_threshold);
+}
+
 extern "C" const int blockinfo[NUM_BLOCKS+1]={
 	[TYPE_NONE]=IS_NOTSOLID,
 	[TYPE_BEDROCK]=0|IS_HARD,

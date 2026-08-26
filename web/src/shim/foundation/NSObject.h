@@ -9,7 +9,7 @@
 // classes the engine actually calls (see foundation-usage.md).
 //
 // P0.1 (web-port-plan.md) is the still-open spike that proves this links; nothing below has
-// been compiled yet (no emcc on this machine — see PORT-STATUS.md).
+// been compiled yet (no emcc on this machine — see archive/PORT-STATUS-2026-08-13.md).
 //
 // Manual retain/release throughout (CLAUDE.md convention #6 — this engine predates ARC and
 // the port keeps it that way rather than perturb every engine file). Build with

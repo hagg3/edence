@@ -82,13 +82,83 @@ NSFileHandle each streaming event).
 5. For each of the 18×18 resident columns: `saveColumn(cx,cz)`:
    - skip unless any chunk in the column has `modified` set (flags are cleared here);
    - existing directory entry → overwrite in place at its `chunk_offset`;
-   - new entry → `chunk_offset = directory_offset − 12000` (i.e. where the creature
-     block currently starts), `directory_offset += 32768`, `writeDirectory=TRUE`;
-   - write 4×(pblocks, pcolors) raw.
-6. `saveCreatures()` — `SaveModels()` fills `creatureData[200]`, written at
-   `directory_offset − 12000`. (v<3 files get the block appended and become v3+.)
-7. Stamp `version=4`, rewrite header at offset 0; if any column was appended,
-   `fwriteDirectory()` rewrites the whole directory at `directory_offset`.
+   - new entry → `chunk_offset = directory_offset − sizeof(EntityData)·MAX_CREATURES_SAVED`
+     (i.e. where the creature block currently starts), `directory_offset += SIZEOF_COLUMN`,
+     `writeDirectory=TRUE`;
+   - write `CHUNKS_PER_COLUMN`×(pblocks, pcolors) raw.
+6. `saveCreatures()` — `SaveModels()` fills `creatureData[]`, written at
+   `directory_offset − sizeof(EntityData)·MAX_CREATURES_SAVED`. (v<3 files get the block
+   appended and become v3+.)
+7. Stamp `version=4` — **unless the file arrived as version ≥ 5**, in which case it keeps its
+   own version. If any column was appended, `fwriteDirectory()` rewrites the whole directory at
+   `directory_offset` (plus the sign trailer, below), then the header is rewritten at offset 0 —
+   **header last**, because it is the only thing that says where the directory is, and on the
+   in-place path below it is the nearest thing this format has to a commit record.
+
+### Two save strategies, chosen by file size (2026-08-25)
+Steps 3–7 above run against a **scratch copy** of the world (`<file>.savetmp`), which one
+`rename()` swaps in at the very end — so any crash before that rename leaves the previous save
+byte-identical. That is still what happens for a file **below `g_save_inplace_threshold`**
+(`Constants.h`, 16 MiB by default), which is every ordinary world.
+
+At or above the threshold the copy is the problem, not the protection: it is O(file size) in time
+*and* in peak memory, and a 256z world can be gigabytes. Measured on a real 279 MB 256z specimen
+with **nothing edited** (`web/tools/headless-save-io-probe.js`): 558 MB read + 558 MB written per
+save, against ~155 KB of genuinely-changed bytes. So above the threshold `saveWorld` writes
+straight into the world file and protects it with a **rollback journal** instead:
+
+- Before touching anything, `writeSaveJournal()` writes `<file>.savejrnl` — a small header
+  (magic `EDNJRNL`, version, original length, region offset/length) plus the world's current
+  192-byte header and the file's tail from `directory_offset − creature block` to EOF.
+- That tail is exactly the region a save can destroy: appended columns start at
+  `directory_offset − creature block`, and everything below that point is only ever overwritten
+  by a dirty column *at its own existing offset*. The journal is therefore O(number of columns),
+  not O(file size) — about 410 KB for a 3.97 GB world.
+- Removing the journal after `closeFile` is the commit. `recoverInterruptedSave()` (called from
+  `probeWorldHeight`, i.e. before anything reads the header, and again from `loadWorld`) replays a
+  surviving journal: restore the region, truncate to the original length, restore the header,
+  delete the journal. It is idempotent, and a journal too short to be complete is discarded
+  because it proves the crash happened *before* the world file was touched.
+- **The honest cost**: a crash between journal and commit can leave an individual dirty column
+  half-old/half-new. The file still loads, the directory is still valid, and no other column is
+  affected — but this is a real downgrade from the copy path's all-or-nothing guarantee.
+  Journalling the dirty columns too would restore it, at the cost of re-reading and re-writing
+  every dirty column each save (up to ~42 MB at 256z), which is most of what removing the copy
+  bought. Deliberate trade.
+- Above the threshold the port also stops maintaining a **whole-file backup slot**
+  (`<file>.savetmp.bak` / `<file>.bak`, `web/src/shim/foundation/NSFileHandle.mm`) and deletes any
+  stale one it finds: nothing above the threshold would ever refresh it, so it is a permanent
+  second copy of the world that the load-failure dialog would offer as if it were the previous
+  save. Durability above the threshold is the journal.
+- If the journal cannot be written (or, below the threshold, if the scratch copy fails), the save
+  is **skipped** with a log line and the last complete save is left intact — rather than
+  finishing a save with neither protection, which is the one path that can leave a world
+  unloadable.
+
+Regression cover: `web/tools/headless-save-inplace-test.js` (both paths, a real
+engine-written journal replayed against a deliberately half-written file, journal hygiene on
+world delete).
+
+**Every one of those sizes is per-world runtime now** (2026-08-06): `SIZEOF_COLUMN` is 32,768 or
+131,072 and `MAX_CREATURES_SAVED` is whatever the file actually has room for. See
+"Runtime world height" in [world-and-terrain.md](world-and-terrain.md) and the 256z section of
+[eden-file-format.md](eden-file-format.md).
+
+### Two quantities that are DERIVED FROM THE FILE, not from its version
+`FileManager::deriveColumnSpans()` (run at the end of every `readDirectory()`) computes both,
+from the directory alone, with no extra I/O:
+
+- **Creature-block size** = `directory_offset − (highest chunk_offset + SIZEOF_COLUMN)`, accepted
+  only if it is a whole number of 60-byte `EntityData` slots and ≤ 400; otherwise the
+  version-implied default (200, or 400 for v≥5). This exists because the version is *not*
+  trustworthy: the sibling world editor writes v5 saves with **no creature block at all**, and
+  that case is a checked test, not a hypothetical. Zero slots is legal and means creatures simply
+  do not persist in that file.
+- **Per-column span** = the gap to the next-highest `chunk_offset` (or to the start of the
+  creature block, for the last column). A column whose span is *shorter* than `SIZEOF_COLUMN` is
+  recorded, and `readColumn` then reads only the bands that are really there and zero-fills the
+  rest. The one measured New Dawn world has exactly one such column (107,072 B where 131,072 was
+  expected); reading it at full stride would silently splice in 24,000 bytes of its neighbour.
 
 ### When saves happen
 - Streaming boundary crossings (before overwriting resident columns) — the frequent,
@@ -108,7 +178,9 @@ original. Shows "Converting World…" in the UI via `convertingWorld`.
 - `setName(file,display)` rewrites just the header's name field (menu rename).
 - `setImageHash(md5)` rewrites the header when a new preview screenshot is taken
   (`md5.c` computes it; sharing uses it to pair world+png server-side).
-- `deleteWorld` removes the file and its `.png`.
+- `deleteWorld` removes the file, its `.png`, and its `.savejrnl` — a journal must never outlive
+  the world it belongs to, or a new world created under the same file name gets "recovered" into
+  that stale tail on its first load.
 - World *files* in Documents are the identity; the display name lives only in the
   header. `Menu::loadWorlds` lists Documents and reads each header for the name.
 
@@ -120,8 +192,9 @@ original. Shows "Converting World…" in the UI via `convertingWorld`.
   order in `prepareAndLoadGeometry` is deliberate.
 - The directory hashmap and the file can diverge between `readDirectory()` calls;
   the code defensively re-reads it at the start of every save.
-- Appended columns assume the creature block is exactly 12,000 bytes; changing
-  `MAX_CREATURES_SAVED` or `EntityData` breaks every existing file.
+- Appended columns place themselves relative to the creature block, whose size is now derived
+  per file (above). `EntityData`'s 60-byte layout is still frozen — changing it breaks every
+  existing file.
 - `twoToOne` returns 0 for out-of-range chunk coords and 0 is treated as
   "corrupt/skip" — worlds cannot extend to negative or ≥ 32768 chunk coordinates.
 - Column writes are not atomic; a crash mid-save can corrupt a world (there is no

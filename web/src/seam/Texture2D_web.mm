@@ -8,7 +8,7 @@
 // is a plain C++ class, not Objective-C) of that SAME interface — same pattern as
 // EAGLView_web.mm's header comment describes.
 //
-// WHAT THIS FILE OWES, measured against the real 1555-line Texture2D.mm (PORT-STATUS.md "Pass
+// WHAT THIS FILE OWES, measured against the real 1555-line Texture2D.mm (archive/PORT-STATUS-2026-08-13.md "Pass
 // 10"): Texture2D is the engine's immediate-mode quad drawer for ALL 2D/UI/sky — every menu
 // button, HUD icon, and the sky backdrop draws through one of the `draw*` methods below. Two
 // clean halves:
@@ -32,7 +32,7 @@
 //
 // DELIBERATELY NOT PORTED:
 //   - initFromString / the `(NSString*, CGSize, UITextAlignment, UIFont*)` text-rasterizing
-//     constructor. CORRECTION (see PORT-STATUS.md "Owed/open" + RESUME-HERE pass 35): the old
+//     constructor. CORRECTION (see archive/PORT-STATUS-2026-08-13.md "Owed/open" + RESUME-HERE pass 35): the old
 //     claim here — "confirmed dead code, only call site is the commented-out Graphics::drawText"
 //     — was wrong. statusbar.mm's `setStatus` calls `new Texture2D(status, ...)` directly (the
 //     world-name label under the menu's world picker, and SharedList.mm's world/date labels), and
@@ -206,7 +206,7 @@ unsigned char* EdenLoadPNG(NSString* path, int* outW, int* outH, BOOL* outHasAlp
         // texcoords-enabled, NOT that the bound texture name is nonzero — so it cannot catch
         // this. TODO next session: if this prints, the bug is path resolution
         // (NSBundle.mm/CMakeLists.txt preload paths); if it does NOT print, decode is reaching
-        // stb_image and the black canvas has a different cause (see RESUME-HERE.md).
+        // stb_image and the black canvas has a different cause (see STATUS.md).
         printg("Texture2D_web: no data at '%s' (NSData load failed or empty)\n", [path UTF8String]);
         return nullptr;
     }

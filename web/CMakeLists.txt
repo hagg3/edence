@@ -238,6 +238,7 @@ set(EDEN_SEAM_SOURCES
   src/seam/Storage_web.mm  # local-storage panel data source (world list/size/mtime, delete). See file header.
   src/seam/Menu_web.mm  # C accessors the DOM main menu (public/eden-menu.js) drives Menu.mm through. NOT a replacement — see file header.
   src/seam/LoadFailure_web.mm  # C4: corrupt/truncated-save signal for FileManager.mm's loadWorld() + .bak restore. See file header.
+  src/seam/MeshTiming_web.mm  # row 36/C1: measures mesh-CPU vs VBO-upload cost per chunk, --wrap of TerrainChunk::rebuild2/prepareVBO. See file header.
   src/seam/SimpleAudioEngine_web.mm  # P5 audio (Web Audio + streaming music). See file header.
   # P4 landed by un-excluding the REAL FileManager.mm/FileManagerHelper.mm (see EDEN_SEAM_EXCLUDE
   # above) rather than writing FileManager_web.mm — no seam replacement needed here.
@@ -256,6 +257,11 @@ if(EDEN_DIAGNOSTICS)
   # Audit row F5 — the dev console (teleport/spawn/world-stats) is deliberately gated the same
   # way: a shipped build should not let a player teleport or spawn creatures at will.
   list(APPEND EDEN_SEAM_SOURCES src/seam/DevConsole_web.mm)
+  # Audit row 21/I6 — real @interface/@implementation test classes exercising objc_runtime.cpp's
+  # dispatch (slot lookup, ivar layout, super, category merging); see the file's own header for
+  # why this needs to be genuine ObjC compiled through the same frontend, not a mock. A shipped
+  # build has no reason to carry it, same reasoning as the two sources above.
+  list(APPEND EDEN_SEAM_SOURCES src/shim/objc/objc_selftest.mm)
 endif()
 
 # ---- case-mismatched #import shims -----------------------------------------------------------
@@ -620,6 +626,12 @@ if(EMSCRIPTEN)
     # is called from Classes/World.mm:499 (cross-TU), so --wrap sees every engine tick exactly
     # once. See src/seam/Movement_web.mm's header. Mangled name confirmed via llvm-nm, not guessed.
     "SHELL:-Wl,--wrap=_ZN6Player9preupdateEf"
+    # row 36/C1 — measure mesh-CPU vs VBO-upload cost before designing an off-thread mesher, per
+    # c1-threaded-build-handoff.md §5 item 1. Both cross-TU (Classes/Terrain.mm calls them on a
+    # TerrainChunk* defined in Classes/TerrainChunk.mm). See src/seam/MeshTiming_web.mm.
+    "SHELL:-Wl,--wrap=_ZN12TerrainChunk8rebuild2Ev"
+    "SHELL:-Wl,--wrap=_ZN12TerrainChunk10prepareVBOEv"
+    "SHELL:-Wl,--wrap=_ZN11FileManager10readColumnEiiP12NSFileHandle"
     # Settings (pass 28). The old GL settings panel is neutralised rather than seam-replaced:
     # SettingsMenu::{load,save,getNewWorldName} and properties[] are kept and driven by the DOM
     # panel, while update()/render() (both called from Classes/Menu.mm, a different TU) become
@@ -777,14 +789,62 @@ if(EMSCRIPTEN)
     "SHELL:--exclude-file *media/textures/config*.txt*"
   )
   if(EDEN_THREADED)
-    # D1: real pthreads (fixes C3's world-load-thread races per the plan's reframing — see
-    # docs/PORT-STATUS.md) + OffscreenCanvas rendering from the worker + a stack-switching-safe
-    # unwind-info format for that combination.
+    # ---- Audit row 36/C1, pass 63 (2026-08-04): ARCHITECTURE CHANGED. Read this before adding
+    # PROXY_TO_PTHREAD back. -------------------------------------------------------------------
+    #
+    # This branch used to be `-pthread -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1
+    # -sUSE_OFFSET_CONVERTER=1`, i.e. web-port-plan.md's original D1: move main() (and therefore
+    # the whole engine and all GL) onto a worker, and hand it the canvas as a transferred
+    # OffscreenCanvas. That was written in 2026-07, when the browser host was a canvas and a
+    # keyboard listener. **It is now the wrong architecture, and it was measured wrong, not
+    # reasoned wrong:** built as-is it links fine and then dies on the first `pthread_create` with
+    #     pthread_create: could not find canvas with ID "#canvas" to transfer to thread!
+    # under `node tools/headless-p1-gate.js build-thr` — the OffscreenCanvas handshake
+    # (public/worker-bootstrap.js) was never written and the sketch for it was deleted in audit
+    # row I5.
+    #
+    # WHY NOT JUST WRITE THE HANDSHAKE: the port grew a real DOM UI layer in passes 58-62. Ten
+    # files under public/ (eden-menu, eden-settings, eden-hotbar, eden-input, eden-viewport,
+    # eden-pausemenu, eden-console, eden-storage, eden-loaderror, eden-ui) call **72 distinct
+    # `_eden_*` engine exports** directly and SYNCHRONOUSLY from the browser main thread — count
+    # it with `grep -oh "_eden_[a-z_0-9]*" public/*.js | sort -u | wc -l`. Under PROXY_TO_PTHREAD
+    # those calls do not become cross-thread messages by themselves: they still execute on the
+    # main thread, against the same shared memory the engine worker is mutating, which is a data
+    # race on engine state with no diagnostic. Making it correct means hand-proxying all 72 (plus
+    # every future one) through emscripten_proxy_async/MAIN_THREAD_EM_ASM. THAT is where the
+    # audit's "3-6 weeks" estimate lives — and it buys nothing toward this row's actual prize.
+    #
+    # WHAT THE PRIZE ACTUALLY NEEDS (audit row 36's own re-framing, pass 59): off-thread chunk
+    # meshing. That is CPU work over `blockarray` producing vertex buckets — it needs *worker
+    # threads sharing the engine's memory*, which is `-pthread` + SharedArrayBuffer + COOP/COEP.
+    # It does NOT need the engine relocated off the main thread, and it does not need
+    # OffscreenCanvas. So:
+    #
+    #   ENGINE + GL + DOM stay on the browser main thread. CLAUDE.md convention #4 ("all GL work
+    #   on the main thread") survives intact and keeps meaning what it says. `-pthread` makes
+    #   `pthread_create` real, which (a) makes the engine's existing world-load thread a genuine
+    #   background thread instead of src/seam/pthread_sync_web.c's inline call, and (b) is the
+    #   prerequisite a future meshing thread pool needs.
+    #
+    # This is strictly a subset of the old flag set, so it does not foreclose the OffscreenCanvas
+    # architecture — it defers it. If it is ever revisited, the 72-export proxy layer is the work,
+    # not the flags.
+    #
+    # PTHREAD_POOL_SIZE: pre-spawn the worker(s) at startup. Without a pooled worker,
+    # `pthread_create` called from the browser MAIN thread cannot block waiting for a Worker to
+    # boot (the Worker's own `onmessage` needs the main thread to return to the event loop first),
+    # so Emscripten defers the thread's start until the next event-loop turn. The engine polls
+    # `doneLoading` per frame rather than joining, so a deferred start is survivable — but a
+    # pooled worker makes it deterministic, and the pool is what a meshing pool will grow out of.
+    # 4 = 1 world-load thread + 3 spare for the eventual mesher; revisit when the mesher exists.
+    #
+    # -sALLOW_MEMORY_GROWTH + -pthread emits `-Wpthreads-mem-growth` (growing a SharedArrayBuffer
+    # invalidates every JS-side heap view in every worker). Accepted, not ignored: this port's
+    # heap demand is measured at 112-140 MB against a 100 MB initial (see -sINITIAL_MEMORY above),
+    # so growth happens a handful of times per session, not per frame.
     list(APPEND EDEN_LINK_FLAGS
       -pthread
-      -sPROXY_TO_PTHREAD=1
-      -sOFFSCREENCANVAS_SUPPORT=1
-      -sUSE_OFFSET_CONVERTER=1
+      -sPTHREAD_POOL_SIZE=4
     )
     target_compile_options(eden PRIVATE -pthread)
   else()

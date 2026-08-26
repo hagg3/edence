@@ -11,15 +11,59 @@ top of the voxel grid.
 |---|---|---|
 | `CHUNK_SIZE` | 16 | Blocks per chunk edge |
 | `T_SIZE` | 288 | Resident window edge, in blocks (18 chunks) |
-| `T_HEIGHT` | 64 | World height, blocks (4 chunks) |
+| `T_HEIGHT` | **64 or 256, runtime** | World height, blocks (4 or 16 chunks) |
 | `T_RADIUS` | 9 | Half the window, in chunks |
 | `CHUNKS_PER_SIDE` | 18 | Window edge in chunks |
-| `CHUNKS_PER_COLUMN` | 4 | Vertical chunks |
+| `CHUNKS_PER_COLUMN` | **4 or 16, runtime** | Vertical chunks |
 | `NUM_BLOCKS` | 111 | Highest block type id |
 | `BLOCK_SIZE` | 1.0f | World units per block |
 
-World height is hard-capped at 64. (The later 2.2.x App Store builds raised the build
-limit; files from those versions load here but are cut off at y=64 — see repo README.)
+## Runtime world height (2026-08-06)
+
+World height used to be hard-capped at 64 by a `#define`. It is now a **per-world runtime
+value**: 64 for every world this engine creates, 256 for a loaded `.eden` whose header
+`version` is 5 or 6 — the 256-block-tall "New Dawn" variant (see
+[eden-file-format.md](eden-file-format.md)). One binary opens both; **64z stays the default
+and costs exactly what it always cost**.
+
+`T_HEIGHT`, `T_BLOCKS`, `CHUNKS_PER_COLUMN` and `MAX_CREATURES_SAVED` are now macros over
+globals (`g_world_height`, `g_t_blocks`, `g_chunks_per_column`, `g_max_creatures_saved`), set
+by `eden_set_world_height()` / `eden_set_creature_slots()` in `Classes/Globals.mm`. Three
+rules follow, and breaking any of them is silent:
+
+1. **A fixed-size declaration cannot use them.** Use `T_HEIGHT_MAX` (256),
+   `CHUNKS_PER_COLUMN_MAX` (16) or `MAX_CREATURES_SAVED_MAX` (400) for anything whose size is
+   fixed at compile time (`creatureData[]`, `renderList[]`, `TerrainGenerator`'s `tblocks`/
+   `tcolors` scratch, the `columns[]` locals, `prepareAndLoadGeometry`'s dirty list). The
+   compiler catches this one — a VLA at file scope is an error.
+2. **The height must be set before `Terrain::allocateMemory()`**, which sizes `blockarray`,
+   `lightarray` and the chunk table from it. `World::loadWorld` does that by probing the save
+   file's header (`FileManager::probeWorldHeight`) before it allocates. A world that does not
+   exist yet answers 64, which is what makes "new worlds are 64z" true by construction.
+3. **The hot path pays for the stride, not the multiply.** `GBLOCKIDXCLEAN` uses a precomputed
+   `g_xz_stride` (`T_SIZE*g_world_height`) rather than multiplying two globals per access.
+   Measured on the load+mesh path (`tools/headless-load-timing.js`, 9 runs per build,
+   2026-08-06): median first-load 67.0 ms with runtime height vs 67.0 ms with the old literal
+   constants, and the runtime build's `eden.wasm` is 540 B **smaller**. The cost is not
+   detectable.
+
+### Memory: what a tall world actually costs
+
+Measured in `build-st` (Debug) against a real 18×18-column 256z world whose terrain reaches
+y≈250, 2026-08-06:
+
+| | menu only | 64z world resident | 256z world resident |
+|---|---:|---:|---:|
+| wasm heap | 96 MB | 128 MB | **413 MB** |
+
+The per-world arrays account for ~95 MB of that (`blockarray` 5.4 → 21.5 MB, `lightarray`
+15.9 → 63.7 MB, 1296 → 5184 chunk objects at 8 KB each); the rest is **mesh** memory, which
+scales with how much solid terrain there actually is, not with the height alone — a tall world
+that is mostly air costs much less (the flat 256z specimen sits at 248 MB). `-sINITIAL_MEMORY`
+stays at 96 MB (audit row E1's conclusion is unchanged): growth is on, and over-reserving would
+only raise the floor for the menu-only session that every player starts in. **Practical
+consequence: 256z is a desktop feature on web.** iOS Safari's per-tab ceiling is well under
+400 MB — the same constraint that produced audit row A11.
 
 ## Block identity: type + color
 
@@ -49,22 +93,23 @@ The world is conceptually huge (chunk coordinates are packed into 15 bits each b
 `twoToOne` — `Util.mm:1053` — so the addressable world is 32,768 × 32,768 chunks;
 the default world's centre sits at chunk (4096, 4096) ⇒ block ≈ 65,536).
 
-Only a **288×288×64 window around the player** is in memory, in two parallel
+Only a **288×288×`T_HEIGHT` window around the player** (64 tall normally, 256 for a v5/v6 world) is in memory, in two parallel
 structures, both indexed *modulo the window size* so absolute world coordinates can be
 used directly:
 
 1. **`block8* blockarray`** — flat type-only cache used by all hot-path reads
    (meshing, collision, lighting). Access macros in `Terrain.h:33-37`:
    ```c
-   GBLOCKIDX(x,z,y) = ((x+g_offcx)%T_SIZE)*(T_SIZE*T_HEIGHT)
-                    + ((z+g_offcz)%T_SIZE)*T_HEIGHT + y
+   GBLOCKIDX(x,z,y) = ((x+g_offcx)%T_SIZE)*g_xz_stride
+                    + ((z+g_offcz)%T_SIZE)*g_world_height + y
+   // g_xz_stride == T_SIZE*T_HEIGHT, precomputed; the height is runtime (see above)
    ```
    `g_offcx = g_offcz = T_SIZE*100` exist only to keep the `%` result positive.
    Because indexing is modular, **no data moves when the player walks** — streaming
    overwrites the cells that now map to the newly-entered columns.
    Note colors are *not* in this array; color reads go through the chunk objects.
 
-2. **`TerrainChunk** chunkTable`** — 18×18×4 = 1296 chunk objects, allocated once in
+2. **`TerrainChunk** chunkTable`** — 18×18×`CHUNKS_PER_COLUMN` = 1296 chunk objects (5184 at 256z), allocated once in
    `Terrain::allocateMemory()` (`Terrain.mm:241`) and **reused forever** (never
    freed/reallocated during play; `resetForReuse()`/`setBounds()` repurpose them).
    Indexed by the `threeToOne(cx,cy,cz)` macro (`Util.h:120`), again modulo
@@ -159,11 +204,28 @@ Doors and portals are *stored* as voxels but *rendered and animated* as extracte
    (`hit_load_counter`) shows the "Loading" status bar, then:
    - `fm->saveWorld()` (flush modified columns **before** they get overwritten!),
    - update `fm->chunkOffsetX/Z` (the render-origin rebase),
-   - `fm->readColumn(cx,cz,file)` for every stale column — from the save file if the
-     directory has it, else from the bundled default world / generator,
-   - `addMoreCreaturesIfNeeded()`, lighting rebuild (`updateLightingBegin` →
-     `calculateLighting` on the next geometry pass).
-4. Drain dirty lists → `rebuild2()` each chunk → queue VBO uploads.
+   - `updateLightingBegin()` (zero the light array; the *recompute* is deferred, below),
+   - **frame-budgeted from here on** (modified from stock, 2026-08-13 — the whole reload used
+     to happen inside this one call, a measured 104–131 ms main-thread block on a teleport or a
+     Warp Home): `bulk_reload_active` latches, and each frame spends
+     `BULK_RELOAD_CHUNK_BUDGET` (96) chunks' worth of `fm->readColumn(cx,cz,file)` —
+     **nearest-to-the-player first**, since collision reads `blockarray` directly — from the save
+     file if the directory has it, else from the bundled default world / generator. The budget is
+     in chunks rather than columns so it stays flat at 256z, where a column is 4× the bytes and
+     4× the mesh work. The file handle is reopened per slice, because an autosave in between
+     renames a `.savetmp` over it.
+   - when every column has landed *and* the meshing they dirtied has drained:
+     `addMoreCreaturesIfNeeded()`, `loaded_new_terrain`, and the lighting recompute
+     (`update_lighting` → `calculateLighting` at the tail of the same pass).
+4. Drain dirty lists → `rebuild2()` each chunk → queue VBO uploads. Two things modify this pass
+   **while a bulk reload is in flight** (and only then — an edit, an explosion and the initial
+   world load still drain in one frame): a column that has not streamed in yet is skipped, flags
+   intact, because every neighbouring column that *has* landed dirtied it and its data is about to
+   be replaced; and the same 96-chunk budget caps the pass, reusing the deferral the `list_max`
+   guard already had. The skip test asks only about the column itself, never its neighbours —
+   deferring a column whose data is already new but whose geometry is old produces a state
+   nothing else in the engine produces, and it crashed the release build intermittently. See
+   `WORKING/chunk-streaming-redesign-prompt.md` §2 for that experiment and §6 for the rollback.
 
 The old octree (`TreeNode troot`, `addToTree`, …) is vestigial: `renderTree()` says it
 plainly — "once upon a time this descended an oct-tree, profiling showed it was

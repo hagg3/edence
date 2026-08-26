@@ -94,7 +94,11 @@ Order matters and is load-bearing:
 3. `UpdateModels` (creatures) unless dead or `CREATURES_ON==false`.
 4. `player->preupdate` — **this is where input is processed and blocks are edited**.
 5. `effects->update`.
-6. `terrain->prepareAndLoadGeometry()` — streaming + chunk re-meshing (CPU).
+6. `terrain->prepareAndLoadGeometry()` — streaming + chunk re-meshing (CPU). A bulk window
+   reload (the `count>140` path) is **spread over several frames** on a fixed per-frame chunk
+   budget rather than done inside this one call — modified from stock, 2026-08-13; see
+   [world-and-terrain.md](world-and-terrain.md) "Streaming". The save that opens a reload is
+   still synchronous and still strictly before the first overwrite.
 7. `terrain->updateAllImportantChunks()` — VBO uploads (GL, main thread only).
 
 ### render() in PLAY mode (`World.mm:550`)

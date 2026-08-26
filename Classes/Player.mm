@@ -1945,7 +1945,10 @@ void Player::groundPlayer(){
     while(!checkCollision()&&pos.y>=0){
         pos.y-=1;
     }
-    while(checkCollision()&&pos.y<=100){
+    // B2: the cap used to be a literal 100 (T_HEIGHT+36 at the only height that existed). In a
+    // 256-tall world a warp target above 100 would stop searching while still inside solid blocks
+    // and leave the player embedded -- every portal/home warp comes through here.
+    while(checkCollision()&&pos.y<=T_HEIGHT+36){
         pos.y+=1;
     }
 }

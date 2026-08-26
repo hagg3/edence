@@ -30,7 +30,10 @@ class TerrainGenerator;
 class Portal;
 class Firework;
 
-#define GBLOCKIDXCLEAN(x,z,y)  ((x+g_offcx)%T_SIZE)*(T_SIZE*T_HEIGHT) + ((z+g_offcz)%T_SIZE)*T_HEIGHT + y
+// g_xz_stride is T_SIZE*T_HEIGHT precomputed (Constants.h): the world height is a runtime
+// per-world value now, and this macro is the hottest thing in the engine -- keeping the
+// x-stride as its own global costs one load instead of a multiply on every block access.
+#define GBLOCKIDXCLEAN(x,z,y)  ((x+g_offcx)%T_SIZE)*g_xz_stride + ((z+g_offcz)%T_SIZE)*g_world_height + y
 #define GBLOCKIDX(x,z,y) GBLOCKIDXCLEAN((x),(z),(y))
 #define GBLOCK(x,z,y) blockarray[GBLOCKIDX(x,z,y)]
 #define GBLOCK_SAFE(x,z,y) blockarray[(GBLOCKIDX(x,z,y)+T_BLOCKS)%T_BLOCKS]

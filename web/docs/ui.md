@@ -42,6 +42,15 @@ Keybinds are the **one deliberate exception** to "settings live in the C table":
 code, because the C settings model only stores floats. See
 [conventions-and-pitfalls.md](conventions-and-pitfalls.md) #7.
 
+**Unified surface (audit row 20/G2, 2026-08-04).** The storage split above is real and stays —
+but the panel's UI was already a single shell before this pass, contrary to the audit's pass-59
+note: `Keys` (keybinds) and `Storage` are tabs in the same rail as every schema-driven group. The
+actual gap was that there was no *shared* reset — only the Keys tab had one. Added
+`eden_settings_reset_all()` (loops `kSettings[]`, resets each row via the existing
+`eden_settings_set`) and a `Reset` tab (`renderResetBody` in `eden-settings.js`) whose one
+confirm-guarded button calls that plus `window.EdenKeybinds.resetDefaults()`, then re-renders —
+one reset, for both halves, in the tab list every other setting already lives in.
+
 `NSUserDefaults` itself is localStorage-backed
 (`src/shim/foundation/NSUserDefaults.mm`) — NSNumber/NSString only, namespaced under
 `eden.prefs.`, guarded so headless (`node eden.js`, no `localStorage`) degrades to an
@@ -77,6 +86,36 @@ Why a hook and not a `--wrap`: the `renderMenuScreen()` call is **intra-TU** (bo
 `Hud::render` live in `Hud.mm`), so the compiler resolves it directly and the linker never
 sees a symbol to wrap. Why a hook and not a plain `bool` on `Hud`: then there is no flag for
 anyone to keep in sync — the answer is recomputed at the one moment it is needed.
+
+**"Move Controls" (audit row 17/G1, touch profile only).** The joystick pad
+(`Classes/Joystick.mm`'s `padbounds`) was not repositionable — a grep for `draggable`/`drag`
+across the port found nothing, and neither did a re-check confirming the same for this pass.
+Fixed as an explicit, opt-in mode rather than an ambiguous long-press during normal play: the
+button (visible only when `eden_effective_input_is_touch()`) hides this panel, calls
+`window.EdenJoystickCustomize.start()` (`eden-input.js`), and shows a floating "Done" button.
+While active, `Classes/Joystick.mm`'s `joystickCustomizeMode` flag makes `Joystick::update`
+no-op entirely (see player-input-camera.md), so there is no real joystick input to fight; the
+SAME touch/mouse pipeline `eden-input.js` already has for gameplay is reused to drag the pad
+(`toEnginePoint()`, already there for touch->engine coordinate mapping), clamped to stay
+on-screen against the live `ENGINE_WIDTH`/`HEIGHT`. The result persists to
+`localStorage['eden.prefs.joystick_pos']` (same `eden.prefs.` family as the hotbar/keybinds) and
+is restored on boot once `eden_settings_loaded()` is true (`eden-st.html`'s `trackCursorNeed`,
+same gate `applyDisplayMode()`'s own restore uses) via `eden_joystick_set_origin`
+(`web/src/seam/Input_web.mm`). Mouse-driven dragging works too (desktop testing without a phone),
+gated the same way as the touch path.
+
+**Live-browser bug (found and fixed 2026-08-04):** `Joystick::render()` draws two rects —
+`padbounds` (the translucent ring) and `joystick_pos` (the solid knob). `eden_joystick_set_origin`
+originally moved only `padbounds`. `joystick_pos` is only ever reset to `default_pos`
+(`Classes/Joystick.mm`'s ctor: a fixed rect that happens to equal `padbounds`'s original (20,20)
+because both start the same size, not because anything keeps them linked), and `Joystick::update`'s
+"no touch active" branch re-snaps it to that stale `default_pos` every frame — including after
+"Done", since normal play immediately starts calling `update()` again. Net effect: drag the pad,
+and the knob stays glued to the OLD spot forever, permanently split from the ring it's supposed to
+sit inside. `eden_joystick_set_origin` now moves `padbounds`, `default_pos`, AND `joystick_pos`
+together, restoring the ctor's implicit invariant. This class of bug — something that only shows up
+as two controls silently drifting apart on screen — is exactly why this feature's audit row kept
+saying "needs a live-browser pass"; headless/static checks had no way to catch it.
 
 Layout: a shrink-to-fit dialog (`.eden-window--fit`) whose width is set by its content
 rather than the 460u dialog default, with left-aligned icon+label rows
@@ -147,6 +186,16 @@ Real DOM dialogs (`EM_ASM`) replace what used to be auto-answer stubs:
   `-alertView:clickedButtonAtIndex:` delegate semantics, factored through a generic
   `eden_js_alert_dialog()` helper reused for other confirms.
 
+**Both overlays must stack above `--eden-z-menu` (25) and `--eden-z-panel` (30)** — they use
+`var(--eden-z-alert,40)`. They were a hard-coded `z-index:20` until 2026-08-06, i.e. *under* the
+DOM menu, and for the world-type dialog that was not cosmetic but a hang: `Menu::render()`'s
+`loading` ladder parks at 3 until the dialog is answered, so an invisible, unclickable modal
+means the game sits on "Loading world… 0%" forever with no way out. Reported by the user,
+reproduced in real Safari (`document.elementFromPoint` over both buttons returned the menu's
+`DIV.eden-stack`, not the buttons), fixed by moving both onto the design system's z-scale.
+**Anything new that parks engine state on a DOM answer belongs on that scale too** — never a
+literal z-index.
+
 `Alert.mm` itself stays seam-excluded (see [networking.md](networking.md)) — its
 delegate *semantics*, not its implementation, are what's preserved.
 
@@ -204,6 +253,13 @@ Two behaviours worth knowing:
   which the port implements as a deliberate no-op (not confirming a destructive prompt is
   the safe default with no dialog), so the engine's own Delete button has never deleted
   anything on web. The DOM screen confirms in the DOM, then calls `a_deleteConfirm()`.
+- **Height format is asked the same way, up front** (2026-08-26, 256z Stage 3 item 4). "Legacy
+  64z" / "New Dawn 256z" is a real segmented control now (it used to have a `placeholder` 256z
+  button, "not implemented in this build"). Same one-shot parking pattern as world type:
+  `eden_menu_set_pending_world_height` (`Menu_web.mm`) is consumed by
+  `FileManager::probeWorldHeight` — not a seam file, since that function already decides a
+  not-yet-existing world's height — the moment the created world is actually played. 64z stays
+  the default; nothing sets 256 unless this screen explicitly picked it.
 
 The **`legacy_menu`** setting (Interface group, labelled "Legacy UI") turns the overlay off,
 revealing the original 2010 GL menu underneath, fully functional. For the MAIN menu "legacy"
@@ -287,7 +343,7 @@ P_ASPECT_RATIO = SCREEN_WIDTH / SCREEN_HEIGHT        # ALWAYS derived — see be
   inside `if(IS_WIDESCREEN)`, leaving the other branch on an iPad 4:3 default that matched no live
   layout. This always derives it. (iPad's own 4:3 branch is *not* resurrected — it is commented out
   in the original and never drove a live layout on any device. See
-  [`../../WORKING/aspect-ratio-toggle-scope.md`](../../WORKING/aspect-ratio-toggle-scope.md).)
+  [`../../WORKING/archive/aspect-ratio-toggle-scope.md`](../../WORKING/archive/aspect-ratio-toggle-scope.md).)
 
 Engine-side, this needed `Hud::layoutForScreen()` / `Menu::layoutForScreen()` (rect math lifted out
 of the constructors so it can run more than once, and kept idempotent) and

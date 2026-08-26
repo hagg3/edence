@@ -3,14 +3,19 @@
 // (perf-audit-dazzling-munching-bengio.md row 10 / Q8: "python3 -m http.server sends no
 // Cache-Control and no compression").
 //
-// Deliberately NOT "far-future immutable caching on content-hashed filenames" (Q8's fuller
-// recommendation) — eden.wasm/eden.data/Eden.eden are unhashed, literal filenames the Emscripten
-// glue (eden.js) and eden_default_world.pre.js both reference directly, and RESUME-HERE's own
-// workflow ("serve on a FRESH PORT after a rebuild") depends on being able to force a refetch by
-// changing the origin. Adding content-hashing would need a build-time rename/rewrite step —
-// bigger than this row's scope, left as future work if it's ever picked up.
+// Serving public/build-st/build-rel DIRECTLY (the normal dev loop) still gets no far-future
+// caching on purpose: those filenames are unhashed literals the Emscripten glue (eden.js) and
+// eden_default_world.pre.js reference directly, and RESUME-HERE's workflow ("serve on a FRESH
+// PORT after a rebuild") depends on being able to force a refetch by changing the origin —
+// content-hashing them would fight that. Audit row 15/B6's far-future-immutable-caching
+// recommendation is real, though, just scoped to a build-time rename/rewrite step
+// (`tools/build-dist.js`) rather than this dev server: point this same server at the assembled
+// `dist/` tree (`node tools/build-dist.js && node tools/serve.js 8123 dist`) and every
+// content-hashed filename it produced gets `immutable, max-age=31536000` below, while
+// eden-st.html/index.html (never hashed, so a load always discovers current hashed names) keep
+// the no-cache/revalidate path.
 //
-// What this DOES give, safely, without touching that workflow:
+// What this DOES give unconditionally, safely, without touching the dev workflow:
 //   - Brotli (falls back to gzip, falls back to identity) compression of text/wasm/binary assets,
 //     computed once and cached in memory — cuts the ~69 MB cold-start transfer noticeably (Eden.eden
 //     is RLE'd but not entropy-coded, so it compresses further; eden.wasm's DWARF-free Release
@@ -29,9 +34,10 @@
 //     confirm freshness (compatible with "serve on a fresh port after a rebuild" — a fresh origin
 //     has no cache entries to revalidate against anyway), never a silently stale asset.
 //
-// Usage: node tools/serve.js [port] [root]
+// Usage: node tools/serve.js [port] [root] [--no-coi]
 //   node tools/serve.js 8123        # from web/, same working directory python3 -m http.server needs
 //   node tools/serve.js 8123 public # serve public/ as the root, e.g. http://localhost:8123/eden-st.html
+//   node tools/serve.js 8123 --no-coi   # withhold COOP/COEP: reproduce a header-less host
 
 'use strict';
 const http = require('http');
@@ -40,8 +46,17 @@ const path = require('path');
 const zlib = require('zlib');
 const crypto = require('crypto');
 
-const PORT = parseInt(process.argv[2], 10) || 8123;
-const ROOT = path.resolve(process.argv[3] || '.');
+const ARGS = process.argv.slice(2);
+// Audit row 36/C1 pass 65: `--no-coi` withholds the two cross-origin-isolation headers below, so
+// this server behaves like GitHub Pages (which cannot send them). That is the ONLY way to
+// exercise public/eden-coi.js + service-worker.js's header synthesis locally — with the headers
+// present the shim correctly does nothing, so a test run against the default mode proves nothing
+// about the deploy path. Not a "break the server" switch: everything else is unchanged.
+const NO_COI = ARGS.includes('--no-coi');
+const POSITIONAL = ARGS.filter((a) => !a.startsWith('--'));
+
+const PORT = parseInt(POSITIONAL[0], 10) || 8123;
+const ROOT = path.resolve(POSITIONAL[1] || '.');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -76,6 +91,18 @@ function pickEncoding(acceptEncoding) {
 // Only worth compressing compressible content; skip already-lossy media.
 function shouldCompress(ext) {
   return ['.html', '.js', '.mjs', '.css', '.json', '.wasm', '.data', '.eden', '.svg'].includes(ext);
+}
+
+// Audit row 15/B6: `tools/build-dist.js` content-hashes eden.wasm/eden.js/eden.data and the
+// public/*.js + *.css eden-st.html references (name.<10-hex-sha256>.ext) when assembling dist/ —
+// a filename matching this pattern is content-addressed by construction, so it is always safe to
+// cache forever; a rebuild that changes bytes mints a new name rather than reusing this one.
+// Files served straight out of public/ during normal dev (unhashed, per this file's own header
+// above) never match and keep the no-cache/revalidate behaviour untouched.
+const HASHED_ASSET_RE = /\.[0-9a-f]{10}\.(?:js|mjs|css|wasm|data)$/;
+
+function isHashedAsset(filePath) {
+  return HASHED_ASSET_RE.test(filePath);
 }
 
 function getCompressed(filePath, stat, encoding, raw) {
@@ -123,13 +150,48 @@ const server = http.createServer((req, res) => {
     const ext = path.extname(filePath).toLowerCase();
     const etag = '"' + crypto.createHash('sha1').update(filePath + ':' + stat.mtimeMs + ':' + stat.size).digest('hex').slice(0, 16) + '"';
 
-    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    res.setHeader('Cache-Control', isHashedAsset(filePath)
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache, must-revalidate');
     res.setHeader('ETag', etag);
     res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
     // Byte serving, required by the lazy Eden.eden FS node (perf-audit row 9 —
     // src/seam/js/eden_default_world.pre.js probes for this and silently falls back to fetching
     // the whole 52 MB file if it's missing, which is exactly what python3 -m http.server does).
     res.setHeader('Accept-Ranges', 'bytes');
+
+    // ---- Cross-origin isolation (audit row 36/C1, pass 63) --------------------------------
+    // `SharedArrayBuffer` — which IS the wasm memory in a -pthread build — is only exposed to a
+    // cross-origin-ISOLATED document, and a document is only isolated if it was served with BOTH
+    // of these. Without them `cmake --build build-thr` produces a module that fails at
+    // instantiation with a bare "SharedArrayBuffer is not defined", which reads as a build
+    // problem and is a hosting problem.
+    //
+    // Sent UNCONDITIONALLY rather than only for the threaded build, on purpose: this server has
+    // no idea which build tree the page will pull eden.js from (the ?build= query picks it
+    // client-side), so gating would mean guessing. The cost to the single-threaded build is that
+    // this origin can no longer embed a cross-origin subresource that neither carries CORP nor
+    // passes a CORS check. This port has exactly one cross-origin dependency and it is fine:
+    // public/eden-worldbrowser.js `fetch()`es the edenarchive manifest/worldfiles from
+    // hagg3.github.io, in CORS mode, and that host sends `Access-Control-Allow-Origin: *`
+    // (re-checked 2026-08-05) — a passing CORS check satisfies require-corp on its own. It sends
+    // no `Cross-Origin-Resource-Policy`, so a NO-CORS load of the same host (an `<img>` world
+    // thumbnail, say) would NOT survive isolation. Everything else is same-origin: eden.js/wasm/
+    // data, public/*, the audio and Eden.eden symlinks.
+    //
+    // COEP `require-corp` rather than `credentialless`: credentialless has weaker browser
+    // coverage (no Safari) and buys nothing here, per the paragraph above.
+    //
+    // NOTE FOR DEPLOYMENT — GitHub Pages cannot send these. There is no `_headers` support and no
+    // way to set response headers on a Pages site, which is the same limitation audit row 15/B6
+    // already documented for Cache-Control. Pass 65 solved that in the page instead of by moving
+    // hosts: the service worker synthesises both headers on the navigation response for a
+    // `?build=thr` URL (see service-worker.js's COI section and public/eden-coi.js). Run this
+    // server with `--no-coi` to withhold the real headers and exercise that path.
+    if (!NO_COI) {
+      res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    }
 
     if (req.headers['if-none-match'] === etag) { res.writeHead(304); res.end(); return; }
     if (req.method === 'HEAD') { res.setHeader('Content-Length', stat.size); res.writeHead(200); res.end(); return; }
@@ -175,4 +237,8 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[serve] ${ROOT} -> http://localhost:${PORT}/  (Brotli/gzip + ETag revalidation)`);
+  console.log(NO_COI
+    ? '[serve] --no-coi: NOT sending COOP/COEP — reproducing a header-less host (GitHub Pages). ' +
+      '?build=thr must get its isolation from the service worker (public/eden-coi.js).'
+    : '[serve] sending COOP/COEP (cross-origin isolation) — ?build=thr can use SharedArrayBuffer.');
 });

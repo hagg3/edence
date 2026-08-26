@@ -3,7 +3,11 @@
 // Backs the Settings panel's "Storage" tab (public/eden-settings.js). Two exports:
 //   * eden_storage_list_worlds() — JSON array of every world file in Documents, with the real
 //     display name (reused from FileManager::getName, the exact lookup Menu::loadWorlds uses —
-//     see docs/save-load.md) plus size/mtime from stat().
+//     see docs/save-load.md) plus size/mtime from stat() and each world's real height (64 or 256,
+//     via FileManager::probeWorldHeight -- added so eden-menu.js's Load World list stops
+//     hardcoding "64z" now that 256z worlds can exist locally, and so the panel can warn about
+//     the ~4x memory a 256z world costs once loaded, per archive/project-audit-2026-07-30.md's pass-67
+//     follow-up item).
 //   * eden_storage_delete_world_at(index) — INDEX into that same list, not a filename string, same
 //     convention as Settings_web.mm's eden_settings_set(i, v): passing a C string in from JS would
 //     need _malloc/_free added to the export list, and the JS already has the index from the row
@@ -93,6 +97,13 @@ const char* eden_storage_list_worlds(void) {
             bytes = (long long)st.st_size;
             mtimeMs = (long long)st.st_mtime * 1000LL;
         }
+        // 256z ("New Dawn") worlds cost ~4x the resident memory of a 64z world once loaded (the
+        // per-world arrays scale with T_HEIGHT) -- surfaced here so the JS layer can label/warn
+        // about them before the player hits the load-time memory ceiling, not after. Reuses the
+        // same header peek World::loadWorld already does before allocateMemory(); a fromArchive
+        // value doesn't matter here (see probeWorldHeight's own header -- it ignores the flag
+        // except for an existence check we've already passed via the directory scan).
+        int height = fm->probeWorldHeight(file_name, FALSE);
 
         if (!first) buf += ",";
         first = false;
@@ -100,8 +111,8 @@ const char* eden_storage_list_worlds(void) {
         jsonEscape(buf, [file_name UTF8String]);
         buf += ",\"name\":";
         jsonEscape(buf, nameC);
-        char nbuf[64];
-        snprintf(nbuf, sizeof(nbuf), ",\"bytes\":%lld,\"mtime\":%lld}", bytes, mtimeMs);
+        char nbuf[80];
+        snprintf(nbuf, sizeof(nbuf), ",\"bytes\":%lld,\"mtime\":%lld,\"height\":%d}", bytes, mtimeMs, height);
         buf += nbuf;
     }
     buf += "]";
@@ -143,6 +154,48 @@ int eden_storage_delete_world_at(int index) {
 EMSCRIPTEN_KEEPALIVE
 void eden_storage_reload_worlds(void) {
     if (World::getWorld && World::getWorld->menu) World::getWorld->menu->loadWorlds();
+}
+
+// 256z Stage 3 item 5: "Convert to 64z" (space reclaim). INDEX into the same scan as the two
+// exports above, same convention. Runs FileManager::convertWorldTo64() (Classes/FileManager.mm —
+// a from-scratch port of web/tools/eden-convert.js's --to-64 direction over NSFileHandle instead
+// of Node's fs) and returns one JSON object describing what happened, so the Storage tab can show
+// the same kind of report the CLI tool prints. Re-runs Menu::loadWorlds() on success for the same
+// reason eden_storage_delete_world_at does: the in-game picker must not show a stale height.
+EMSCRIPTEN_KEEPALIVE
+const char* eden_storage_convert_to_64z_at(int index) {
+    static std::string buf;
+    buf = "{\"ok\":false,\"error\":\"no such world\"}";
+    if (index < 0 || !World::getWorld || !World::getWorld->fm) return buf.c_str();
+    NSArray* names = eden_storage_scan(NULL);
+    int seen = 0;
+    NSString* target = nil;
+    int n = (int)[names count];
+    for (int i = 0; i < n; ++i) {
+        NSString* file_name = [names objectAtIndex:i];
+        if (!eden_storage_is_world_file(file_name)) continue;
+        if (seen == index) { target = file_name; break; }
+        seen++;
+    }
+    if (!target) return buf.c_str();
+
+    ConvertTo64Report r = World::getWorld->fm->convertWorldTo64(target);
+    if (r.ok && World::getWorld->menu) World::getWorld->menu->loadWorlds();
+
+    buf = "{\"ok\":";
+    buf += r.ok ? "true" : "false";
+    buf += ",\"error\":";
+    jsonEscape(buf, r.error);
+    char nbuf[256];
+    snprintf(nbuf, sizeof(nbuf),
+             ",\"columns\":%d,\"blocksDiscarded\":%d,\"columnsAffected\":%d,\"doorsOrphaned\":%d,"
+             "\"creaturesDropped\":%d,\"creaturesRelocated\":%d,\"creaturesOverflow\":%d,"
+             "\"posClamped\":%s,\"homeClamped\":%s}",
+             r.columns, r.blocksDiscarded, r.columnsAffected, r.doorsOrphaned,
+             r.creaturesDropped, r.creaturesRelocated, r.creaturesOverflow,
+             r.posClamped ? "true" : "false", r.homeClamped ? "true" : "false");
+    buf += nbuf;
+    return buf.c_str();
 }
 
 }  // extern "C"

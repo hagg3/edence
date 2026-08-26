@@ -330,6 +330,11 @@ void World::loadWorld(NSString* name){
         
         doneLoading=1;
         Resources::getResources->stopMenuTune();
+        // The world's HEIGHT has to be known before allocateMemory() sizes blockarray/lightarray
+        // and the chunk table, and the only place it is written down is the save file's header.
+        // Probe it here (a 96-byte read of a file we are about to open anyway); a world that does
+        // not exist yet is 64z, which is what makes "new worlds stay 64z" true by construction.
+        eden_set_world_height(fm->probeWorldHeight(name,TRUE));
         if(LOW_MEM_DEVICE){
             menu->deactivate();
             

@@ -91,7 +91,7 @@ Desktop Chrome/Safari tolerated this; **iOS/iPadOS Safari did not** — it faile
 boot got just far enough to release the run dependency before the tab was killed — a
 live WebGL2 context with a permanently black canvas at frame 0 (`World::update` never
 ticking because `main()` was still blocked). This is exactly the "iOS Safari will
-terminate the tab well before desktop does" risk `WORKING/project-audit-2026-07-30.md`
+terminate the tab well before desktop does" risk `WORKING/archive/project-audit-2026-07-30.md`
 flags generally (D2) — this was a concrete, now-fixed instance of it, not the same bug
 as A2's per-frame autorelease-pool ramp (that's a slow climb over a session; this was a
 single large spike during boot).
@@ -147,9 +147,45 @@ A **Storage tab** (`src/seam/Storage_web.mm` + `public/eden-settings.js`) lists 
 deletes saved worlds. Listing re-derives names/sizes each call via
 `FileManager::getName` + `stat()` over the documents directory (index-based delete,
 chosen to avoid needing `_malloc`/`_free` exports across the JS boundary); deletion
-reuses `FileManager::deleteWorld` verbatim — no reimplementation.
+reuses `FileManager::deleteWorld` verbatim — no reimplementation. Each row also carries
+a `height` field (`FileManager::probeWorldHeight`, the same header peek
+`World::loadWorld` does before sizing arrays) — 64 or 256 — which both this tab and
+`eden-menu.js`'s Load World list use to label 256z ("New Dawn") worlds correctly and to
+show a memory-footprint warning before playing one; see
+[world-and-terrain.md](world-and-terrain.md)'s "A 256z world costs 413 MB of wasm heap".
+
+The Storage tab also offers a **"Convert to 64z"** action (2026-08-26, 256z Stage 3 item 5) on any
+row with `height===256`, via `eden_storage_convert_to_64z_at` (same index convention as delete) ->
+`FileManager::convertWorldTo64` (`Classes/FileManager.mm`). That function is a from-scratch C++
+restatement of `web/tools/eden-convert.js`'s `--to-64` algorithm over `NSFileHandle` — a browser
+has no Node to shell out to the CLI tool, so the byte-surgery logic is duplicated by hand rather
+than shared; keep the two in sync if the format's rules ever change. Same temp+rename atomicity as
+`saveWorld()` (writes to `<file>.64zconv`, only replaces the original after a full successful
+write), and refuses outright if the target is the world currently open in this session. Regression
+test: `tools/headless-256z-authoring-test.js` (also covers the New World height picker below).
 
 ## Durability hardening
+- **Two save strategies, chosen by file size** (2026-08-25, 256z Stage 3 / B5). Below
+  `g_save_inplace_threshold` (`Classes/Constants.h`, 16 MiB) nothing changed: the save is built
+  in a `.savetmp` whole-file scratch copy and committed by one rename. At or above it the save
+  writes the world file in place behind a small `.savejrnl` rollback journal. The full design,
+  the failure it trades away, and the recovery path are in
+  [`../../docs/save-load.md`](../../docs/save-load.md) — they are engine-level, not web-specific.
+  What is **web**-specific is why the threshold has to exist at all:
+  - The `copyItemAtPath:` shim reads the whole file into an `NSData` (a `std::vector<uint8_t>`) —
+    i.e. a **transient wasm-heap allocation the size of the world**, on a 32-bit heap that this
+    build grows from 96 MB and that a loaded 256z world already occupies ~413 MB of. A
+    multi-gigabyte world cannot be saved that way at all, at any speed.
+  - MEMFS is JS-heap, so every copy is also a second full-size resident copy, and IDBFS's
+    `{autoPersist:true}` then has to push whatever changed into IndexedDB against a finite quota.
+  - Measured with `tools/headless-save-io-probe.js` against a real 279 MB 256z specimen, saving
+    with **nothing edited**: 558 MB read + 558 MB written per save before, 127 KB read +
+    83 KB written after. Three whole-file copies were involved, not one — `copyItemAtPath:`,
+    plus the `.savetmp.bak` slot below.
+  - Above the threshold the port therefore also stops maintaining the whole-file backup slot and
+    reclaims any stale one (see the next bullet); `eden-loaderror.js`'s Restore action has
+    nothing to offer for such a world, by design, because the journal covers the failure it
+    existed for and a permanently-stale second copy of a gigabyte world is not a fair trade.
 - `NSFileHandle`'s `-writeData:` now `fflush()`s, so a later `flushNow()`-style sync
   can't silently persist a stdio-buffered/stale file to IndexedDB.
 - `+fileHandleForWritingAtPath:` copies the existing file to a `.bak` sibling before
@@ -163,7 +199,10 @@ reuses `FileManager::deleteWorld` verbatim — no reimplementation.
   last-known-good `.bak` with the corrupt bytes, before the length check even ran.
   The atomic-rename save path's genuine writes into its own `.savetmp` scratch copy
   (also opened via `fileHandleForUpdatingAtPath:`) still get a backup, unchanged —
-  only a pure read-then-close is now exempt. The pending-backup path is stored as a
+  only a pure read-then-close is now exempt. As of 2026-08-25 the backup is **also** skipped for
+  any file at or above `g_save_inplace_threshold`, because it is itself a whole-file copy and
+  was firing on the same save as `saveWorld`'s scratch copy (that is the third of the three
+  full-size copies the I/O probe found). The pending-backup path is stored as a
   plain `strdup`'d C string ivar, not a retained `NSString*` — see the comment in
   `NSFileHandle.mm` for why (this class's ivar-offset layout was only ever measured
   with one own ivar, and adding an ObjC-object ivar hit a real, reproducible "function

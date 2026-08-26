@@ -11,10 +11,10 @@
 // The only way to give `EAGLView` web-appropriate behavior is therefore to provide a NEW
 // @implementation of the SAME @interface declared in that untouched header — not to shadow or
 // fork the header. This is the pattern to replicate for Texture2D/FileManager/
-// SimpleAudioEngine/etc. when their turn comes (P2/P4/P5) — see PORT-STATUS.md.
+// SimpleAudioEngine/etc. when their turn comes (P2/P4/P5) — see archive/PORT-STATUS-2026-08-13.md.
 //
 // STATUS: skeleton only. Every method is a real, minimal implementation or a clearly marked
-// TODO; nothing here has been compiled (no emcc on this machine, see PORT-STATUS.md).
+// TODO; nothing here has been compiled (no emcc on this machine, see archive/PORT-STATUS-2026-08-13.md).
 // Framebuffer setup is deferred entirely to Stage P2 ("GL surface + fixed-function shim +
 // first frame") — this file's job for P1 is just to make `EAGLView` exist as a type and to
 // start the touch-forwarding path into Input.mm (Stage P3) once one exists.

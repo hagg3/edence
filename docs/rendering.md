@@ -146,6 +146,35 @@ compile-time disabled.
 optimization. Chunks failing entirely are skipped; there is no hierarchy (octree
 removed).
 
+## Object batch upload (perf-audit row 23/E3, 2026-08-06)
+Doors, golden cubes, portal frames, portal swirls and flowers are still rebuilt on the
+CPU every frame (animation — door swing, cube rotation, portal UV swirl, flower
+billboard yaw — is unavoidable), but each batch now owns a persistent
+`GL_DYNAMIC_DRAW` buffer (`Terrain.mm`: `ObjectBatch`/`objBatchStage`/`objBatchDraw`,
+`g_doorBatch`/`g_goldenBatch`/`g_portalBatch`/`g_swirlBatch`/`g_flowerBatch`) instead of
+filling a stack-local `vertexObject objVertices[]` and handing GL four client-side
+array pointers. The frame still fills a staging array exactly as before; the change is
+one `glBufferSubData` upload per batch (growing via `glBufferData` in power-of-two
+steps) instead of the GL shim silently re-uploading all four client arrays' worth of
+the same bytes per draw (`gl_es1_shim.cpp`, `eden_gl_setup_attributes` — client-side
+vertex data isn't legal in WebGL). One buffer per batch, not a shared one — a shared
+buffer would make its `glBufferSubData` a write the previous batch's draw is still
+reading (driver sync stall each batch); five small elidable rebinds cost less than
+that. Measured live in Safari (`web/tools/safari-objbatch-probe.js`, 24 doors + 24
+golden cubes + 24 portals + 144 flowers): upload traffic dropped from 47
+`glBufferData`/frame, 756.5 KB/frame (44.3 MB/s @ 60fps) to 8 `glBufferData` + 5
+`glBufferSubData`/frame, 176.6 KB/frame (10.3 MB/s) — a 4.3× drop.
+
+This also retired three latent stack-overrun bugs the old fixed `max_render_objects*6*6`
+(10800-vertex) array had: golden cubes emit 144 vertices each (76 visible cubes
+overran it), flowers emit 6 each against `MAX_FLOWERS=10000` (1801 visible overran
+it), and `doorso`/`portalso` were unbounded writes into 500/200-entry stack arrays
+(now clamped). The new staging arrays `realloc` to fit and return `NULL` on failure
+rather than lying — every call site guards its loop with `objVertices&&`.
+
+Instancing for the non-animated subset (portal frames, which reuse regular cube
+geometry) is a separate future item (row 24/C2, WebGL2) — not done here.
+
 ## Performance characteristics & knobs
 - Meshing a chunk is O(4096·faces); a full window re-mesh (~1296 chunks) happens on
   load and on lighting changes — this is the main hitch source.
@@ -158,9 +187,9 @@ removed).
 ## Common pitfalls
 - Terrain vertex positions are shorts in quarter-block units — forgetting the ×4/×0.25
   produces subtly misplaced geometry.
-- All object batches allocate `vertexObject objVertices[300*36]` **on the stack**
-  (~470 KB each in `render` and `render2`). Increasing `max_render_objects` risks
-  stack overflow.
+- Object batches used to allocate `vertexObject objVertices[300*36]` on the stack;
+  since row 23/E3 (2026-08-06) they're heap-backed persistent VBOs (`ObjectBatch`,
+  above) that `realloc` to fit, so this is no longer a stack-overflow risk.
 - GL state leaks easily: every pass assumes the previous one restored texture-matrix
   scale, fog, blend, and client arrays. Match every `glScalef` on `GL_TEXTURE` with
   its inverse (the code does this manually, e.g. `Terrain.mm:3299`).

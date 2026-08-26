@@ -501,6 +501,18 @@ void eden_settings_set(int i, float v) {
     eden_persist_setting(i);
 }
 
+// Audit row 20/G2 (unify settings + keybinds): the two persistence systems (this C table vs.
+// eden-keybinds.js's own localStorage blob) stay split on purpose — a JS float can't hold a
+// code->action map — but that split had left the SURFACE fragmented too: no single "reset
+// everything" existed anywhere (only the Keys tab's own local reset), which is the fragmentation
+// the audit's row actually complains about, not the storage split itself. This is the engine-side
+// half of one shared reset; eden-settings.js's new "Reset" tab calls this AND
+// window.EdenKeybinds.resetDefaults() together, then re-renders once.
+EMSCRIPTEN_KEEPALIVE
+void eden_settings_reset_all(void) {
+    for (int i = 0; i < kSettingCount; ++i) eden_settings_set(i, kSettings[i].def);
+}
+
 // Convenience for the port's own keyboard shortcuts (B, F): keeps the key and the panel in sync
 // instead of each writing its own copy of the state. Index-based, NOT key-based, deliberately —
 // passing a C string in from JS would need `_malloc`/`_free` added to the export list, and the JS

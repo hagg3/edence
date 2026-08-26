@@ -82,4 +82,15 @@ const char* eden_console_world_stats(void) {
     return buf;
 }
 
+// getblock x z y -- Terrain's own (x,z,y) order, the read counterpart of eden_console_setblock.
+// Returns the block TYPE at that coordinate, or -1 for "outside the world" (which the engine also
+// uses for out-of-range y, so a 256z world reporting -1 at y=200 is exactly the regression this
+// exists to catch). Added for tools/headless-256z-test.js: reading a block back is the only way to
+// prove a tall column was decoded into the right band from a script.
+EMSCRIPTEN_KEEPALIVE
+int eden_console_getblock(int x, int z, int y) {
+    if (!World::getWorld || !World::getWorld->terrain) return -1;
+    return World::getWorld->terrain->getLand(x, z, y);
+}
+
 } // extern "C"

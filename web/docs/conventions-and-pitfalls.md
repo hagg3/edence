@@ -6,7 +6,7 @@ first (legacy iOS documentation, but the conventions themselves are current) —
 struct rules all apply unchanged. They now apply to *you* as well as to the engine:
 since the never-edit-`Classes/` rule was retired (2026-07-25) you can be the one violating
 them. This file only adds the port's *own* traps, learned the hard way across many passes
-and recorded in full in `../../WORKING/PORT-STATUS.md`'s "distilled hard-won knowledge"
+and recorded in full in `../../WORKING/archive/PORT-STATUS-2026-08-13.md`'s "distilled hard-won knowledge"
 section — this is the durable summary of that.
 
 ## Editing engine code
@@ -69,10 +69,12 @@ load-bearing (save-before-stream, edit-before-mesh, mesh-before-upload).
 
 ## Where a root-doc rule needs a web amendment
 - **Threading**: root says "all GL work on the main thread; the only other thread is
-  the world-load pthread." On web, the actually-used build (`build-st`) is
-  single-threaded end to end — there is no separate load thread; a threaded build
-  variant exists but needs COOP/COEP + OffscreenCanvas + SharedArrayBuffer and is
-  browser-only (not the one exercised day to day). See
+  the world-load pthread." On web, the default build (`build-st`) is single-threaded end
+  to end — there is no separate load thread at all (`src/seam/pthread_sync_web.c` runs
+  the load routine inline). `-DEDEN_THREADED=ON` (`build-thr`) restores exactly root's
+  arrangement — one real world-load thread, everything else including all GL on the main
+  thread — and needs a cross-origin-isolated page for its `SharedArrayBuffer` memory. It
+  does **not** use OffscreenCanvas; that plan was dropped in pass 63. See
   [build-and-toolchain.md](build-and-toolchain.md).
 - **On-disk structs**: still raw-memcpy'd, still must never be reordered/resized —
   but now also flowing through IDBFS persistence, not just the native filesystem. See

@@ -10,7 +10,13 @@ Touch handling, the block-pick raycast, player physics/collision, and the camera
 - `Classes/Util.mm` — `findWorldCoords` raycast, SAT polyhedra collision
   (`collidePolyhedra`, `makeBox/makeRamp/makeSide`), math helpers.
 - `Classes/Camera.mm` — view matrix.
-- `Classes/Joystick.mm` — virtual stick used by the HUD.
+- `Classes/Joystick.mm` — virtual stick used by the HUD. `padbounds` (the pad's screen rect) is a
+  plain global, mutable from outside this file; the web port's "move controls" feature (audit row
+  17/G1, `web/src/seam/Input_web.mm`'s `eden_joystick_*` exports) sets it from a drag gesture.
+  `joystickCustomizeMode` (also global, default false) makes `Joystick::update` no-op entirely —
+  no movement input, no `joystick_pos` tracking — while that feature has this on, so a
+  repositioning drag can never fight real gameplay touch handling; `render()` is unaffected, so the
+  pad stays visible (wherever it currently is) while customize mode is on.
 
 ## Input layer (`Input.mm`)
 `EAGLView` forwards `touchesBegan/Moved/Ended/Cancelled` to the `Input` singleton,
@@ -65,7 +71,7 @@ results — callers read them immediately after the call.
     a prior version of this doc claimed one; verified against the code during the
     web port's PC-controls audit, 2026-07, and no such mechanism exists. The edit
     fires only on `M_RELEASE`, one block per down/up pair. The web port adds a real
-    hold-to-repeat itself, as a port-side feature — see WORKING/PORT-STATUS.md.)
+    hold-to-repeat itself, as a port-side feature — see WORKING/archive/PORT-STATUS-2026-08-13.md.)
   - **Auto-rejump** (hold jump to bhop): `Player.mm:897-917`'s re-trigger gate is
     `lastjump != TRUE && !jumping` — `lastjump` is assigned from `jumping` at the
     END of the previous frame (`:917`), not from the jump button, so holding jump
@@ -75,7 +81,7 @@ results — callers read them immediately after the call.
     no separate mechanism was needed. The 2-frame gap costs lateral speed (ground
     friction `×0.9` plus the jump's own `vel.x*=.9` lateral tax, `:908-911`, apply
     during it), so chained hops decay rather than build; the web port's opt-in
-    "advanced movement" setting removes that cost (see PORT-STATUS.md) without
+    "advanced movement" setting removes that cost (see archive/PORT-STATUS-2026-08-13.md) without
     touching this file.
   - Creature interactions: tapping a creature in pick mode grabs it
     (`PickupModel`), tap again places (`PlaceModel`); paint mode colors it
@@ -97,6 +103,11 @@ results — callers read them immediately after the call.
   calls `Portal::enterPortal`, which finds the *next portal of the same color* and
   returns its position+exit direction; travel is a `warpToPoint` (save+reload) if the
   destination is outside the resident window.
+- **`groundPlayer()`** (`:1944`, the landing step every portal/home warp ends in): searches down
+  to the first non-colliding spot, then back up while still colliding. The upward search used to
+  stop at a literal `y <= 100`; it is `T_HEIGHT + 36` now, which is the same 100 at 64z and the
+  difference between landing and being left embedded in rock in a 256-tall world
+  (`WORKING/256z-format-backport-plan-2026-08-05.md`, breaker B2).
 - **FLY_MODE** (this fork, `:32`): three bools enable flight; fire/pickaxe buttons
   become up/down thrust. Set all three to `false` to restore stock behaviour.
 - **Crouch** (web port addition, `CROUCH_HELD` global + `Player::canFit`): holding crouch (keyboard

@@ -338,6 +338,16 @@ int extraGeneration(any_t passedIn,any_t chunkToGen){
 }
 static BOOL update_lighting=FALSE;
 
+// TRUE while prepareAndLoadGeometry is part-way through a bulk window reload (the count>140 path)
+// and still owes the window some columns. See the long comment at the reload itself: the reload
+// used to read+mesh every stale column inside one call, which measured a 104-124 ms main-thread
+// block on a teleport; it now spends a per-frame budget and takes several frames instead.
+// Reset on load so a world that was mid-reload when it got unloaded can't leave this latched.
+static BOOL bulk_reload_active=FALSE;
+// Set by the meshing pass when the per-frame budget stopped it short, i.e. that reload still owes
+// the window geometry even if every column has been read.
+static BOOL bulk_reload_meshing=FALSE;
+
 void updateLightingBegin(){
     if(LOW_MEM_DEVICE)return;
     update_lighting=TRUE;
@@ -390,6 +400,10 @@ void Terrain::loadTerrain(NSString* name,BOOL fromArchive){
     loaded_new_terrain=TRUE;
     
 	loaded=1;
+    // loadWorld just filled the whole window, so no bulk reload is outstanding -- and a latched
+    // TRUE from the previous world would run a slice against a window this world never staged.
+    bulk_reload_active=FALSE;
+    bulk_reload_meshing=FALSE;
     World::getWorld->hud->justLoaded=1;
     
 	//NSLog(@"dict entries: %d",hashmap_length(chunkMap));
@@ -2122,6 +2136,50 @@ void Terrain::startDynamics(){/*
 static double time1,time2,time3,time4;
 static int hit_load_counter=0;
 
+// How much of a bulk window reload one frame is allowed to do, counted in CHUNKS rather than in
+// columns so the budget stays honest at 256z: a column is CHUNKS_PER_COLUMN chunks of BOTH the
+// read (32 KB at 64z, 131 KB at 256z) and the mesh work, so a column budget would cost 4x as
+// much per frame in a tall world. 96 chunks = 24 columns at 64z, 6 at 256z.
+#define BULK_RELOAD_CHUNK_BUDGET 96
+
+// One stale column of the resident window, plus its squared chunk-space distance to the player,
+// so a budgeted slice can take the nearest ones first (see the reload).
+struct StaleColumn{
+    int cx,cz;
+    int d2;
+};
+static int compare_stale_column(const void* a,const void* b){
+    int da=((const StaleColumn*)a)->d2;
+    int db=((const StaleColumn*)b)->d2;
+    if(da<db)return -1;
+    if(da>db)return 1;
+    return 0;
+}
+
+// Is toroidal chunk-table column (x,z) holding the column the window wants this frame? Only asked
+// while a bulk reload is part-way through, where the answer can be no.
+// (CHUNKS_PER_SIDE == T_RADIUS*2, so a toroidal slot maps 1:1 onto a window slot. Unlike
+// threeToOne's fixed +50*CHUNKS_PER_SIDE bias, this one really does have to fold the modulus
+// twice: x is a small toroidal index and ox is an absolute chunk coordinate in the thousands.)
+//
+// This deliberately asks about the column ITSELF and not about the four lateral neighbours
+// rebuild2() reads across, even though widening it to the neighbourhood is strictly better on
+// paper -- it meshes each chunk exactly once instead of once per adjacent column that lands
+// later, measured 1296 rebuilds instead of 2016. It was written that way, measured, and reverted:
+// it produces a state this engine otherwise never has -- a chunk whose pbounds and blocks are the
+// NEW column while its built geometry is still the old one -- and that state crashed the release
+// build with an out-of-bounds access inside the frame tick, intermittently (5 of 6 runs of
+// tools/headless-mesh-burst-probe.js against build-relwdiag; never in build-st, and never with
+// the check as written here). Not root-caused. The narrow test keeps the existing invariant that
+// a resident chunk's geometry belongs to its own pbounds, and only defers columns the window is
+// ALREADY tolerating as stale, which is the state the count>140 threshold exists to allow.
+static bool columnMeshableDuringReload(int x,int z,int ox,int oz,
+                                       const bool isloaded[T_RADIUS*2][T_RADIUS*2]){
+    int wx=((x-ox)%CHUNKS_PER_SIDE+CHUNKS_PER_SIDE)%CHUNKS_PER_SIDE;
+    int wz=((z-oz)%CHUNKS_PER_SIDE+CHUNKS_PER_SIDE)%CHUNKS_PER_SIDE;
+    return isloaded[wx][wz];
+}
+
 void Terrain::prepareAndLoadGeometry(){
     time1=time2=-[start timeIntervalSinceNow];
     World* world=World::getWorld;
@@ -2129,16 +2187,19 @@ void Terrain::prepareAndLoadGeometry(){
     
     
     
-    int m_chunkOffsetX;
-    int m_chunkOffsetZ;
-    
+    int m_chunkOffsetX=0;
+    int m_chunkOffsetZ=0;
+    // Hoisted out of the load block below because the meshing pass reads it too: mid-bulk-reload
+    // it is the record of which columns of the window are resident RIGHT NOW, which is what tells
+    // the mesher which chunks are worth meshing yet (see BULK_RELOAD_CHUNK_BUDGET).
+    bool isloaded[T_RADIUS*2][T_RADIUS*2];
+
     ///////////load geom from file or gen
     if(loaded){
         m_chunkOffsetX=player->pos.x/CHUNK_SIZE-T_RADIUS;
        m_chunkOffsetZ=player->pos.z/CHUNK_SIZE-T_RADIUS;
 
                 int r=T_RADIUS;
-        bool isloaded[T_RADIUS*2][T_RADIUS*2];
         int count=0;
         //NSLog(@"player p
         for(int x=0;x<2*r;x++){
@@ -2175,48 +2236,108 @@ void Terrain::prepareAndLoadGeometry(){
             }
         }
         
-        if(count>140) {
-            hit_load_counter++;
-            if(hit_load_counter==1){
-                World::getWorld->hud->sb->setStatus(@"Loading",999);
-                if(count>300){
-                    hit_load_counter++;
+        // The bulk window reload. This used to save, read EVERY stale column and then mesh all of
+        // them inside this one call -- one engine frame -- which tools/headless-mesh-burst-probe.js
+        // measured at a 104-124 ms main-thread block on a teleport (324 columns / 1296 chunks:
+        // ~60% mesh CPU, ~20-30% column read/decode, the rest the save that precedes it). It is
+        // now frame-budgeted: the save still happens once, up front and before anything is
+        // overwritten (that ordering is the one correctness rule here), and the read+mesh loop
+        // spends BULK_RELOAD_CHUNK_BUDGET chunks' worth of columns per frame until the window is
+        // whole again. No new concurrency -- this is cooperative slicing on the same thread.
+        //
+        // Why a partly-filled window is safe: the engine ALREADY tolerates up to 140 stale slots
+        // at all times (that is what this threshold means -- a slot whose pbounds say some other
+        // world position, drawn where its pbounds put it, i.e. outside the view distance). A
+        // slice only extends that tolerated state by a handful of frames. The one thing that
+        // must not wait is the ground under the player, hence the nearest-first ordering below.
+        if(count>140||bulk_reload_active) {
+            if(!bulk_reload_active){
+                hit_load_counter++;
+                if(hit_load_counter==1){
+                    World::getWorld->hud->sb->setStatus(@"Loading",999);
+                    if(count>300){
+                        hit_load_counter++;
+                    }
+
                 }
-            
+                if(hit_load_counter>=2){
+                    hit_load_counter=0;
+                    World::getWorld->hud->sb->clear();
+                    World::getWorld->fm->saveWorld();
+
+                    World::getWorld->fm->chunkOffsetX=m_chunkOffsetX;
+                    World::getWorld->fm->chunkOffsetZ=m_chunkOffsetZ;
+
+                    // Zero the light array NOW, before the first column lands, so every chunk this
+                    // reload meshes bakes the same zeroed light the single-frame version gave it.
+                    // Only the "recompute the lights" half is deferred to the final slice: running
+                    // calculateLighting() against a half-read window would miss every lightbox in
+                    // a column that hasn't streamed in yet.
+                    void updateLightingBegin();
+                    updateLightingBegin();
+                    update_lighting=FALSE;
+
+                    bulk_reload_active=TRUE;
+                }
             }
-            if(hit_load_counter>=2){
-                hit_load_counter=0;
-                World::getWorld->hud->sb->clear();
-                World::getWorld->fm->saveWorld();
-                
-                World::getWorld->fm->chunkOffsetX=m_chunkOffsetX;
-                World::getWorld->fm->chunkOffsetZ=m_chunkOffsetZ;
-                
-                
+            if(bulk_reload_active){
               //  printf("chunks to load:%d\n",count);
-                NSString* file_name=[NSString stringWithFormat:@"%@/%@",world->fm->documents,world_name];
-                
-                //[sf_lock lock];
-                NSFileHandle* saveFile=[NSFileHandle fileHandleForReadingAtPath:file_name];
-                
+                // Nearest-first. Budgeting means some columns wait a few frames, and the ones the
+                // player is standing in must not be the ones that wait -- collision reads
+                // blockarray directly, so a far-away column can be late but the player's own
+                // column cannot.
+                static StaleColumn stale[T_RADIUS*2*T_RADIUS*2];
+                int nstale=0;
+                int pcx=player->pos.x/CHUNK_SIZE;
+                int pcz=player->pos.z/CHUNK_SIZE;
                 for(int x=0;x<2*r;x++){
                     for(int z=0;z<2*r;z++){
                         if(!isloaded[x][z]){
-                            //removeLights
-                            world->fm->readColumn( x+m_chunkOffsetX,z+m_chunkOffsetZ,saveFile);
-                            //addlights
+                            int cx=x+m_chunkOffsetX;
+                            int cz=z+m_chunkOffsetZ;
+                            stale[nstale].cx=cx;
+                            stale[nstale].cz=cz;
+                            stale[nstale].d2=(cx-pcx)*(cx-pcx)+(cz-pcz)*(cz-pcz);
+                            nstale++;
                         }
                     }
                 }
-                
-                [saveFile closeFile];
-                //void calculateLighting();
-                
-                addMoreCreaturesIfNeeded();
-                void updateLightingBegin();
-                updateLightingBegin();
-                extern BOOL loaded_new_terrain;
-                loaded_new_terrain=TRUE;
+
+                if(nstale==0){
+                    // Reads are done. The reload is only over once the geometry they dirtied has
+                    // been meshed too, or the deferred backlog would all come due in one frame --
+                    // which is the burst again, just moved to the end (measured: it was).
+                    if(!bulk_reload_meshing){
+                        bulk_reload_active=FALSE;
+                        addMoreCreaturesIfNeeded();
+                        if(!LOW_MEM_DEVICE)update_lighting=TRUE;
+                        extern BOOL loaded_new_terrain;
+                        loaded_new_terrain=TRUE;
+                    }
+                }else{
+                    NSString* file_name=[NSString stringWithFormat:@"%@/%@",world->fm->documents,world_name];
+
+                    //[sf_lock lock];
+                    // Reopened per slice on purpose: holding a handle across frames would outlive
+                    // the rename an autosave does under it (FileManager::saveWorld writes a
+                    // .savetmp and renames), leaving the slice reading a file nobody points at.
+                    NSFileHandle* saveFile=[NSFileHandle fileHandleForReadingAtPath:file_name];
+
+                    qsort(stale,nstale,sizeof(StaleColumn),compare_stale_column);
+
+                    int budget=BULK_RELOAD_CHUNK_BUDGET/CHUNKS_PER_COLUMN;
+                    if(budget<1)budget=1;
+                    if(budget>nstale)budget=nstale;
+                    for(int i=0;i<budget;i++){
+                        //removeLights
+                        world->fm->readColumn( stale[i].cx,stale[i].cz,saveFile);
+                        //addlights
+                        isloaded[stale[i].cx-m_chunkOffsetX][stale[i].cz-m_chunkOffsetZ]=TRUE;
+                    }
+
+                    [saveFile closeFile];
+                    //void calculateLighting();
+                }
             }
             time2=-[start timeIntervalSinceNow];
             
@@ -2268,26 +2389,58 @@ void Terrain::prepareAndLoadGeometry(){
     //////////////////build geom
     if(loaded){
         int num=0;
-        int list[2000];
-        
+        // B1: this used to be int list[2000], filled with no bounds check, against a worst case of
+        // CHUNKS_PER_SIDE^2*CHUNKS_PER_COLUMN -- 1296 at 64z (already 65% full, one bulk-dirty
+        // event from overrunning) and 5184 at 256z. Sized to that worst case now, and the fill is
+        // guarded: dropping a dirty chunk costs one stale frame, overrunning the stack costs the tab.
+        static int list[CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN_MAX];
+        const int list_max=CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN;
+        // While a bulk reload is in flight the same per-frame budget that limits its column reads
+        // limits its meshing, using the deferral list_max already had. Outside a reload this is
+        // list_max, i.e. the pass drains everything exactly as it always did -- an edit, an
+        // explosion and the initial world load are all unbudgeted.
+        const int frame_max=bulk_reload_active&&BULK_RELOAD_CHUNK_BUDGET<list_max
+                            ?BULK_RELOAD_CHUNK_BUDGET:list_max;
+
         idxrl=0;
-        
+        bulk_reload_meshing=FALSE;
+
             for(int x=0;x<CHUNKS_PER_SIDE;x++){
                 for(int z=0;z<CHUNKS_PER_SIDE;z++){
                     if(columnsToUpdate[getColIndex(x,z)]){
+                        // Mid-bulk-reload the window is deliberately part-resident. A column that
+                        // has not streamed in yet gets dirtied anyway, by every neighbouring
+                        // column that HAS (addChunk marks the four laterals), and meshing it now
+                        // just builds geometry for data that is about to be replaced: measured,
+                        // the sliced reload meshed 4188 chunks instead of 2016 without this.
+                        // Deferring is free -- the dirty flags stay set, and readColumn re-sets
+                        // them when the column really lands.
+                        if(bulk_reload_active&&
+                           !columnMeshableDuringReload(x,z,m_chunkOffsetX,m_chunkOffsetZ,isloaded))
+                            continue;
                         for(int y=0;y<CHUNKS_PER_COLUMN;y++){
                             if(chunksToUpdate[threeToOne(x,y,z)]){
-                                
+
                                 int n=threeToOne(x,y,z);
-                                
+
                                 if(n>=CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN||n<0){
                                     printg("out of bounds index: %d\n",n);
                                 }
+                                if(num>=frame_max){
+                                    // Leave chunksToUpdate/columnsToUpdate set for what didn't fit,
+                                    // so the next frame picks it up instead of losing it forever.
+                                    if(num>=list_max){
+                                        printg("dirty-chunk list full at %d, deferring the rest\n",num);
+                                    }else{
+                                        bulk_reload_meshing=TRUE;
+                                    }
+                                    goto list_full;
+                                }
                                 list[num++]=n;
-                                
+
                                 chunksToUpdate[threeToOne(x,y,z)]=FALSE;
                             }
-                            
+
                         }
                         columnsToUpdate[getColIndex(x,z)]=FALSE;
                         // if(num>=1000){printg("1234overflow\n");break;}
@@ -2295,10 +2448,10 @@ void Terrain::prepareAndLoadGeometry(){
                     }
                 }
             }
-            
-            
-            
-            
+            list_full:
+
+
+
             // goto cleanup;
             
             
@@ -2432,8 +2585,8 @@ void Terrain::updateAllImportantChunks(){
 void Terrain::colort(float r,float g,float b){
 	glColor4f(r,g,b,1);
 }
-static TerrainChunk* renderList[(T_SIZE/CHUNK_SIZE)*(T_SIZE/CHUNK_SIZE)*(T_HEIGHT/CHUNK_SIZE)];
-static TerrainChunk* renderList2[(T_SIZE/CHUNK_SIZE)*(T_SIZE/CHUNK_SIZE)*(T_HEIGHT/CHUNK_SIZE)];
+static TerrainChunk* renderList[(T_SIZE/CHUNK_SIZE)*(T_SIZE/CHUNK_SIZE)*CHUNKS_PER_COLUMN_MAX];
+static TerrainChunk* renderList2[(T_SIZE/CHUNK_SIZE)*(T_SIZE/CHUNK_SIZE)*CHUNKS_PER_COLUMN_MAX];
 void renderTree(TreeNode* node,int state){
     //once upon a time this descended an oct-tree, profiling showed it was useless, now just iterates through chunk list
     for(int i=0;i<CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN;i++){
@@ -2592,6 +2745,106 @@ static BOOL last_skycolor_was_defaultblue=FALSE;
 
 int lolc=0;
 
+// -------------------------------------------------------------------------------------------------
+// Persistent dynamic VBOs for the per-frame object batches (perf-audit row 23/E3, 2026-08-06).
+//
+// Doors, golden cubes, portal frames, portal swirls and flowers are still REBUILT ON THE CPU every
+// frame -- they animate (door swing angle, cube rotation, portal UV swirl, flower billboard yaw) and
+// none of that geometry logic changed. What changed is where the result lives.
+//
+// Each batch used to fill a fixed-size `vertexObject objVertices[max_render_objects*6*6]` STACK
+// local (~380 KB) and hand it to GL as four CLIENT-SIDE arrays. On real ES 1.1 that was free. On
+// WebGL it is not: client-side vertex data is forbidden outright, so the GL shim
+// (web/src/shim/gl/gl_es1_shim.cpp, eden_gl_setup_attributes) had to copy the span into a streaming
+// VBO once per ENABLED ARRAY per draw -- four uploads of the same interleaved bytes every frame,
+// plus a fresh glVertexAttribPointer each time because the buffer it latched kept changing.
+//
+// Now each batch owns one persistent GL_DYNAMIC_DRAW buffer plus a heap staging array. The frame
+// fills the staging array exactly as before, uploads it ONCE with glBufferSubData, and specifies the
+// four arrays as byte offsets into that buffer. The shim then takes its VBO-resident path: zero
+// uploads, and offsets that are identical frame to frame, so the specifications elide too.
+//
+// Measured in real Safari with tools/safari-objbatch-probe.js (24 doors + 24 golden cubes +
+// 24 portals + 144 flowers in view, against an empty-flat-world control):
+//     before   47 glBufferData/frame, 756.5 KB/frame  = 44.3 MB/s at 60 fps
+//     after     8 glBufferData + 5 glBufferSubData/frame, 176.6 KB/frame = 10.3 MB/s
+// i.e. the object batches' per-frame upload traffic dropped 4.3x, which is the 4-uploads-of-the-
+// same-bytes redundancy plus the tail of the array the old fixed-size span always carried.
+//
+// Three things to know before touching this:
+//  - One buffer PER BATCH, deliberately, not one shared buffer. A shared buffer would make all four
+//    offset specifications byte-identical and therefore fully elidable, but it would also make each
+//    batch's glBufferSubData a write to memory the previous batch's draw is still reading, i.e. an
+//    implicit driver sync every batch. Separate buffers trade ~16 elidable setup calls for zero
+//    write-after-read hazards; the uploads were the expensive half.
+//  - objBatchDraw() must be called with GL_ARRAY_BUFFER at the engine's own binding (0 at every
+//    call site here), and it restores that before returning. docs/rendering.md: every pass assumes
+//    its predecessor restored state, and a leaked non-zero GL_ARRAY_BUFFER silently reinterprets the
+//    NEXT client-array glVertexPointer as a byte offset -- that does not fail, it draws garbage.
+//  - Growing is REAL now, which retires three latent stack overruns the old fixed 10800-vertex
+//    array had. A golden cube emits 144 vertices (6 faces x tess^2 x 6), so 76 visible cubes used to
+//    write past the end of it; MAX_FLOWERS is 10000 flowers x 6 vertices = 60000; and `doorso`/
+//    `portalso` were themselves unbounded writes into 500/200-entry stack arrays (now clamped).
+//    objBatchStage() reallocs instead, and returns NULL rather than lying if that fails, which is
+//    what the `objVertices&&` loop guards at each call site are for.
+struct ObjectBatch {
+    GLuint buffer;             // GL name, 0 until the first draw
+    int gpuCapacity;           // vertices the GL buffer is currently sized for
+    vertexObject* staging;     // CPU staging array (was a stack local)
+    int stagingCapacity;
+};
+
+static ObjectBatch g_doorBatch   = {0,0,NULL,0};
+static ObjectBatch g_goldenBatch = {0,0,NULL,0};
+static ObjectBatch g_portalBatch = {0,0,NULL,0};
+static ObjectBatch g_swirlBatch  = {0,0,NULL,0};
+static ObjectBatch g_flowerBatch = {0,0,NULL,0};
+
+// Returns a staging array good for `verts` vertices, or NULL if it could not be had. Never shrinks:
+// these are per-frame scratch buffers whose high-water mark is what matters.
+static vertexObject* objBatchStage(ObjectBatch* b,int verts){
+    if(verts<=0)return b->staging;
+    if(verts>b->stagingCapacity){
+        vertexObject* grown=(vertexObject*)realloc(b->staging,(size_t)verts*sizeof(vertexObject));
+        if(grown==NULL)return NULL;   // old (smaller) array is still valid and still owned
+        b->staging=grown;
+        b->stagingCapacity=verts;
+    }
+    return b->staging;
+}
+
+// Upload `verts` staged vertices, point the arrays at them, draw, restore the array binding.
+// `withNormals` mirrors whether the caller has GL_NORMAL_ARRAY enabled (doors and golden cubes do;
+// the portal and flower passes disable it) -- specifying a pointer for a disabled array would be
+// harmless but misleading.
+static void objBatchDraw(ObjectBatch* b,int verts,BOOL withNormals){
+    if(verts<=0||b->staging==NULL)return;
+    if(b->buffer==0){
+        glGenBuffers(1,&b->buffer);
+        if(b->buffer==0)return;
+        b->gpuCapacity=0;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER,b->buffer);
+    if(verts>b->gpuCapacity){
+        // Powers of two so a scene drifting up in object count reallocates a handful of times per
+        // session rather than every frame. GL_DYNAMIC_DRAW, not the GL_STATIC_DRAW that
+        // TerrainChunk::prepareVBO uses -- this whole span is rewritten every single frame.
+        int cap=b->gpuCapacity?b->gpuCapacity:1024;
+        while(cap<verts)cap*=2;
+        glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)cap*sizeof(vertexObject),NULL,GL_DYNAMIC_DRAW);
+        b->gpuCapacity=cap;
+    }
+    glBufferSubData(GL_ARRAY_BUFFER,0,(GLsizeiptr)verts*sizeof(vertexObject),b->staging);
+    glVertexPointer(3,GL_FLOAT,sizeof(vertexObject),(const void*)offsetof(vertexObject,position));
+    if(withNormals)
+        glNormalPointer(GL_FLOAT,sizeof(vertexObject),(const void*)offsetof(vertexObject,normal));
+    glTexCoordPointer(2,GL_FLOAT,sizeof(vertexObject),(const void*)offsetof(vertexObject,texs));
+    glColorPointer(4,GL_UNSIGNED_BYTE,sizeof(vertexObject),(const void*)offsetof(vertexObject,colors));
+    glDrawArrays(GL_TRIANGLES,0,verts);
+    glBindBuffer(GL_ARRAY_BUFFER,0);
+}
+// -------------------------------------------------------------------------------------------------
+
 void Terrain::render(){
     if(do_reload==-1)return;
    //  NSLog(@"rendering!!");
@@ -2678,7 +2931,6 @@ void Terrain::render(){
     glEnableClientState(GL_NORMAL_ARRAY);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glEnable(GL_NORMALIZE);
-    vertexObject objVertices[max_render_objects*6*6];
     extern const GLshort cubeShortVertices[36*3];
     extern const GLshort cubeTexture[36*2];
     extern const GLfloat cubeNormals[36*3];
@@ -2689,9 +2941,10 @@ void Terrain::render(){
     for(int i=0;i<chunksr;i++){
         for(int j=0;j<renderList[i]->rtnum_objects;j++){
             if(renderList[i]->rtobjects[j].type!=TYPE_DOOR_TOP)continue;
-            doorso[num_doors++]=&renderList[i]->rtobjects[j];
+            if(num_doors<500)doorso[num_doors++]=&renderList[i]->rtobjects[j];
         }
     }
+    vertexObject* objVertices=objBatchStage(&g_doorBatch,num_doors*6*6);
    // printg("chunksr %d   num doors:%d\n",chunksr,num_doors);
     int vert=0;
     int object=0;
@@ -2703,7 +2956,7 @@ void Terrain::render(){
     for(int clr=0;clr<60;clr++){
         vert=0;
         object=0;
-    for(int i=0;i<num_doors;i++){
+    for(int i=0;objVertices&&i<num_doors;i++){
         StaticObject* door=doorso[i];
         if(door->color!=clr){
             continue;
@@ -2848,14 +3101,7 @@ void Terrain::render(){
     glBindBuffer(GL_ARRAY_BUFFER,0);
 
     glBindTexture(GL_TEXTURE_2D, Resources::getResources->getDoorTex(clr));
-    glVertexPointer(3, GL_FLOAT, sizeof(vertexObject), objVertices[0].position);
-    glNormalPointer( GL_FLOAT, sizeof(vertexObject), objVertices[0].normal);
-	glTexCoordPointer(2, GL_FLOAT,  sizeof(vertexObject),  objVertices[0].texs);
-	glColorPointer(	4, GL_UNSIGNED_BYTE, sizeof(vertexObject), objVertices[0].colors);
-    
-	
-  
-        glDrawArrays(GL_TRIANGLES, 0,vert);
+        objBatchDraw(&g_doorBatch,vert,TRUE);
         }
     }
     
@@ -2869,9 +3115,12 @@ void Terrain::render(){
     lolc++;
     
     int tess=2;
-    
+
     float tessf=1.0f/(float)tess;
-    for(int i=0;i<chunksr;i++){
+    // A cube emits 6 faces x tess^2 subquads x 6 vertices; at tess=2 that is 144 per object, which
+    // is why max_render_objects of them never fitted the old max_render_objects*6*6 array.
+    objVertices=objBatchStage(&g_goldenBatch,max_render_objects*6*tess*tess*6);
+    for(int i=0;objVertices&&i<chunksr;i++){
         for(int j=0;j<renderList[i]->rtnum_objects;j++){
             if(renderList[i]->rtobjects[j].type!=TYPE_GOLDEN_CUBE)continue;
             for(int f=0;f<6;f++)
@@ -2953,13 +3202,7 @@ void Terrain::render(){
                     
    // glDisable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, Resources::getResources->getTex(ICO_SPHEREMAP)->name);
-    glVertexPointer(3, GL_FLOAT, sizeof(vertexObject), objVertices[0].position);
-    glNormalPointer( GL_FLOAT, sizeof(vertexObject), objVertices[0].normal);
-	glTexCoordPointer(2, GL_FLOAT,  sizeof(vertexObject),  objVertices[0].texs);
-	glColorPointer(	4, GL_UNSIGNED_BYTE, sizeof(vertexObject), objVertices[0].colors);
-	
-    
-    glDrawArrays(GL_TRIANGLES, 0,vert);
+    objBatchDraw(&g_goldenBatch,vert,TRUE);
         float coloursp2[4] = {0,0,0,0};
     glMaterialfv(GL_FRONT_AND_BACK,GL_SPECULAR,coloursp2) ;
     glLightfv(GL_LIGHT0,GL_SPECULAR,coloursp2);
@@ -2977,7 +3220,8 @@ void Terrain::render(){
      cubeTextureCustom=cubeTexture;
     vert=0;
    object=0;
-    for(int i=0;i<chunksr;i++){
+    objVertices=objBatchStage(&g_portalBatch,max_render_objects*6*6);
+    for(int i=0;objVertices&&i<chunksr;i++){
         for(int j=0;j<renderList[i]->rtnum_objects;j++){
             if(renderList[i]->rtobjects[j].type!=TYPE_PORTAL_TOP)continue;
            // printg("drawing portal\n");
@@ -3067,13 +3311,7 @@ void Terrain::render(){
   
     
     glBindTexture(GL_TEXTURE_2D, Resources::getResources->getTex(ICO_PORTAL)->name);
-    glVertexPointer(3, GL_FLOAT, sizeof(vertexObject), objVertices[0].position);
-   
-	glTexCoordPointer(2, GL_FLOAT,  sizeof(vertexObject),  objVertices[0].texs);
-	glColorPointer(	4, GL_UNSIGNED_BYTE, sizeof(vertexObject), objVertices[0].colors);
-	
-    
-    glDrawArrays(GL_TRIANGLES, 0,vert);
+    objBatchDraw(&g_portalBatch,vert,FALSE);
     
     
     
@@ -3192,16 +3430,17 @@ void Terrain::render(){
     for(int i=0;i<chunksr;i++){
         for(int j=0;j<renderList[i]->rtnum_objects;j++){
             if(renderList[i]->rtobjects[j].type!=TYPE_PORTAL_TOP)continue;
-            portalso[num_portals++]=&renderList[i]->rtobjects[j];
+            if(num_portals<200)portalso[num_portals++]=&renderList[i]->rtobjects[j];
         }
     }
-    
+    objVertices=objBatchStage(&g_swirlBatch,num_portals*6);
+
    // for(int clr=0;clr<60;clr++){
         vert=0;
         object=0;
 
-    
-    for(int i=0;i<num_portals;i++){
+
+    for(int i=0;objVertices&&i<num_portals;i++){
         StaticObject* portal=portalso[i];
        // if(portal->color!=clr){
        //     continue;
@@ -3277,13 +3516,7 @@ void Terrain::render(){
         
         if(vert!=0){
         glBindTexture(GL_TEXTURE_2D, Resources::getResources->getTex(ICO_SWIRL)->name);
-        glVertexPointer(3, GL_FLOAT, sizeof(vertexObject), objVertices[0].position);
-        
-        glTexCoordPointer(2, GL_FLOAT,  sizeof(vertexObject),  objVertices[0].texs);
-        glColorPointer(	4, GL_UNSIGNED_BYTE, sizeof(vertexObject), objVertices[0].colors);
-        
-        
-        glDrawArrays(GL_TRIANGLES, 0,vert);
+        objBatchDraw(&g_swirlBatch,vert,FALSE);
         }
 
    // }
@@ -3377,7 +3610,6 @@ void Terrain::render2(){
     
     glMatrixMode(GL_MODELVIEW);
     
-    vertexObject objVertices[max_render_objects*6*6];
     extern const GLshort cubeShortVertices[36*3];
     extern const GLshort cubeTexture[36*2];
     extern const GLfloat cubeNormals[36*3];
@@ -3406,7 +3638,10 @@ void Terrain::render2(){
     qsort (flowerList, flowers, sizeof (StaticObject), compare_objects_back2front);
     extern Vector colorTable[256];
     BOOL isNight=v_equals(final_skycolor,colorTable[54]);
-    for(int i=0;i<flowers;i++){
+    // 6 vertices per billboard. MAX_FLOWERS of them is 60000, which never fitted the old
+    // max_render_objects*6*6 (10800) stack array -- 1801 visible flowers overran it.
+    vertexObject* objVertices=objBatchStage(&g_flowerBatch,flowers*6);
+    for(int i=0;objVertices&&i<flowers;i++){
         
         
         // printg("rendering flower?\n");
@@ -3493,16 +3728,12 @@ void Terrain::render2(){
     glBindBuffer(GL_ARRAY_BUFFER,0);
     
     glBindTexture(GL_TEXTURE_2D, Resources::getResources->getTex(ICO_FLOWER)->name);
-    glVertexPointer(3, GL_FLOAT, sizeof(vertexObject), objVertices[0].position);
-    
-	glTexCoordPointer(2, GL_FLOAT,  sizeof(vertexObject),  objVertices[0].texs);
-	glColorPointer(	4, GL_UNSIGNED_BYTE, sizeof(vertexObject), objVertices[0].colors);
     glEnable(GL_BLEND);
-    
-    
+
+
     //glDepthMask(GL_FALSE);
     glDepthMask(GL_TRUE);
-    glDrawArrays(GL_TRIANGLES, 0,vert);
+    objBatchDraw(&g_flowerBatch,vert,FALSE);
 
     
    

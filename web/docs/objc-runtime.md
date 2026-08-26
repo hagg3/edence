@@ -32,7 +32,7 @@ Reproduce any ivar-layout measurement yourself rather than trusting memory:
 ```
 em++ -x objective-c++ -fobjc-runtime=gnustep-1.9 -fno-objc-arc -S -emit-llvm -o - FILE.mm | grep ...
 ```
-(see `PORT-STATUS.md` for the exact grep pattern used historically). This is the
+(see `archive/PORT-STATUS-2026-08-13.md` for the exact grep pattern used historically). This is the
 concrete instance of [conventions-and-pitfalls.md](conventions-and-pitfalls.md)'s
 "measure, don't reason" rule — the ivar bug was mis-diagnosed at least once before
 being measured directly.

@@ -10,7 +10,7 @@
 //
 // FIX: `--wrap` Player::setSpeed (mangled name confirmed via
 // `llvm-nm build-st/CMakeFiles/eden.dir/.../Classes/Player.mm.o`, NOT guessed — see
-// web/docs/RESUME-HERE.md's "measure, never extrapolate" rule) and scale the walk_dir
+// web/docs/STATUS.md's "measure, never extrapolate" rule) and scale the walk_dir
 // magnitude passed through by `k = clamp(DT_REF/dt_smoothed, 1, 4)`. Both callers of
 // setSpeed — the keyboard path (Input_web.mm's eden_set_move_input) and the real touch
 // joystick (Classes/Joystick.mm:70/83) — funnel through this one wrap, so both are fixed by

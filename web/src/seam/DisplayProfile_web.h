@@ -32,7 +32,7 @@
 // never matched its own 480x320 point space. This file always derives it. (iPad's own 4:3 layout is
 // NOT resurrected — that branch, `EAGLView.mm:114-119`, is commented out in the original and never
 // drove a live layout on any device, so there is no tested branch to bring back. See
-// `WORKING/aspect-ratio-toggle-scope.md`.)
+// `WORKING/archive/aspect-ratio-toggle-scope.md`.)
 //
 // ORDER IS LOAD-BEARING at boot: `eden_display_set_viewport()` must be called before
 // `eden_seam_create_eagl_view()` (i.e. from the page's `onRuntimeInitialized`, which fires before

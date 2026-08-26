@@ -2,6 +2,8 @@
 /build/
 /build-rel/
 /build-st/
+# -DEDEN_THREADED=ON, audit row 36/C1 — see WORKING/c1-threaded-build-handoff.md
+/build-thr/
 /dist/
 *.wasm
 *.wasm.map

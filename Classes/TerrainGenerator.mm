@@ -21,8 +21,8 @@ extern block8* blockarray;
 static const int TREE_SPACING=50;
 int boundx;
 int boundz;
-block8 tblocks[(CHUNKS_PER_COLUMN*CHUNK_SIZE*2)*(CHUNK_SIZE*2)*(CHUNK_SIZE*2)];
-block8 tcolors[(CHUNKS_PER_COLUMN*CHUNK_SIZE*2)*(CHUNK_SIZE*2)*(CHUNK_SIZE*2)];
+block8 tblocks[(CHUNKS_PER_COLUMN_MAX*CHUNK_SIZE*2)*(CHUNK_SIZE*2)*(CHUNK_SIZE*2)];  //max-sized; indexing uses the runtime CHUNKS_PER_COLUMN
+block8 tcolors[(CHUNKS_PER_COLUMN_MAX*CHUNK_SIZE*2)*(CHUNK_SIZE*2)*(CHUNK_SIZE*2)];  //max-sized; indexing uses the runtime CHUNKS_PER_COLUMN
 TerrainGenerator::TerrainGenerator(Terrain* parent){
     init();
 	ter=parent;
@@ -35,7 +35,7 @@ TerrainGenerator::TerrainGenerator(Terrain* parent){
 void tgenInit(){
     init();
 }
-static TerrainChunk* column[CHUNKS_PER_COLUMN];
+static TerrainChunk* column[CHUNKS_PER_COLUMN_MAX];  //max-sized, only CHUNKS_PER_COLUMN used
 
 inline static int getCustomct(int x,int z,int y){
      return  tcolors[x*CHUNKS_PER_COLUMN*CHUNK_SIZE*CHUNK_SIZE*2*2+z*CHUNKS_PER_COLUMN*CHUNK_SIZE*2+y];

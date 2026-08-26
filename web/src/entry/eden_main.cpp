@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
     // TODO P0.1/P1: no non-Emscripten target is planned (this engine has no desktop port per
     // docs/engine-vs-game.md's own note: "a desktop port was once contemplated but never
     // started"), so this branch exists only so the file has SOME shape to read/reason about
-    // on a machine without emcc (this one, currently — see PORT-STATUS.md). Not a real
+    // on a machine without emcc (this one, currently — see archive/PORT-STATUS-2026-08-13.md). Not a real
     // fallback loop.
     eden_frame_tick();
 #endif

@@ -13,7 +13,7 @@ Read this before writing any code. These are the implicit rules the codebase fol
    `[x, y, z, x2, y2, z2]`. **Every off-by-one-axis bug in this codebase comes from
    here.** When in doubt, read the callee's loop body.
 2. **Storage order**: within a chunk, `CC(x,z,y) = x·256 + z·16 + y` (y fastest —
-   vertical strips contiguous). `blockarray`: `x·(T_SIZE·T_HEIGHT) + z·T_HEIGHT + y`.
+   vertical strips contiguous). `blockarray`: `x·g_xz_stride + z·g_world_height + y` (the height is runtime — see world-and-terrain.md).
    The RLE bundle transposes to `CC(y,z,x)`.
 3. **Two coordinate spaces**: absolute world blocks (≈65,000 near spawn) for logic
    and storage; render space rebased by `fm->chunkOffsetX/Z · 16` for GL. Terrain
@@ -100,12 +100,20 @@ Read this before writing any code. These are the implicit rules the codebase fol
 
 ## Known limitations
 
-- Max ~1296 resident chunks; no vertical world growth without a save-format change.
+- 1296 resident chunks at 64z, 5184 at 256z (`CHUNKS_PER_SIDE²·CHUNKS_PER_COLUMN`).
 - One liquid update queue globally; heavy flow re-meshes chunks every tick.
-- 200 persisted creatures, 300 live; 1000 portals; 80 fireworks; 32k vertices per
-  chunk stream (excess silently dropped).
+- 200 persisted creature slots in a 64z save (400 in a 256z one, and the real number is
+  **derived from the file**, not the version — a save can legitimately have none); 300 live;
+  1000 portals; 80 fireworks; 32k vertices per chunk stream (excess silently dropped).
 - No multiplayer of any kind; "sharing" is file upload/download.
-- Worlds from 2.2.7+ App Store builds load height-truncated (README).
+- Worlds from 2.2.7+ App Store builds ("New Dawn", 256-block-tall, header `version` 5 or 6) load
+  and play natively as of 2026-08-06 — see [world-and-terrain.md](world-and-terrain.md) "Runtime
+  world height". They never loaded "height-truncated" as the README claimed: before the Stage-0
+  guard this build read every column past the first at the wrong stride (garbage) and the next
+  autosave silently overwrote the file at 64 blocks tall, destroying it. A version **above** 6 is
+  still refused outright rather than guessed at.
+  Authoring a *new* 256z world in-game is not implemented (Stage 3); a 256z world that is opened
+  and edited here saves correctly, keeping its own version.
 - Backgrounding does not save; only streaming/warp/exit do.
 
 ## When you change X, also check Y
@@ -114,7 +122,8 @@ Read this before writing any code. These are the implicit rules the codebase fol
 |---|---|
 | Block type enum / tables | Save compat (raw bytes on disk!), `blockinfo`, `blockTypeFaces`, `blockColor`, atlas, `blockTntMap`, HUD picker list |
 | `colorTable` generation | Every painted block in every existing world re-tints |
-| `T_SIZE`/`T_HEIGHT`/`CHUNK_SIZE` | `SIZEOF_COLUMN` (file format!), progress divisors, `INDICES_MAX` sizing, streaming threshold |
+| `T_SIZE`/`CHUNK_SIZE` | `SIZEOF_COLUMN` (file format!), progress divisors, `INDICES_MAX` sizing, streaming threshold |
+| `T_HEIGHT`/`CHUNKS_PER_COLUMN` (now **runtime** globals) | Anything sized at COMPILE time must use `T_HEIGHT_MAX`/`CHUNKS_PER_COLUMN_MAX`/`MAX_CREATURES_SAVED_MAX` instead — a file-scope VLA is a build error, a stack one is not |
 | `WorldFileHeader`/`EntityData`/`ColumnIndex` | All existing saves + the bundled `Eden.eden` + the upload server |
 | Meshing (`rebuild2`) | Counting pass and fill pass must agree exactly; `prepareVBO` swap |
 | Update order in `World::update` | Streaming/save/mesh/upload dependencies (see execution-flow.md) |
