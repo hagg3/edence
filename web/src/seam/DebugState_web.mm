@@ -322,6 +322,43 @@ extern "C" const char *eden_debug_world_format(void) {
     return buf;
 }
 
+// B3 Stage 2 (off-thread meshing): whole-window geometry integrity + a comparable fingerprint.
+// The plan doc's R1 asks for a whole-window integrity scan as the tool for chasing a count/fill
+// heap overrun; this is that scan, and it doubles as the equivalence check the change actually
+// needs. Vertex COUNTS depend only on block types and face visibility -- not on lighting, which is
+// baked into vertex colours and is sliced across frames -- so after the same teleports over the
+// same deterministic default world, `rt_vertices` must come out byte-identical whether the meshing
+// ran inline or on a worker. A worker mesher that dropped, duplicated or truncated a chunk shows up
+// here as a different total; `unpublished` catches the other failure mode, a chunk left holding a
+// built-but-never-uploaded mesh (needsVBO still set), which is what "the chunk went invisible"
+// looks like from the inside. Diagnostics-only, like everything else in this file.
+EMSCRIPTEN_KEEPALIVE
+extern "C" const char *eden_debug_terrain_geometry(void) {
+    static char buf[256];
+    long long verts = 0, verts2 = 0, objects = 0;
+    int meshed = 0, unpublished = 0, busy = 0, total = 0;
+    extern TerrainChunk** chunkTablec;
+    if (chunkTablec) {
+        const int n = CHUNKS_PER_SIDE * CHUNKS_PER_SIDE * CHUNKS_PER_COLUMN;
+        for (int i = 0; i < n; i++) {
+            TerrainChunk* c = chunkTablec[i];
+            if (!c) continue;
+            total++;
+            verts   += c->rtn_vertices;
+            verts2  += c->rtn_vertices2;
+            objects += c->rtnum_objects;
+            if (c->rtn_vertices || c->rtn_vertices2) meshed++;
+            if (c->needsVBO) unpublished++;
+            if (c->meshJobState != MESH_JOB_IDLE) busy++;
+        }
+    }
+    snprintf(buf, sizeof(buf),
+             "{\"chunks\":%d,\"meshed\":%d,\"rt_vertices\":%lld,\"rt_vertices2\":%lld,"
+             "\"rt_objects\":%lld,\"unpublished\":%d,\"jobs_in_flight\":%d}",
+             total, meshed, verts, verts2, objects, unpublished, busy);
+    return buf;
+}
+
 // B5 (256z Stage 3): force the save strategy for a test. Above g_save_inplace_threshold saveWorld
 // writes the world file in place behind a rollback journal; below it, it runs on a whole-file
 // scratch copy. Real worlds pick a path by their size, which would make the in-place path

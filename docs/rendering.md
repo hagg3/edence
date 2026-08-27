@@ -77,12 +77,87 @@ CPU-side, runs on the main thread inside `prepareAndLoadGeometry`. Stages:
 
 Empty-result chunks set `clearOldVerticesOnly` so `prepareVBO` frees GL buffers.
 
+### Re-entrancy (modified from stock, 2026-08-27)
+`rebuild2()` is now safe to run on a thread other than the one that owns the world, because the
+mesher is being moved onto a worker (`WORKING/b3-off-thread-meshing-plan.md`). Nothing about *what*
+it meshes changed. Three things did:
+
+- Its scratch (`v_idx`, `v_idx2`, `face_visibility[]`, `face_size[]`, `hasBlocky[]`, `hasVisy[]`)
+  was file-scope `static`, i.e. one copy shared by every call. It is now tagged `EDEN_MESH_TLS`,
+  which is `thread_local` when the build defines `EDEN_THREADED` and **empty otherwise** — the
+  single-threaded and iOS builds are unchanged.
+- The counting pass and the fill pass both read the chunk's own `pblocks`/`pcolors`, and
+  `Terrain::setLand` writes those directly on every block edit. A write landing between the two
+  passes changes a block's face count and overruns the vertex buffer, so a worker meshes from a
+  private 8 KB snapshot instead: `tc_meshSetSource()` installs it and `rebuild2()` resolves it once
+  per call into `mblocks`/`mcolors`. Its *other* global reads (neighbour `blockarray`, `lightarray`,
+  `getColorc`) all feed `face_visibility[]`, which is private scratch computed **before** both
+  passes — so staleness there is cosmetic and cannot break the invariant.
+- The three things it did to global state are now deferrable: `Portal::addPortal` (portal tops) and
+  the corrupt-type `setLand` repair queue into a caller-supplied `MeshSideEffect` sink that the main
+  thread replays via `tc_meshReplaySideEffects()`, and `isOnFire()`'s walk of the main thread's
+  mutable `burnList` is replaced by a precomputed per-chunk burn mask. With no sink and no mask
+  installed — the single-threaded default — all three behave exactly as stock.
+
+### Off-thread meshing (modified from stock, 2026-08-27)
+The re-entrancy above exists because bulk-reload chunks are now meshed on **worker threads**
+(`Classes/MeshPool.{h,mm}`; design in `WORKING/b3-off-thread-meshing-plan.md`). The split follows
+the `rt*` boundary that `prepareVBO()` already was:
+
+> a worker fills the chunk's **non-`rt`** fields via `rebuild2()`; the main thread calls
+> `prepareVBO()` to publish them into `rt*` and upload. **GL never leaves the main thread**, so
+> convention #4 holds unchanged — and it costs nothing, because upload is under 1% of a burst.
+
+- **Scope, deliberately narrow.** Only chunks dirtied by a **bulk window reload** (`Terrain.mm`'s
+  `bulk_reload_active`) go to a worker. Player edits, explosions, fire and the initial world load
+  still mesh inline, in the same frame, exactly as before — they are few, latency-sensitive and next
+  to the player.
+- **Dispatch** is in `Terrain::prepareAndLoadGeometry` where `rebuild2()` used to be called;
+  **publish** is `mp_publishFinished()`, called both at the top of that function and in
+  `updateAllImportantChunks`. Each chunk carries an atomic `meshJobState`
+  (`IDLE→QUEUED→RUNNING→DONE→IDLE`); the worker's `DONE` is a release store and the main thread's
+  read an acquire, which is what orders the vertex buffer against the counts describing it.
+- **A worker never touches live world state.** It meshes an 8 KB snapshot of the chunk's own
+  `pblocks`/`pcolors`, is handed a precomputed burn mask instead of walking `burnList`, and queues
+  its two global mutations into a `MeshSideEffect` sink the main thread replays at publish time.
+- **Three invalidation rules carry the correctness** and are the things to preserve when touching
+  any of this:
+  1. *A chunk with a job in flight is never recycled.* `readColumn()` re-homes a whole column
+     (`setBounds()` plus a wholesale voxel rewrite), so the reload skips a column whose chunks are
+     not all `IDLE` and takes the next-nearest stale one instead; the dirty-list build skips busy
+     chunks the same way, leaving their flags set. `Terrain::deallocateMemory` and `loadTerrain`
+     drain the pool.
+  2. *An edit during a job makes the mesh stale, not torn* — the worker read a snapshot. The mesh is
+     **published anyway** and the chunk re-dirtied. Discarding it would leave the chunk with no
+     geometry at all, which draws as a hole.
+  3. *Fire meshes inline.* `burnList` is a list the main thread frees nodes from.
+- **Two kill switches, both intentional.** Without `EDEN_THREADED` every `mp_*` entry point compiles
+  to a no-op and `mp_dispatch()` always answers "mesh it yourself" — the stock path, byte for byte.
+  And "no free job slot → mesh inline" means a pool size of 0 disables the feature without removing
+  it.
+- Measured effect on a teleport burst: frames over the 16.66 ms budget 5–7 per 5 bursts → 0–1,
+  frames over 8.3 ms 62–68 → 13–24, with the window still filling in the same wall clock and the
+  resulting geometry byte-identical to the inline mesher's.
+
 ### VBO upload — `prepareVBO()` (`TerrainChunk.mm:1433`)
 Copies the plain fields into the `rt*` (render) fields, mallocs the per-chunk index
 scratch `rtindices`, deletes old GL buffers, creates `vertexBuffer` (stream 1),
 `vertexBuffer2` (stream 2), `elementBuffer`, uploads with `GL_STATIC_DRAW`, frees the
 staging arrays. The plain/`rt` split is leftover double-buffering from the removed
 background meshing thread — today both halves are always in sync.
+
+**`render()`'s only "is there geometry" test is `rtn_vertices==0`, so every `rt*` field has to
+say "empty" from construction, not from the first `prepareVBO()`.** The constructor did not
+initialise them until 2026-08-27: a chunk is allocated out of a heap that has just held vertex and
+colour data, so `rtn_vertices` came up garbage-nonzero, `render()` sailed past the guard, and the
+index re-pack `memcpy`'d from `allIndices + rtface_idx[i]` with `rtface_idx[i]` in the tens of
+millions (into a NULL `rtindices`) — an out-of-bounds trap inside the frame tick. Stock never
+reached it because a chunk was always meshed before it could be drawn. **Anything that lets a
+resident chunk be drawn before its first mesh — the bulk reload's neighbourhood deferral
+([world-and-terrain.md](world-and-terrain.md)), or a worker-thread mesher whose output lands a
+frame late — depends on that initialisation.** Note the re-pack still bounds only its
+*destination* cursor against `INDICES_MAX`, not `rtface_idx[i]+rtnum_vertices[i]`; that is fine
+while a chunk cannot exceed 32768 vertices, and is the guard to revisit if one ever can.
 
 ## Frame passes
 

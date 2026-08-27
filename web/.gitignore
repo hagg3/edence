@@ -4,6 +4,10 @@
 /build-st/
 # -DEDEN_THREADED=ON, audit row 36/C1 — see WORKING/c1-threaded-build-handoff.md
 /build-thr/
+# scratch -O2 build with EDEN_DIAGNOSTICS=ON, used by tools/headless-mesh-burst-probe*.js
+/build-relwdiag/
+# same, plus -DEDEN_THREADED=ON — the A/B baseline for B3 off-thread meshing
+/build-relthr/
 /dist/
 *.wasm
 *.wasm.map

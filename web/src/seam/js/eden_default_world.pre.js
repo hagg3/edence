@@ -99,11 +99,20 @@ Module['preRun'].push(function () {
   var MAX_BLOCKS = Module['EDEN_WORLD_FS_BLOCKS'] || 128;   // 128 × 32 KB = 4 MB residency ceiling
   var READAHEAD = Module['EDEN_WORLD_FS_READAHEAD'] === undefined ? 1 : Module['EDEN_WORLD_FS_READAHEAD'];
 
+  var nowMs = (typeof performance === 'object' && performance.now)
+    ? function () { return performance.now(); }
+    : function () { return Date.now(); };
+
   Module['addRunDependency'](DEP);
   var depDone = false;
   function doneDep() { if (!depDone) { depDone = true; Module['removeRunDependency'](DEP); } }
 
-  var stats = { requests: 0, bytesFetched: 0, reads: 0, blockHits: 0, blockMisses: 0, evictions: 0 };
+  // fetchMs / fetchMsMax (B1, ROADMAP Phase B): wall time spent in readRange() — the synchronous
+  // XHR range fetch (browser) or fs.readSync (node) that is the actual transport under a cold
+  // block read. Paired with MeshTiming_web.mm's ioMs (total fread time): fetchMs is the transport
+  // subset, ioMs - fetchMs is this cache/coalesce layer's own overhead.
+  var stats = { requests: 0, bytesFetched: 0, reads: 0, blockHits: 0, blockMisses: 0, evictions: 0,
+                fetchMs: 0, fetchMsMax: 0 };
   Module['EdenWorldFS'] = { mode: 'pending', size: 0, blockSize: BLOCK_SIZE, maxBlocks: MAX_BLOCKS, stats: stats };
 
   // ------------------------------------------------------------------ eager fallback (pass 30)
@@ -179,7 +188,11 @@ Module['preRun'].push(function () {
     function fetchBlocks(b0, b1) {
       var start = b0 * BLOCK_SIZE;
       var end = Math.min((b1 + 1) * BLOCK_SIZE, size) - 1;
+      var _t0 = nowMs();
       var data = readRange(start, end);
+      var _dt = nowMs() - _t0;
+      stats.fetchMs += _dt;
+      if (_dt > stats.fetchMsMax) stats.fetchMsMax = _dt;
       stats.requests++;
       stats.bytesFetched += data.length;
       for (var bi = b0; bi <= b1; bi++) {
@@ -224,7 +237,11 @@ Module['preRun'].push(function () {
       // this same read still needs. Nothing in the engine does this today (the largest read is a
       // ~12 KB RLE chunk), but a bypass is two lines and removes the failure mode entirely.
       if (b1 - b0 + 1 > MAX_BLOCKS) {
+        var _tw = nowMs();
         var whole = readRange(position, position + length - 1);
+        var _dtw = nowMs() - _tw;
+        stats.fetchMs += _dtw;
+        if (_dtw > stats.fetchMsMax) stats.fetchMsMax = _dtw;
         stats.requests++;
         stats.bytesFetched += whole.length;
         dest.set(whole, destOffset);

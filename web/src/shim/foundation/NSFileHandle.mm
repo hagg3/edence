@@ -1,3 +1,4 @@
+#include <emscripten/emscripten.h>  // emscripten_get_now — B1 read-path I/O timing (see below)
 #include <unistd.h>   // ftruncate — used by -truncateFileAtOffset:
 #include <cstdio>     // rename, remove — used by the backup-slot copy below
 #include <cstring>    // strdup — used by the deferred-backup path (_backupPathC)
@@ -7,6 +8,14 @@
 #import "NSString.h"
 #import "NSData.h"
 #include "Constants.h"   // g_save_inplace_threshold — the shared save-strategy threshold
+
+// B1 (ROADMAP Phase B): the column-read/RLE-decode burst characterization needs the file-I/O half
+// of FileManager::readColumn measured separately from the RLE decode. Every default-world column
+// read bottoms out in the fread() below (via NSData readDataOfLength:), whether it is served from
+// the lazy Eden.eden node's block cache or triggers a synchronous XHR/readSync range fetch. Report
+// each fread's wall time to MeshTiming_web.mm's accumulator; it is weak so a build that excludes
+// that TU (none today) still links. Two emscripten_get_now() calls per column read = noise.
+extern "C" __attribute__((weak)) void eden_mt_note_io(double ms);
 
 @implementation NSFileHandle
 
@@ -120,7 +129,9 @@ static void eden_fire_deferred_backup(NSFileHandle *fh) {
     if (!_fp || length == 0) return [NSData data];
     NSMutableData *d = [NSMutableData dataWithCapacity:length];
     [d setLength:length];
+    double _t0 = emscripten_get_now();
     size_t got = fread(d->_bytes.data(), 1, length, _fp);
+    if (eden_mt_note_io) eden_mt_note_io(emscripten_get_now() - _t0);
     [d setLength:(NSUInteger)got];
     return d;
 }

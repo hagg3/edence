@@ -14,6 +14,8 @@
 
 
 void calculateLighting();
+BOOL calculateLightingSlice();   // budgeted per-frame form for the post-bulk-reload path
+void calculateLightingSliceReset();
 void addlight(int xx,int zz,int yy,float brightness,Vector color);
 
 

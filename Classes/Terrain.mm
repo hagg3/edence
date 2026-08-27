@@ -13,6 +13,13 @@
 #import "VectorUtil.h"
 
 #import "Lighting.h"
+#import "MeshPool.h"
+
+// Repo-root Lighting.h is the built one (Eden.xcodeproj / web CMake); the Classes/ copy next to
+// this file is a stale snapshot with no prototypes, hence these explicit decls.
+void calculateLighting();
+BOOL calculateLightingSlice();
+void calculateLightingSliceReset();
 
 //@implementation Terrain
 //@synthesize home,loaded,world_name,level_seed,tgen,counter,skycolor,final_skycolor,chunkTable,portals,fireworks;
@@ -35,6 +42,18 @@ static Terrain* singleton;
 //static BOOL* chunksToUpdatefg;
 
 static BOOL* chunksToUpdateImmediatley;
+
+// B3 Stage 2. Handed to the mesh pool so it can put a chunk back on the dirty lists after it
+// publishes a mesh that went stale under a worker (an edit landed after the snapshot was taken) or
+// that rebuild2() refused. Lives here rather than in MeshPool.mm because chunksToUpdate /
+// columnsToUpdate are this file's state.
+static void mp_redirtyChunk(int idxn){
+    if(!chunksToUpdate||!columnsToUpdate)return;
+    if(idxn<0||idxn>=CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN)return;
+    chunksToUpdate[idxn]=TRUE;
+    columnsToUpdate[idxn/CHUNKS_PER_COLUMN]=TRUE;
+}
+
 
 block8* blockarray;
 //static color8* shadowarray;
@@ -264,6 +283,10 @@ void Terrain::allocateMemory(){
 }
 
 void Terrain::deallocateMemory(){
+    // B3 Stage 2, invalidation rule 3: nothing may be in flight when the chunks it is reading are
+    // deleted. Discard rather than publish -- these chunks are about to stop existing, and their
+    // destructors free the vertex buffers the workers built.
+    mp_drain(NULL,FALSE);
     for(int i=0;i<CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN;i++){
         if(chunkTablec[i]!=NULL){
             delete chunkTablec[i];
@@ -352,6 +375,7 @@ void updateLightingBegin(){
     if(LOW_MEM_DEVICE)return;
     update_lighting=TRUE;
     memset(lightarray,0,sizeof(Vector8)*T_SIZE*T_SIZE*T_HEIGHT);
+    calculateLightingSliceReset();   // restart the sliced sweep from column 0
 }
 
 void Terrain::loadTerrain(NSString* name,BOOL fromArchive){
@@ -376,6 +400,11 @@ void Terrain::loadTerrain(NSString* name,BOOL fromArchive){
     
 	world_name=name;
 	[world_name retain];
+    // B3 Stage 2, invalidation rule 1: loadWorld() calls readColumn() for the whole window, which
+    // re-homes every chunk slot. Nothing may be meshing when that happens. (In practice a load is
+    // always preceded by a teardown or a fresh world, so this drains nothing -- it is here so the
+    // rule holds by construction rather than by luck.)
+    mp_drain(mp_redirtyChunk,TRUE);
 	World::getWorld->fm->loadWorld(name,fromArchive);
     
    /* for(int x=0;x<T_SIZE;x++){
@@ -720,6 +749,10 @@ void Terrain::setLand(int x,int z,int y,int type,BOOL chunkToo){
        
             chunk->pblocks[x*(CHUNK_SIZE*CHUNK_SIZE)+z*(CHUNK_SIZE)+y]=type;
         chunk->modified=TRUE;
+        // B3 Stage 2, invalidation rule 2: if a worker is meshing this chunk it is meshing a
+        // snapshot taken before this edit. That is SAFE -- it cannot tear -- but the mesh it
+        // produces is one edit out of date, so flag it and let the publish step re-dirty.
+        tc_noteChunkWritten(chunk);
         
 		
 	}
@@ -748,6 +781,7 @@ BOOL Terrain::setColor(int x,int z,int y, color8 color){
     if(c1==color) return FALSE;
     chunk->modified=TRUE;
     chunk->pcolors[x*(CHUNK_SIZE*CHUNK_SIZE)+z*(CHUNK_SIZE)+y]=color;
+    tc_noteChunkWritten(chunk);   // B3 Stage 2, invalidation rule 2 (see Terrain::setLand)
 		
 	// NSLog(@"hi! %f,%f,%f",color.x,color.y,color.z);
     return TRUE;
@@ -2141,6 +2175,23 @@ static int hit_load_counter=0;
 // read (32 KB at 64z, 131 KB at 256z) and the mesh work, so a column budget would cost 4x as
 // much per frame in a tall world. 96 chunks = 24 columns at 64z, 6 at 256z.
 #define BULK_RELOAD_CHUNK_BUDGET 96
+//
+// RE-TUNED, AND DELIBERATELY LEFT AT 96, after B3 Stage 2 (2026-08-27). Stage 2 turned this from a
+// mesh budget into a DISPATCH budget -- the meshing it gates now happens on a worker -- so what it
+// still governs on the main thread is the column read/decode, the half of the burst that has not
+// moved yet (Stage 3). Swept against build-relthr, 2 runs each, 5 teleport bursts each:
+//
+//   budget | worst main-thread block | frames >16.66ms | window fill time
+//      96  |            15 / 15 ms   |       0 / 0     |   ~265 ms
+//     144  |            11 / 30 ms   |       0 / 1     |   ~183 ms
+//     192  |            24 / 19 ms   |       1 / 1     |   ~135 ms
+//
+// Raising it fills the window visibly faster and it is tempting; it also puts frames back over the
+// 60 fps budget, because what it buys more of per frame is now DECODE. At 96 the threaded build
+// misses the budget zero times across five bursts, which is exactly what B3 was for -- the window
+// filling in at 60 fps rather than 45 (WORKING/b3-off-thread-meshing-plan.md §1). Trading that away
+// for a shorter fill would undo the reason for the change. Revisit at Stage 3, when decode moves off
+// the main thread too and this stops governing main-thread work at all; 144 is the candidate then.
 
 // One stale column of the resident window, plus its squared chunk-space distance to the player,
 // so a budgeted slice can take the nearest ones first (see the reload).
@@ -2162,28 +2213,54 @@ static int compare_stale_column(const void* a,const void* b){
 // threeToOne's fixed +50*CHUNKS_PER_SIDE bias, this one really does have to fold the modulus
 // twice: x is a small toroidal index and ox is an absolute chunk coordinate in the thousands.)
 //
-// This deliberately asks about the column ITSELF and not about the four lateral neighbours
-// rebuild2() reads across, even though widening it to the neighbourhood is strictly better on
-// paper -- it meshes each chunk exactly once instead of once per adjacent column that lands
-// later, measured 1296 rebuilds instead of 2016. It was written that way, measured, and reverted:
-// it produces a state this engine otherwise never has -- a chunk whose pbounds and blocks are the
-// NEW column while its built geometry is still the old one -- and that state crashed the release
-// build with an out-of-bounds access inside the frame tick, intermittently (5 of 6 runs of
-// tools/headless-mesh-burst-probe.js against build-relwdiag; never in build-st, and never with
-// the check as written here). Not root-caused. The narrow test keeps the existing invariant that
-// a resident chunk's geometry belongs to its own pbounds, and only defers columns the window is
-// ALREADY tolerating as stale, which is the state the count>140 threshold exists to allow.
+// This asks about the column AND the four lateral neighbours rebuild2() reads across, so a chunk
+// is meshed exactly once instead of once per adjacent column that lands later: measured 1296
+// rebuilds per burst instead of 1949, i.e. 144 ms of mesh CPU down to 107 ms (same-session A/B,
+// tools/headless-mesh-burst-probe.js against build-relwdiag, 4 runs each).
+//
+// Pass 70 wrote exactly this, measured it, and REVERTED it, because it crashed the release build
+// with an intermittent out-of-bounds inside the frame tick. That crash is now root-caused and
+// fixed, and it was never about the neighbourhood test: deferring a RESIDENT column is the only
+// way this engine ever draws a chunk that has not been meshed since it was allocated, and
+// TerrainChunk's constructor left the whole rt* geometry block uninitialised, so render()'s
+// `rtn_vertices==0` guard read garbage and the index memcpy walked off allIndices. See the
+// constructor in TerrainChunk.mm. The narrow test only hid it by guaranteeing every drawn chunk
+// had been meshed at least once.
+//
+// Keep that in mind before assuming a similar deferral is safe: what makes THIS one safe is that
+// a deferred chunk's geometry still belongs to its own pbounds, and the chunk is now empty rather
+// than garbage until it is meshed. A worker-thread mesher produces the same "resident but not yet
+// meshed" state by construction and depends on the same initialisation.
 static bool columnMeshableDuringReload(int x,int z,int ox,int oz,
                                        const bool isloaded[T_RADIUS*2][T_RADIUS*2]){
     int wx=((x-ox)%CHUNKS_PER_SIDE+CHUNKS_PER_SIDE)%CHUNKS_PER_SIDE;
     int wz=((z-oz)%CHUNKS_PER_SIDE+CHUNKS_PER_SIDE)%CHUNKS_PER_SIDE;
-    return isloaded[wx][wz];
+    if(!isloaded[wx][wz])return false;
+    // The four laterals, folded the same way -- rebuild2() reads one block across each side face,
+    // so a column whose neighbour is still stale would have to be meshed again when it lands.
+    for(int d=0;d<4;d++){
+        static const int dx[4]={-1,1,0,0};
+        static const int dz[4]={0,0,-1,1};
+        int nx=((wx+dx[d])%CHUNKS_PER_SIDE+CHUNKS_PER_SIDE)%CHUNKS_PER_SIDE;
+        int nz=((wz+dz[d])%CHUNKS_PER_SIDE+CHUNKS_PER_SIDE)%CHUNKS_PER_SIDE;
+        if(!isloaded[nx][nz])return false;
+    }
+    return true;
 }
 
 void Terrain::prepareAndLoadGeometry(){
     time1=time2=-[start timeIntervalSinceNow];
     World* world=World::getWorld;
     Player* player=world->player;
+
+    // B3 Stage 2. Publish anything the workers finished since the last frame BEFORE deciding what
+    // to read or mesh this frame: a published chunk is IDLE again, so it is free to be re-dirtied,
+    // re-dispatched, or (the rule that matters) re-homed by a column read. updateAllImportantChunks
+    // publishes a second time at the end of the frame to catch jobs that landed during it -- the
+    // plan doc's §4.2 names that one; this one exists because World::update calls the two back to
+    // back, so publishing only there would keep every dispatched chunk busy for a whole extra frame.
+    mp_publishFinished(mp_redirtyChunk);
+    mp_beginFrame();
     
     
     
@@ -2328,11 +2405,20 @@ void Terrain::prepareAndLoadGeometry(){
                     int budget=BULK_RELOAD_CHUNK_BUDGET/CHUNKS_PER_COLUMN;
                     if(budget<1)budget=1;
                     if(budget>nstale)budget=nstale;
-                    for(int i=0;i<budget;i++){
+                    // B3 Stage 2, invalidation rule 1 (plan doc §4.3): readColumn re-homes every
+                    // chunk of the column -- setBounds(), and a wholesale rewrite of pblocks/
+                    // pcolors -- so a column with a mesh job in flight must not be read yet. Skip
+                    // it and take the next-nearest stale column instead; the job finishes in a
+                    // frame or two and the column is still in stale[] next frame. Structurally
+                    // this is the same "wait for the state to be safe" the neighbour test below
+                    // does, and it cannot livelock: workers always finish.
+                    for(int i=0,taken=0;i<nstale&&taken<budget;i++){
+                        if(mp_columnBusy(stale[i].cx,stale[i].cz))continue;
                         //removeLights
                         world->fm->readColumn( stale[i].cx,stale[i].cz,saveFile);
                         //addlights
                         isloaded[stale[i].cx-m_chunkOffsetX][stale[i].cz-m_chunkOffsetZ]=TRUE;
+                        taken++;
                     }
 
                     [saveFile closeFile];
@@ -2418,6 +2504,9 @@ void Terrain::prepareAndLoadGeometry(){
                         if(bulk_reload_active&&
                            !columnMeshableDuringReload(x,z,m_chunkOffsetX,m_chunkOffsetZ,isloaded))
                             continue;
+                        // B3 Stage 2: set if any chunk of this column had to be left dirty because
+                        // a worker still owns it, so the column flag survives to the next frame.
+                        BOOL column_deferred=FALSE;
                         for(int y=0;y<CHUNKS_PER_COLUMN;y++){
                             if(chunksToUpdate[threeToOne(x,y,z)]){
 
@@ -2425,6 +2514,15 @@ void Terrain::prepareAndLoadGeometry(){
 
                                 if(n>=CHUNKS_PER_SIDE*CHUNKS_PER_SIDE*CHUNKS_PER_COLUMN||n<0){
                                     printg("out of bounds index: %d\n",n);
+                                }
+                                // A chunk a worker is meshing must not be meshed again underneath
+                                // it, and must not be re-dispatched. Leave its dirty bit set --
+                                // same shape as the frame_max deferral below -- and let the next
+                                // frame, by which time the publish step has put it back to IDLE,
+                                // pick it up.
+                                if(mp_chunkBusy(chunkTable[n])){
+                                    column_deferred=TRUE;
+                                    continue;
                                 }
                                 if(num>=frame_max){
                                     // Leave chunksToUpdate/columnsToUpdate set for what didn't fit,
@@ -2442,7 +2540,8 @@ void Terrain::prepareAndLoadGeometry(){
                             }
 
                         }
-                        columnsToUpdate[getColIndex(x,z)]=FALSE;
+                        if(!column_deferred)
+                            columnsToUpdate[getColIndex(x,z)]=FALSE;
                         // if(num>=1000){printg("1234overflow\n");break;}
                         
                     }
@@ -2478,7 +2577,16 @@ void Terrain::prepareAndLoadGeometry(){
 
         for(int i=0;i<idxrl;i++){
             
-                
+                   // B3 Stage 2. Deliberate scope limit (plan doc §4.3): only the bulk-reload /
+                   // streaming path goes to a worker. Player edits, explosions, fire and the
+                   // initial world load keep meshing inline -- they are few, latency-sensitive and
+                   // touch data right next to the player, so sending them off-thread widens the
+                   // invalidation surface for no measured gain (steady state is 0.065 ms/chunk and
+                   // is not felt). Revisit only with a number. mp_dispatch answering FALSE -- no
+                   // threads, no free slot, or something burning in this chunk -- falls straight
+                   // through to the unmodified inline path below.
+                   if(bulk_reload_active&&mp_dispatch(rebuildList[i],rebuildList[i]->idxn))
+                       continue;
               
                    if(rebuildList[i]->rebuild2()==-1){
                     //    chunksToUpdate[rebuildList[i].idxn]=TRUE;
@@ -2504,9 +2612,12 @@ void Terrain::prepareAndLoadGeometry(){
         
     }
     if(update_lighting){
-        void calculateLighting();
-        calculateLighting();
-        update_lighting=FALSE;
+        // Sliced: the lightbox sweep is O(window volume) and was one unbudgeted ~20ms (64z) /
+        // ~80ms (256z) frame per teleport/warp -- the actual 256z bulk-reload spike (the chunk
+        // mesh budget was already height-scaled). calculateLightingSlice does a budgeted strip of
+        // columns per frame and returns TRUE only once the whole window is swept.
+        if(calculateLightingSlice())
+            update_lighting=FALSE;
         // hit_load_counter=0;
     }
 
@@ -2518,6 +2629,11 @@ void Terrain::prepareAndLoadGeometry(){
 }
 void Terrain::updateAllImportantChunks(){
 	double start_time=-[start timeIntervalSinceNow];
+
+    // B3 Stage 2's publish point (plan doc §4.2): a worker fills the non-rt fields, the main
+    // thread copies them into rt* and uploads. This is where the pool's output joins the frame,
+    // alongside the inline mesher's own chunksToUpdateImmediatley backlog below.
+    mp_publishFinished(mp_redirtyChunk);
     
     
    

@@ -14,11 +14,21 @@ root*, not `Classes/` (`Classes/Lighting.c` exists but is not in the build).
   brightness=−1, subtracts) a spherical falloff light of radius `LIGHT_RADIUS 5`:
   `contribution = 64·(1−dist/5)·brightness·color`, clamped 0..255 per channel.
   Called when lightboxes are placed/destroyed/repainted.
-- `calculateLighting()` (`Lighting.mm:49`) — full rebuild: scans every resident chunk
+- `calculateLighting()` (`Lighting.mm`) — full rebuild: scans every resident chunk
   for `TYPE_LIGHTBOX` and re-adds its light, refreshing affected chunk meshes.
   Triggered via `updateLightingBegin()` (zero the array + set a flag) after world
   load and after every streaming event — lights are **not** persisted, they're
-  re-derived from lightbox blocks.
+  re-derived from lightbox blocks. The per-column scan body is factored into
+  `sweepLightingColumn(cx,cz)`, shared with the sliced form below.
+- `calculateLightingSlice()` (`Lighting.mm`, web-port perf change 2026-08-27) — the
+  same sweep but a budgeted strip of columns per frame (`LIGHTING_SWEEP_CHUNK_BUDGET`
+  256 chunks, counted like `BULK_RELOAD_CHUNK_BUDGET` so it stays flat at 256z),
+  holding a cursor between frames and returning TRUE only when the window is fully
+  swept. This is what the **post-bulk-reload** `update_lighting` path calls now: the
+  full scan is O(window volume) (~5.3M voxel tests at 64z, ~21M at 256z) and was one
+  unbudgeted ~20 ms (64z) / ~80 ms (256z) main-thread stall per teleport/warp — the
+  actual 256z reload spike, not the chunk-mesh budget. `updateLightingBegin()` calls
+  `calculateLightingSliceReset()` so a second teleport mid-sweep restarts from column 0.
 - Consumption: `calcLight(x,z,y, skylight, channel)` (`Terrain.mm:1505`) adds
   `lightarray/64` to the base skylight and clamps to 1.5; the mesher bakes this into
   vertex colors. Skylight is 1.0 by day, 0.35 when the sky color is the night palette
@@ -92,7 +102,9 @@ GL lights for doors/creatures).
 
 ## Common pitfalls
 - Lighting rebuilds re-mesh chunks in radius; a wall of lightboxes on a streaming
-  boundary causes visible hitching.
+  boundary causes visible hitching. The post-reload rebuild is now sliced
+  (`calculateLightingSlice`) so the *scan* no longer stalls a frame, but a dense
+  lightbox cluster can still spread its re-meshes across the following frames.
 - Liquids and fire both mutate terrain during `Terrain::update` — never cache raw
   block pointers across it.
 - Portal registry rebuilds via meshing means a portal in a *not-yet-meshed* chunk is

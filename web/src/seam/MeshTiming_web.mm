@@ -19,13 +19,32 @@
 // (Terrain.mm's list[] is sized CHUNKS_PER_SIDE^2*CHUNKS_PER_COLUMN_MAX), so this is noise next
 // to the work being measured.
 #include <emscripten/emscripten.h>
+#include <cstdint>
 #include <cstdio>
 
+// B3 Stage 2 made this file's rebuild2() wrapper multi-threaded. --wrap is a link-time symbol
+// rename, so Classes/MeshPool.mm's `chunk->rebuild2()` on a WORKER lands in __wrap_ below just
+// like the main thread's does — which is what keeps the mesh-CPU number honest once meshing moves
+// off-thread, and which means these three counters are now written from up to three threads at
+// once. Doubles cannot be atomically added, so the mesh accumulator is integer nanoseconds with
+// __atomic_fetch_add and the max is a compare-exchange loop. Upload/read/io stay plain doubles:
+// prepareVBO() and readColumn() are main-thread-only by construction (GL, and the non-reentrant
+// FileManager singleton respectively) and that is not going to change.
 namespace {
 
-double   g_meshMs = 0.0;
-double   g_meshMsMax = 0.0;
+uint64_t g_meshNs = 0;
+uint64_t g_meshNsMax = 0;
 unsigned g_meshCount = 0;
+
+void note_mesh(double ms) {
+    uint64_t ns = (uint64_t)(ms * 1e6);
+    __atomic_fetch_add(&g_meshNs, ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_meshCount, 1u, __ATOMIC_RELAXED);
+    uint64_t cur = __atomic_load_n(&g_meshNsMax, __ATOMIC_RELAXED);
+    while (ns > cur &&
+           !__atomic_compare_exchange_n(&g_meshNsMax, &cur, ns, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
 
 double   g_uploadMs = 0.0;
 double   g_uploadMsMax = 0.0;
@@ -39,7 +58,32 @@ double   g_readMs = 0.0;
 double   g_readMsMax = 0.0;
 unsigned g_readCount = 0;
 
+// B1 (ROADMAP Phase B): split the g_readMs figure above one layer further. FileManager::readColumn
+// is `NSFileHandle file I/O` + `RLE decode + band transpose` (see fmh_readColumnFromDefault). This
+// counter is the file-I/O half only — every fread() the shim's NSFileHandle -readDataOfLength:
+// serves during a read window, fed in via eden_mt_note_io() from src/shim/foundation/NSFileHandle.mm.
+// g_readMs - g_ioMs is then the pure RLE-decode/transpose CPU cost. The JS side splits g_ioMs again:
+// Module.EdenWorldFS.stats.fetchMs is the transport (sync XHR / fs.readSync) subset of it, leaving
+// g_ioMs - fetchMs as the lazy node's block-cache/coalesce overhead.
+double   g_ioMs = 0.0;
+double   g_ioMsMax = 0.0;
+unsigned g_ioCount = 0;
+
 } // namespace
+
+// Classes/MeshPool.mm (B3 Stage 2). Declared rather than #included so this seam file keeps its
+// no-engine-headers property — these are plain C entry points with no TerrainChunk in the signature.
+extern "C" void mp_getStats(double* snapshotMs, unsigned* dispatched, unsigned* inlined,
+                            unsigned* published, unsigned* stale);
+extern "C" void mp_resetStats();
+
+// C linkage, called from the NSFileHandle shim (a different TU) around its fread(). A tiny
+// accumulator function rather than an exported data symbol so there is no mangled-name coupling.
+extern "C" void eden_mt_note_io(double ms) {
+    g_ioMs += ms;
+    g_ioCount++;
+    if (ms > g_ioMsMax) g_ioMsMax = ms;
+}
 
 extern "C" {
 
@@ -47,22 +91,42 @@ extern "C" {
 // that window rather than a cumulative-since-boot figure.
 EMSCRIPTEN_KEEPALIVE
 void eden_debug_mesh_timing_reset(void) {
-    g_meshMs = g_meshMsMax = g_uploadMs = g_uploadMsMax = g_readMs = g_readMsMax = 0.0;
-    g_meshCount = g_uploadCount = g_readCount = 0;
+    g_uploadMs = g_uploadMsMax = g_readMs = g_readMsMax = 0.0;
+    g_ioMs = g_ioMsMax = 0.0;
+    g_uploadCount = g_readCount = g_ioCount = 0;
+    __atomic_store_n(&g_meshNs, (uint64_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_meshNsMax, (uint64_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_meshCount, 0u, __ATOMIC_RELAXED);
+    mp_resetStats();
 }
 
 // Static buffer, same shape as DebugState_web.mm's other JSON exports (that file is
 // EDEN_DIAGNOSTICS-only; this export deliberately is not, so it stays reachable in build-rel).
 EMSCRIPTEN_KEEPALIVE
 const char* eden_debug_mesh_timing(void) {
-    static char buf[384];
+    static char buf[768];
+    // B3 Stage 2's own numbers. snapshotMs is the ONE piece of work the worker mesher adds to the
+    // main thread — the 8 KB pblocks+pcolors memcpy per dispatched chunk, 10.6 MB per 64z burst —
+    // and it was unmeasured when Stage 2 was specified. dispatched/inlined say how often the pool
+    // actually took the work versus falling back to today's inline path (no threads, no free slot,
+    // or fire in the chunk); stale says how often an edit landed under a running job.
+    double   snapshotMs = 0.0;
+    unsigned dispatched = 0, inlined = 0, published = 0, stale = 0;
+    mp_getStats(&snapshotMs, &dispatched, &inlined, &published, &stale);
     snprintf(buf, sizeof(buf),
         "{\"meshMs\":%.3f,\"meshCount\":%u,\"meshMsMax\":%.3f,"
         "\"uploadMs\":%.3f,\"uploadCount\":%u,\"uploadMsMax\":%.3f,"
-        "\"readMs\":%.3f,\"readCount\":%u,\"readMsMax\":%.3f}",
-        g_meshMs, g_meshCount, g_meshMsMax,
+        "\"readMs\":%.3f,\"readCount\":%u,\"readMsMax\":%.3f,"
+        "\"ioMs\":%.3f,\"ioCount\":%u,\"ioMsMax\":%.3f,"
+        "\"snapshotMs\":%.3f,\"dispatched\":%u,\"inlined\":%u,"
+        "\"published\":%u,\"stale\":%u}",
+        (double)__atomic_load_n(&g_meshNs, __ATOMIC_RELAXED) / 1e6,
+        __atomic_load_n(&g_meshCount, __ATOMIC_RELAXED),
+        (double)__atomic_load_n(&g_meshNsMax, __ATOMIC_RELAXED) / 1e6,
         g_uploadMs, g_uploadCount, g_uploadMsMax,
-        g_readMs, g_readCount, g_readMsMax);
+        g_readMs, g_readCount, g_readMsMax,
+        g_ioMs, g_ioCount, g_ioMsMax,
+        snapshotMs, dispatched, inlined, published, stale);
     return buf;
 }
 
@@ -81,10 +145,7 @@ int __real__ZN12TerrainChunk8rebuild2Ev(TerrainChunk* self);
 int __wrap__ZN12TerrainChunk8rebuild2Ev(TerrainChunk* self) {
     double t0 = emscripten_get_now();
     int result = __real__ZN12TerrainChunk8rebuild2Ev(self);
-    double dt = emscripten_get_now() - t0;
-    g_meshMs += dt;
-    g_meshCount++;
-    if (dt > g_meshMsMax) g_meshMsMax = dt;
+    note_mesh(emscripten_get_now() - t0);
     return result;
 }
 

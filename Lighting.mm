@@ -45,6 +45,28 @@ void addlight(int xx,int zz,int yy,float brightness,Vector color){
    // printf("\n");
 }
 extern Vector colorTable[256];
+extern TerrainChunk** chunkTablec;
+
+// One (cx,cz) column of the resident window: scan its chunks for TYPE_LIGHTBOX and splat each
+// one's light. Shared by calculateLighting (whole window in one call, on world load) and
+// calculateLightingSlice (a budgeted strip per frame, after a bulk window reload) so the two can
+// never drift.
+static void sweepLightingColumn(int cx,int cz){
+    for(int cy=0;cy<CHUNKS_PER_COLUMN;cy++){
+        TerrainChunk* chunk=chunkTablec[threeToOne(cx,cy,cz)];
+        if(!chunk)continue;
+        for(int y=chunk->pbounds[1];y<CHUNK_SIZE+chunk->pbounds[1];y++){
+            for(int x=chunk->pbounds[0];x<CHUNK_SIZE+chunk->pbounds[0];x++){
+                for(int z=chunk->pbounds[2];z<CHUNK_SIZE+chunk->pbounds[2];z++){
+                    if(getLandc(x,z,y)==TYPE_LIGHTBOX){
+                        addlight(x,z,y,1.0f,colorTable[getColorc(x,z,y)]);
+                        World::getWorld->terrain->refreshChunksInRadius(x,z,y,LIGHT_RADIUS);
+                    }
+                }
+            }
+        }
+    }
+}
 
 void calculateLighting(){
     //printf("calculating lighting first load\n");
@@ -84,29 +106,43 @@ void calculateLighting(){
     
     for(int cx=0;cx<CHUNKS_PER_SIDE;cx++){
         for(int cz=0;cz<CHUNKS_PER_SIDE;cz++){
-                for(int cy=0;cy<CHUNKS_PER_COLUMN;cy++){
-                    TerrainChunk* chunk=chunkTablec[threeToOne(cx,cy,cz)];
-                   
-                    if(chunk)
-                    for(int y=chunk->pbounds[1];y<CHUNK_SIZE+chunk->pbounds[1];y++){
-                        for(int x=chunk->pbounds[0];x<CHUNK_SIZE+chunk->pbounds[0];x++){
-                            for(int z=chunk->pbounds[2];z<CHUNK_SIZE+chunk->pbounds[2];z++){
-                                
-                                if(getLandc(x,z,y)==TYPE_LIGHTBOX){
-                                    addlight(x,z,y,1.0f,colorTable[getColorc(x,z,y)]);
-                                    World::getWorld->terrain->refreshChunksInRadius(x,z,y,LIGHT_RADIUS);
-                                }
-                                
-                                
-                            }
-                        }
-                    }
-                }
+            sweepLightingColumn(cx,cz);
         }
     }
     
     
     //printf("calculating lighting first load end\n");
+}
+
+// Post-bulk-reload lighting (Terrain.mm's update_lighting path). calculateLighting above is an
+// O(window volume) scan for TYPE_LIGHTBOX -- ~5.3M voxel tests at 64z, ~21M at 256z -- and
+// measured as a single unbudgeted ~20ms (64z) / ~80ms (256z) main-thread stall once per
+// teleport/warp (tools/headless-mesh-burst-probe*.js, 2026-08-27: it, not the chunk mesh budget,
+// is the 256z reload spike). This walks the same window a budgeted strip of columns per frame,
+// holding a cursor between calls; a partly-swept window just has some lightboxes not yet
+// contributing for a few frames -- the same tolerated-stale state the reload budget itself relies
+// on. Budget is counted in chunks, like BULK_RELOAD_CHUNK_BUDGET, so the per-frame cost stays
+// flat as world height scales (256 chunks = 64 columns at 64z, 16 at 256z). Returns TRUE once the
+// whole window has been swept; the caller clears update_lighting on that.
+#define LIGHTING_SWEEP_CHUNK_BUDGET 256
+
+static int g_lighting_sweep_cursor=0;
+
+// Called by updateLightingBegin (Terrain.mm) whenever it zeroes lightarray to start a fresh
+// rebuild -- otherwise a second teleport mid-slice would resume from the old cursor and never
+// re-sweep the columns before it.
+void calculateLightingSliceReset(){ g_lighting_sweep_cursor=0; }
+
+BOOL calculateLightingSlice(){
+    if(LOW_MEM_DEVICE)return TRUE;
+    int& cursor=g_lighting_sweep_cursor;
+    const int ncols=CHUNKS_PER_SIDE*CHUNKS_PER_SIDE;
+    int col_budget=LIGHTING_SWEEP_CHUNK_BUDGET/CHUNKS_PER_COLUMN;
+    if(col_budget<1)col_budget=1;
+    for(int done=0;done<col_budget&&cursor<ncols;done++,cursor++)
+        sweepLightingColumn(cursor/CHUNKS_PER_SIDE,cursor%CHUNKS_PER_SIDE);
+    if(cursor>=ncols){cursor=0;return TRUE;}
+    return FALSE;
 }
 /*if(getLandc(x,z,y)==TYPE_NONE)continue;
  float ret=y/T_HEIGHT/2+.7f;

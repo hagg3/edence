@@ -216,16 +216,33 @@ Doors and portals are *stored* as voxels but *rendered and animated* as extracte
      renames a `.savetmp` over it.
    - when every column has landed *and* the meshing they dirtied has drained:
      `addMoreCreaturesIfNeeded()`, `loaded_new_terrain`, and the lighting recompute
-     (`update_lighting` → `calculateLighting` at the tail of the same pass).
-4. Drain dirty lists → `rebuild2()` each chunk → queue VBO uploads. Two things modify this pass
+     (`update_lighting` → `calculateLightingSlice()` at the tail of the same pass —
+     itself frame-budgeted since 2026-08-27: the full `calculateLighting` scan is
+     O(window volume) and was a ~20 ms / ~80 ms (64z / 256z) unbudgeted stall here,
+     the real 256z reload spike; it now sweeps a strip of columns per frame and
+     `update_lighting` stays set until the sweep reports done).
+4. Drain dirty lists → `rebuild2()` each chunk → queue VBO uploads. **Since 2026-08-27 the chunks
+   dirtied by a bulk reload are meshed on worker threads instead** (`Classes/MeshPool.{h,mm}`) —
+   edits, explosions, fire and the initial load still mesh inline in this pass. The rule that
+   matters here: a column whose chunks have a mesh job in flight is **skipped by the column read
+   above**, because `readColumn()` re-homes the slot a worker is reading. See docs/rendering.md
+   "Off-thread meshing". Two things modify this pass
    **while a bulk reload is in flight** (and only then — an edit, an explosion and the initial
-   world load still drain in one frame): a column that has not streamed in yet is skipped, flags
-   intact, because every neighbouring column that *has* landed dirtied it and its data is about to
-   be replaced; and the same 96-chunk budget caps the pass, reusing the deferral the `list_max`
-   guard already had. The skip test asks only about the column itself, never its neighbours —
-   deferring a column whose data is already new but whose geometry is old produces a state
-   nothing else in the engine produces, and it crashed the release build intermittently. See
-   `WORKING/chunk-streaming-redesign-prompt.md` §2 for that experiment and §6 for the rollback.
+   world load still drain in one frame): a column is skipped, flags intact, unless it **and its
+   four lateral neighbours** have all streamed in, because `rebuild2()` reads one block across
+   each side face and meshing early just builds geometry for data about to be replaced; and the
+   same 96-chunk budget caps the pass, reusing the deferral the `list_max` guard already had.
+   The neighbourhood test means each chunk is meshed exactly once per reload — 1296 rebuilds and
+   107 ms of mesh CPU per burst, against 1949 and 144 ms for a test that asked only about the
+   column itself (`tools/headless-mesh-burst-probe.js`, same-session A/B).
+
+   That neighbourhood test was written, reverted and restored: it is the only thing in the engine
+   that draws a chunk which has not been meshed since it was allocated, and until 2026-08-27
+   `TerrainChunk`'s constructor left the whole `rt*` geometry block uninitialised, so
+   `render()`'s `rtn_vertices==0` guard read garbage from a recycled heap and the index `memcpy`
+   walked off `allIndices`. See [rendering.md](rendering.md) and
+   `WORKING/chunk-streaming-redesign-prompt.md` §2. **Any future deferral that leaves a resident
+   chunk unmeshed — a worker-thread mesher, above all — depends on that initialisation.**
 
 The old octree (`TreeNode troot`, `addToTree`, …) is vestigial: `renderTree()` says it
 plainly — "once upon a time this descended an oct-tree, profiling showed it was
