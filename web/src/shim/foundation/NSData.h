@@ -7,13 +7,36 @@
 #import "NSObject.h"
 #include <vector>
 #include <cstdint>
+#include <memory>
+#include <utility>
+
+// B6 (ROADMAP Phase B): std::vector<uint8_t>::resize() VALUE-initialises what it grows into, i.e.
+// it zero-fills. Every one of this shim's grow sites (initWithBytes:, initWithContentsOfFile:,
+// appendBytes:, and NSFileHandle's -readDataOfLength:) overwrites 100% of those bytes on the very
+// next statement, so the fill is pure waste -- and on the chunk-streaming burst path it is ~48 KB
+// of it per bundled-map column, thousands of columns per teleport. This allocator is the standard
+// escape hatch: identical to std::allocator except that a value-less construct() does a DEFAULT
+// initialisation (a no-op for uint8_t) instead of a value initialisation, which makes resize()
+// leave new bytes untouched. It changes NOTHING an NSData caller can observe, because -setLength:
+// below still explicitly zeroes what it grows into, exactly like real Foundation does.
+template <class T>
+struct eden_default_init_allocator : std::allocator<T> {
+    using std::allocator<T>::allocator;
+    template <class U> struct rebind { typedef eden_default_init_allocator<U> other; };
+    template <class U, class... Args> void construct(U *p, Args &&...args) {
+        ::new ((void *)p) U(std::forward<Args>(args)...);
+    }
+    template <class U> void construct(U *p) { ::new ((void *)p) U; }  // default-init: no zero-fill
+};
+
+typedef std::vector<uint8_t, eden_default_init_allocator<uint8_t> > eden_byte_vector;
 
 @class NSString;
 typedef struct _NSRange NSRange;
 
 @interface NSData : NSObject {
 @public
-    std::vector<uint8_t> _bytes;
+    eden_byte_vector _bytes;
 }
 
 + (NSData *)data;
@@ -49,6 +72,11 @@ typedef struct _NSRange NSRange;
 - (void)appendBytes:(const void *)bytes length:(NSUInteger)len;
 - (void)appendData:(NSData *)other;
 - (void)setLength:(NSUInteger)len;
+// Shim-only (no real-Foundation counterpart). Same as -setLength: but skips zeroing the bytes it
+// grows into -- for the "grow, then immediately overwrite every byte" shape, which is what the
+// NSFileHandle read path does. Growing with this and then NOT filling leaks whatever the allocator
+// handed back, so only use it immediately before a full overwrite.
+- (void)setLengthUninitialized:(NSUInteger)len;
 @end
 
 #endif

@@ -16,9 +16,48 @@ matching the root engine's own pre-ARC style).
 
 ## Dispatch model
 **Slot-based**, not IMP-based: `objc_msg_lookup_sender`/`objc_slot_lookup_super`
-return a `struct objc_slot*`, looked up per send via an `unordered_map<uint64,
-slot*>` — there is no inline cache. This is a real, measured perf cost (e.g.
-`Hud.mm` alone issues 275 message sends), accepted rather than optimized away.
+return a `struct objc_slot*`. Every `[obj msg]` in the engine goes through
+`lookupSlot()`, and `Hud.mm` alone issues 275 sends, so the send path has been
+optimized in three measured steps. In the order a send meets them:
+
+1. **A direct-mapped inline cache** (4096 entries, keyed on the low bits of
+   `(class, interned selector name)`) — perf-audit row #15. One array read and one
+   compare for the overwhelmingly common repeat send.
+2. **An `unordered_map<uint64, slot*>` method cache** behind it, which is where the
+   inline cache's misses and collisions land. The 64-bit key packs the two 32-bit
+   wasm pointers exactly, so a hit needs no re-verification.
+3. **A full class-chain walk** (`findMethod`) on first sight of a (class, selector)
+   pair. No implementation anywhere ⇒ `unresolvedMethod()` names the selector and
+   aborts; this runtime has no forwarding.
+
+All caches are **per-thread** (`EDEN_OBJC_TLS`), not locked — the method lists they
+read are immutable after static-constructor time, so two threads independently
+reconstruct identical slots rather than contending. See the long comment above
+`methodCache()`.
+
+**The `isResolved()` guard runs AFTER the inline cache, and that ordering is
+load-bearing** (ROADMAP B7). The guard catches a message sent to a class whose
+superclass never registered — walking such a class's chain reads a `const char*`
+name as if it were a pointer — but `resolvedClasses()` is insert-only, so a cache
+hit is itself proof the class was resolved. An unresolved class can never hit;
+it misses and gets the same named abort it always did. Moving the guard behind
+the hit removed an `unordered_map` lookup from *every* send.
+
+**`objc_lookup_class()` is on the hot path too**, and is easy to forget: clang emits
+one at every `[ClassName msg]` site. `classesByName()` is keyed on `std::string`,
+which pre-C++20 has no heterogeneous lookup, so `find(const char *)` used to build
+and hash a `std::string` per class-message send (plus malloc/free for any name past
+the 15-byte SSO buffer). `findClass()` now front-ends it with a 256-entry
+direct-mapped cache keyed on the caller's name pointer, verified with `strcmp` on
+hit and invalidated wholesale by a generation counter that `__objc_exec_class()`
+bumps.
+
+Measured (B7, 2026-08-28, `tools/headless-column-read-bench.js` — the port's
+lowest-noise shim-level harness): **isolated column read 1.15 → 1.075 µs/column
+(−7%) single-threaded, 2.84 → 2.73 (−4%) threaded**; in a whole-session CPU profile
+`lookupSlot` + `findClass` self time fell **16.5 ms → 6.7 ms (−60%)**. The strcmp
+verification was A/B'd against trusting the pointer outright and cost ~1.5%, inside
+the harness's noise — so the safe version is the one that shipped.
 
 ## The ivar-layout sentinel fix (pass 7)
 Under `-x objective-c++`, a class whose **entire ancestor chain has zero own

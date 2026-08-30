@@ -24,7 +24,8 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const positional = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+const argv = process.argv.slice(2);
+const positional = argv.filter((a) => !a.startsWith('--'));
 const edenJsPath = path.resolve(positional[0] || path.join(__dirname, '..', 'build-relwdiag', 'eden.js'));
 const edenDir = path.dirname(edenJsPath);
 
@@ -110,6 +111,16 @@ global.Module.postRun.push(async () => {
     }
     await new Promise((r) => setTimeout(r, 2000)); // let the initial-load churn settle
 
+    // B6: the per-fread timing that produces the `ioMs` half of B1's split is OFF by default now.
+    // It costs two emscripten_get_now() calls per -readDataOfLength:, and since B6 cut the reads
+    // per column from 8 to 1 that is no longer the 16-crossings-per-column it was -- but it is
+    // still measurement overhead sitting inside the thing being measured, so it stays opt-in.
+    // Without --io-timing, ioMs/transportMs/cacheMs below read 0 and rleCpuMs collapses to readMs.
+    const ioTiming = argv.includes('--io-timing');
+    if (ioTiming && typeof global.Module._eden_debug_set_io_timing === 'function') {
+        global.Module._eden_debug_set_io_timing(1);
+    }
+
     const results = [];
     // Several teleports far enough apart that each one re-triggers a near-full-window reload
     // (Terrain.mm's `count>140` gate) — same coordinates used against the real-Safari run.
@@ -163,11 +174,20 @@ global.Module.postRun.push(async () => {
         };
         // readMs = NSFileHandle I/O (ioMs) + RLE-decode/transpose CPU. ioMs = transport (fetchMs)
         // + block-cache/coalesce overhead. Break it out so B1 has the layered number it asks for.
+        // B3 Stage 3 split this. A column whose decode was deferred to a worker never enters
+        // FileManager::readColumn, so `readMs` does not see it at all -- its main-thread half shows
+        // up as `readRawMs` (the seek + fread of the raw RLE bytes) and its CPU half as `decodeMs`
+        // on a worker. The figure to compare across builds is therefore mainThreadColumnMs, NOT
+        // readMs: in a non-threaded build readRawMs and decodeMs are 0 and it reduces to the old
+        // readMs. rleCpuMs keeps meaning "decode still being done on the main thread", which is
+        // what should go to ~0 when Stage 3 is working.
+        const mainThreadColumnMs = +(timing.readMs + (timing.readRawMs || 0)).toFixed(3);
         const rleCpuMs = +(timing.readMs - timing.ioMs).toFixed(3);
         const cacheMs = +(timing.ioMs - worldfs.fetchMs).toFixed(3);
         results.push({
             ...r, ...timing,
             meshMsPerChunk: timing.meshCount ? +(timing.meshMs / timing.meshCount).toFixed(4) : 0,
+            mainThreadColumnMs,
             b1_breakdown: { readMs: +timing.readMs.toFixed(3), ioMs: +timing.ioMs.toFixed(3),
                             transportMs: worldfs.fetchMs, cacheMs, rleCpuMs, ...worldfs },
         });
@@ -182,26 +202,18 @@ global.Module.postRun.push(async () => {
         readMs: a.readMs + b.readMs, ioMs: a.ioMs + b.ioMs,
         transportMs: a.transportMs + b.b1_breakdown.transportMs,
         rleCpuMs: a.rleCpuMs + b.b1_breakdown.rleCpuMs,
-    }), { readMs: 0, ioMs: 0, transportMs: 0, rleCpuMs: 0 });
-    // B3 Stage 2. dispatched/inlined say whether the worker pool actually took the work or fell
-    // back to the inline path (no threads, no free slot, or fire in the chunk — all three are
-    // designed fallbacks, not failures); stale says how often an edit landed under a running job;
-    // snapshotMs is the 8 KB-per-chunk pblocks+pcolors copy the pool ADDS to the main thread.
-    const b3 = results.reduce((a, b) => ({
-        dispatched: a.dispatched + (b.dispatched || 0), inlined: a.inlined + (b.inlined || 0),
-        published: a.published + (b.published || 0), stale: a.stale + (b.stale || 0),
-        snapshotMs: a.snapshotMs + (b.snapshotMs || 0),
-        overBudget: a.overBudget + b.over_budget_ms, over16: a.over16 + b.blocks_over_16ms,
-    }), { dispatched: 0, inlined: 0, published: 0, stale: 0, snapshotMs: 0, overBudget: 0, over16: 0 });
-    console.log(`soft-drag total over ${results.length} bursts: ${b3.overBudget.toFixed(0)} ms past the ` +
-        `16.66 ms budget, in ${b3.over16} frames; window fill time ` +
-        `${results.map((x) => x.fill_ms).join('/')} ms`);
-    console.log(`B3 mesh pool: ${b3.dispatched} chunks dispatched to workers, ${b3.inlined} meshed ` +
-        `inline, ${b3.published} published, ${b3.stale} went stale; ` +
-        `${b3.snapshotMs.toFixed(1)} ms of snapshot memcpy on the main thread`);
-    console.log(`B1 column-read breakdown, summed over ${results.length} bursts: ` +
-        `readMs ${tot.readMs.toFixed(1)} = fread I/O ${tot.ioMs.toFixed(1)} ` +
-        `(transport ${tot.transportMs.toFixed(1)} + cache/coalesce ${(tot.ioMs - tot.transportMs).toFixed(1)}) ` +
-        `+ RLE decode/transpose CPU ${tot.rleCpuMs.toFixed(1)}`);
+        readRawMs: a.readRawMs + (b.readRawMs || 0),
+        decodeMs: a.decodeMs + (b.decodeMs || 0),
+        mainThread: a.mainThread + b.mainThreadColumnMs,
+        decodedCols: a.decodedCols + (b.decodedColumns || 0),
+    }), { readMs: 0, ioMs: 0, transportMs: 0, rleCpuMs: 0, readRawMs: 0, decodeMs: 0,
+          mainThread: 0, decodedCols: 0 });
+    console.log(`column read ON THE MAIN THREAD, summed over ${results.length} bursts: ` +
+        `${tot.mainThread.toFixed(1)} ms = readColumn ${tot.readMs.toFixed(1)} ` +
+        `(fread I/O ${tot.ioMs.toFixed(1)}, of which transport ${tot.transportMs.toFixed(1)}; ` +
+        `RLE decode/transpose still inline ${tot.rleCpuMs.toFixed(1)}) ` +
+        `+ raw read for deferred columns ${tot.readRawMs.toFixed(1)}`);
+    console.log(`column decode moved OFF the main thread: ${tot.decodeMs.toFixed(1)} ms of ` +
+        `RLE decode/transpose on workers, over ${tot.decodedCols} columns`);
     process.exit(0);
 });

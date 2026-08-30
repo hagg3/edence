@@ -85,7 +85,12 @@ sizeWithFont:.
 `dataWithBytes:length:`, `initWithBytes:length:`, `initWithBytesNoCopy:length:`,
 `initWithContentsOfFile:`, `dataWithContentsOfFile:`, `initWithData:`, `appendBytes:length:`,
 `appendData:`, `bytes`, `mutableBytes`, `length`, `writeToFile:atomically:`,
-`getBytes:length:`/`getBytes:range:`, `subdataWithRange:`. Backing: `std::vector<uint8_t>`.
+`getBytes:length:`/`getBytes:range:`, `subdataWithRange:`. Backing: a `std::vector<uint8_t>`
+with a **default-init allocator** (`eden_default_init_allocator`, NSData.h) — `resize()` therefore
+does NOT zero what it grows into, because every grow site here overwrites those bytes on the next
+statement (B6, 2026-08-28). `-setLength:` re-adds the zero-fill explicitly so it still matches real
+Foundation; the shim-only `-setLengthUninitialized:` is the escape hatch for "grow, then fill
+completely", which is what the file-read path does.
 All implemented (trivial). `initWithContentsOfFile:`/`writeToFile:` are the **P4** seam
 (FileManager's actual save I/O) — implemented here over plain `fopen`/`FILE*` for P1 headless
 correctness; P4 swaps the *seam* (FileManager.mm's callers), not this class, to OPFS.
@@ -133,6 +138,19 @@ matching this API almost 1:1). **This pass**: header + a P1-only backing over pl
 `fopen`/`fseek`/`fread`/`fwrite` (works under Emscripten's default MEMFS, enough to link and
 smoke-test in-memory), clearly marked `// TODO P4: swap to OPFS FileSystemSyncAccessHandle,
 see WORKING/web-port-plan.md Stage P4` at every method.
+
+**Read-path performance (B6, 2026-08-28).** `-readDataOfLength:` is the world file's read
+primitive and it is on the chunk-streaming burst path, so its per-call overhead matters. Two
+things were removed: the `-setLength:` zero-fill (see NSData above), and the unconditional
+per-`fread` `emscripten_get_now()` pair that fed B1's I/O split — that timing is now behind
+`eden_debug_set_io_timing(1)` and OFF by default, so shipped builds pay one branch instead of two
+wasm→JS crossings per read (`tools/headless-mesh-burst-probe.js --io-timing` turns it back on).
+What is deliberately **not** here is a read-ahead buffer: a 16 KB one was implemented, measured,
+and thrown away — it made the column read ~60% *slower*, because under this port the file is the
+lazy `Eden.eden` node serving reads out of 32 KB blocks, so over-reading costs a real copy. The
+fix that worked was at the caller (`fmh_readColumnRawFromDefault` asks for the whole ~1.2 KB
+record once instead of eight times), which left nothing for a buffer here to earn. Measure with
+`tools/headless-column-read-bench.js` before adding one back.
 
 ### NSFileManager — P1 (to link) / **P4**. 10 mentions
 `defaultManager`, `fileExistsAtPath:`, `createFileAtPath:contents:attributes:`,

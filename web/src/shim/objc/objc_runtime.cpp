@@ -93,6 +93,16 @@ eden_objc_selector *canonicalSelector(const char *name, const char *types) {
   return sel;
 }
 
+// Per-thread storage for the three dispatch-path caches (the class-name cache below and the two
+// method caches further down). `thread_local` in the threaded build, nothing at all in the
+// single-threaded one — so the ST build's codegen is byte-for-byte what it was. The reasoning for
+// per-thread rather than locked caches is spelled out above methodCache().
+#if defined(__EMSCRIPTEN_PTHREADS__)
+#define EDEN_OBJC_TLS thread_local
+#else
+#define EDEN_OBJC_TLS
+#endif
+
 // --- Class registry ----------------------------------------------------------------------
 std::unordered_map<std::string, eden_objc_class *> &classesByName() {
   static std::unordered_map<std::string, eden_objc_class *> m;
@@ -131,11 +141,67 @@ bool isResolved(eden_objc_class *cls) {
   return cls && resolvedClasses().count(cls) != 0;
 }
 
+// Bumped by every __objc_exec_class(); see classCache() for why the cache keys on it.
+unsigned &registryGeneration() {
+  static unsigned g = 0;
+  return g;
+}
+
+// Direct-mapped cache in front of classesByName() (ROADMAP B7, found by B6's profile). Clang emits
+// an objc_lookup_class() call at EVERY `[ClassName msg]` site, so this runs once per class-message
+// send — and `classesByName()` is keyed on std::string, which before C++20 has no heterogeneous
+// lookup: `m.find(name)` therefore CONSTRUCTED a std::string from the `const char *` on every send,
+// hashed the whole name, and for any name longer than the 15-byte SSO buffer ("NSAutoreleasePool",
+// "NSMutableDictionary", …) called malloc and free as well. In B6's isolated read bench findClass
+// was 3.9% of the whole column-read path's self time, next to nothing of which was the actual
+// lookup. Keying on the caller's `const char *` skips all of that.
+//
+// Two things make the pointer a legitimate key rather than a shortcut:
+//   * A HIT IS VERIFIED, not trusted — strcmp against the class's own name. A `const char *` is
+//     not a stable identity in general (a freed heap string can be reallocated at the same
+//     address), and this file's whole style is to not rely on an invariant it hasn't checked. The
+//     strcmp is on a ~10–20 byte name that is already in cache; what it replaces is a string
+//     construction plus a hash of the same bytes, so it is strictly cheaper than the miss path.
+//   * The generation counter covers registration. classesByName() is insert-only AFTER static
+//     construction (nothing in this tree calls objc_allocateClassPair — see the threading note at
+//     the top of the file), but DURING it a name can be looked up before its class registers, and
+//     `operator[]` would let a duplicate name overwrite. Rather than reason about either, every
+//     __objc_exec_class() invalidates the whole cache by bumping the counter — free, since that
+//     runs only from static constructors, and it means the cache cannot outlive a registry change.
+// A miss falls through to the map unchanged; like the inline method cache, this is purely
+// additive and can never be a second source of truth.
+struct ClassCacheEntry {
+  const char *name;
+  eden_objc_class *cls;
+  unsigned generation;
+};
+const unsigned kClassCacheSize = 256;  // power of two; the port registers ~40 classes
+const unsigned kClassCacheMask = kClassCacheSize - 1;
+ClassCacheEntry *classCache() {
+  static EDEN_OBJC_TLS ClassCacheEntry table[kClassCacheSize] = {};
+  return table;
+}
+inline unsigned classCacheIndex(const char *name) {
+  // Name literals are byte-aligned and clustered per translation unit, so mix several byte
+  // positions rather than taking the low bits straight.
+  const size_t p = (size_t)name;
+  return (unsigned)((p ^ (p >> 8) ^ (p >> 16)) & kClassCacheMask);
+}
+
 eden_objc_class *findClass(const char *name) {
   if (!name) return 0;
+  ClassCacheEntry &ce = classCache()[classCacheIndex(name)];
+  if (ce.name == name && ce.generation == registryGeneration() && ce.cls &&
+      strcmp(ce.cls->name, name) == 0) {
+    return ce.cls;
+  }
   std::unordered_map<std::string, eden_objc_class *> &m = classesByName();
   std::unordered_map<std::string, eden_objc_class *>::iterator it = m.find(name);
-  return it == m.end() ? 0 : it->second;
+  if (it == m.end()) return 0;  // misses are NOT cached — the class may register later
+  ce.name = name;
+  ce.cls = it->second;
+  ce.generation = registryGeneration();
+  return it->second;
 }
 
 void registerMethodList(eden_objc_method_list *list) {
@@ -314,9 +380,10 @@ void drainPending() {
 }
 
 // --- Dispatch ----------------------------------------------------------------------------
-// PER-THREAD CACHES, not locked caches (audit row 36/C1, pass 63). Both caches below are
-// `EDEN_OBJC_TLS`, which is `thread_local` in the threaded build and nothing at all in the
-// single-threaded one — so the ST build's codegen is byte-for-byte what it was.
+// PER-THREAD CACHES, not locked caches (audit row 36/C1, pass 63). Both caches below — and the
+// class-name cache up in the class registry — are `EDEN_OBJC_TLS`, which is `thread_local` in the
+// threaded build and nothing at all in the single-threaded one (the macro is defined above
+// classesByName()), so the ST build's codegen is byte-for-byte what it was.
 //
 // Why per-thread beats a mutex here, and it is not close: this is the hot path of every single
 // `[obj msg]` in the engine — Hud.mm alone has 275 sends and per-frame sends run into the
@@ -337,12 +404,6 @@ void drainPending() {
 // If a future thread ever DOES need to see main-thread cache state, the answer is still not a
 // lock on this path — it is that the underlying method lists are already shared, so the second
 // thread reconstructs the same answer on its own.
-#if defined(__EMSCRIPTEN_PTHREADS__)
-#define EDEN_OBJC_TLS thread_local
-#else
-#define EDEN_OBJC_TLS
-#endif
-
 // Method cache, keyed on (class, interned selector name). Both are 32-bit under wasm32, so the
 // packed 64-bit key is exact — no collisions, no need to re-verify on hit.
 std::unordered_map<unsigned long long, eden_objc_slot *> &methodCache() {
@@ -423,6 +484,22 @@ eden_objc_slot *unresolvedMethod(eden_objc_class *cls, const char *selName) {
 }
 
 eden_objc_slot *lookupSlot(eden_objc_class *cls, eden_objc_selector *sel) {
+  const char *selName = sel->name;
+  const unsigned long long key = cacheKey(cls, selName);
+
+  // The inline cache comes FIRST, ahead of the isResolved() guard below (ROADMAP B7). The guard
+  // used to run on every single message send, which made an `unordered_map<ptr,bool>` lookup the
+  // unavoidable floor of the fastest path in the runtime — B6's profile caught it inside
+  // lookupSlot, 5.1% of the whole column-read path. Reordering keeps the guard's diagnostic value
+  // intact: `resolvedClasses()` is insert-only (never erased — see resolveClass()), so a class
+  // that was resolved when this entry was cached is still resolved now, and a cache HIT is itself
+  // proof that this (class, selector) pair reached the miss path below and passed the guard there.
+  // An unresolved class can therefore never hit; it misses (nothing ever cached for it) and gets
+  // the same named abort it always did, on the same send. Computing `key` before the guard is
+  // safe — it only reads the pointers, never dereferences `cls`, which is the whole hazard.
+  InlineCacheEntry &ic = inlineCache()[inlineCacheIndex(key)];
+  if (ic.key == key && ic.slot) return ic.slot;
+
   // Guard, not an assertion for its own sake: an UNRESOLVED class still holds a `const char *`
   // class NAME in its super_class field (objc_abi.h note 3), so walking the chain would step off
   // the end of a string and into arbitrary memory. That is precisely the "memory access out of
@@ -437,11 +514,6 @@ eden_objc_slot *lookupSlot(eden_objc_class *cls, eden_objc_selector *sel) {
             pendingClasses().size());
     abort();
   }
-  const char *selName = sel->name;
-  const unsigned long long key = cacheKey(cls, selName);
-
-  InlineCacheEntry &ic = inlineCache()[inlineCacheIndex(key)];
-  if (ic.key == key && ic.slot) return ic.slot;
 
   std::unordered_map<unsigned long long, eden_objc_slot *> &cache = methodCache();
   std::unordered_map<unsigned long long, eden_objc_slot *>::iterator it = cache.find(key);
@@ -478,6 +550,10 @@ void __objc_exec_class(void *module_ptr, ...) {
   eden_objc_module *module = (eden_objc_module *)module_ptr;
   if (!module || !module->symtab) return;
   eden_objc_symtab *symtab = module->symtab;
+
+  // The registry is about to change; invalidate every thread's class-name cache (see classCache()).
+  // Only static constructors reach here, so this costs nothing on any hot path.
+  registryGeneration()++;
 
   // Selectors first: method-list registration below interns against the same table.
   if (symtab->refs) {

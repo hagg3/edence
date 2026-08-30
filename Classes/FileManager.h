@@ -79,6 +79,13 @@ public:
     void saveColumn(int cx,int cz);
     void saveGenColumn(int cx,int cz,int origin);
     void readColumn(int cx,int cz,NSFileHandle* nsfh);
+    // B3 Stage 3. What Terrain's bulk reload calls instead of readColumn(). Identical, except that
+    // a column coming from the BUNDLED default map -- the only path with an RLE decode in it, and
+    // B1's ~75% of the burst's column-read cost -- may be handed to a worker instead. Returns TRUE
+    // if the column has landed synchronously (the caller marks it loaded), FALSE if a decode job
+    // was dispatched and the column will land in a later frame. readColumn() itself is unchanged
+    // and still synchronous for every other caller, world load included.
+    BOOL readColumnDeferred(int cx,int cz,NSFileHandle* nsfh);
     void saveWorld();
     void saveWorld(Vector warp);
     void loadGenFromDisk();

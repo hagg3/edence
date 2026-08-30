@@ -33,6 +33,15 @@ void mp_beginFrame();
 // idxn is the chunk's index in Terrain's chunkTable, remembered so the publish step can re-dirty it.
 BOOL mp_dispatch(TerrainChunk* chunk,int idxn);
 
+// B3 Stage 3. Try to hand column (cx,cz)'s RLE decode to a worker. The RAW READ happens inside
+// this call, on the main thread, because it is FileManager singleton state (one open handle, a
+// stateful seek); only the run-expansion and the band transpose -- B1's ~75% of the column-read
+// cost -- go to the worker, and the publish (chunk voxels, blockarray, dirty lists) comes back to
+// the main thread. TRUE = accepted: the caller must NOT mark the column loaded, and nothing may
+// touch its chunks until mp_publishFinished() lands it. FALSE = "read it inline yourself", the
+// stock synchronous path, which is again both the fallback and the kill switch.
+BOOL mp_dispatchColumnDecode(int cx,int cz);
+
 // Main thread: publish every job that has finished since the last call -- replay its deferred side
 // effects, prepareVBO() it, hand the slot back. `redirty` is called for any chunk whose mesh went
 // stale under it (an edit landed after the snapshot) or that rebuild2() refused, so the caller can
@@ -55,6 +64,10 @@ void mp_drain(void (*redirty)(int idxn),BOOL publish);
 // this change ADDS to the main thread, and unmeasured until now (10.6 MB per 64z burst).
 extern "C" void mp_getStats(double* snapshotMs,unsigned* dispatched,unsigned* inlined,
                             unsigned* published,unsigned* stale);
+// B3 Stage 3: readRawMs is the main-thread raw file read inside a decode dispatch -- what is LEFT
+// of the column-read cost after the run-expansion and transpose move to a worker. `decoded` counts
+// the columns that went off-thread.
+extern "C" void mp_getDecodeStats(double* readRawMs,double* decodeMs,unsigned* decoded);
 extern "C" void mp_resetStats();
 
 #endif

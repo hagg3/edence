@@ -225,8 +225,10 @@ Doors and portals are *stored* as voxels but *rendered and animated* as extracte
    dirtied by a bulk reload are meshed on worker threads instead** (`Classes/MeshPool.{h,mm}`) —
    edits, explosions, fire and the initial load still mesh inline in this pass. The rule that
    matters here: a column whose chunks have a mesh job in flight is **skipped by the column read
-   above**, because `readColumn()` re-homes the slot a worker is reading. See docs/rendering.md
-   "Off-thread meshing". Two things modify this pass
+   above**, because `readColumn()` re-homes the slot a worker is reading. Since the same date the
+   column **read** is split too: a column served from the bundled default map has its RLE decode
+   done on a worker (`FileManager::readColumnDeferred` → `fmh_decodeColumnBands`), and does not
+   count as resident until that decode publishes. See docs/rendering.md "Off-thread meshing". Two things modify this pass
    **while a bulk reload is in flight** (and only then — an edit, an explosion and the initial
    world load still drain in one frame): a column is skipped, flags intact, unless it **and its
    four lateral neighbours** have all streamed in, because `rebuild2()` reads one block across

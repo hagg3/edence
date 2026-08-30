@@ -74,6 +74,18 @@ the loading pthread during initial load and from the main thread during streamin
 the shared file handle's seek/read pairs are the point of fragility if you ever
 parallelize loading.
 
+Since the web port's B3/B6 work it is three functions rather than one — a main-thread
+`fmh_readColumnRawFromDefault` (seek + read the raw RLE bytes), a pure
+`fmh_decodeColumnBands` (run-expansion + the `CC(x,z,y)`↔`CC(y,z,x)` band transpose,
+which is what can run on a worker) and a main-thread `fmh_publishColumnFromDefault`.
+The raw read pulls the **whole column record in one `readDataOfLength:`** of
+`FMH_RECORD_HINT` (4 KB), slicing the four bands' 2-byte length prefixes and payloads
+out of memory, with a top-up read for the rare record that runs past the hint. It used
+to issue eight reads per column (a prefix and a payload per band); a record averages
+~1.2 KB in the bundled map, so those eight reads were mostly per-call overhead. Do not
+size the hint from the worst record seen — that makes every small column pull the big
+one's bytes, and it measured worse than the occasional top-up.
+
 ## Seeds
 - `LEVEL_SEED == 0` — flat world.
 - `LEVEL_SEED == DEFAULT_LEVEL_SEED (333333)` — bundled default world.

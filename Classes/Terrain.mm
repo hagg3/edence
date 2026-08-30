@@ -2415,9 +2415,18 @@ void Terrain::prepareAndLoadGeometry(){
                     for(int i=0,taken=0;i<nstale&&taken<budget;i++){
                         if(mp_columnBusy(stale[i].cx,stale[i].cz))continue;
                         //removeLights
-                        world->fm->readColumn( stale[i].cx,stale[i].cz,saveFile);
+                        // B3 Stage 3: readColumnDeferred may hand the column's RLE decode to a
+                        // worker and answer FALSE, meaning "not landed yet". Then it must NOT be
+                        // marked loaded -- isloaded is what gates meshing (columnMeshableDuringReload)
+                        // and what decides the reload is finished, and both answers have to stay
+                        // "no" until the decode publishes. The column is still in stale[] next
+                        // frame; mp_columnBusy above is what stops it being read a second time.
+                        if(world->fm->readColumnDeferred( stale[i].cx,stale[i].cz,saveFile))
+                            isloaded[stale[i].cx-m_chunkOffsetX][stale[i].cz-m_chunkOffsetZ]=TRUE;
                         //addlights
-                        isloaded[stale[i].cx-m_chunkOffsetX][stale[i].cz-m_chunkOffsetZ]=TRUE;
+                        // Counted whether it landed or was dispatched: the budget limits how much
+                        // work one frame STARTS, which is what it has to mean once the work is
+                        // asynchronous.
                         taken++;
                     }
 

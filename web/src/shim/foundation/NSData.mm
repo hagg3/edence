@@ -48,7 +48,7 @@
 
 - (id)initWithData:(NSData *)other {
     self = [super init];
-    _bytes = other ? other->_bytes : std::vector<uint8_t>();
+    _bytes = other ? other->_bytes : eden_byte_vector();
     return self;
 }
 
@@ -100,6 +100,16 @@
     if (other) [self appendBytes:other->_bytes.data() length:(NSUInteger)other->_bytes.size()];
 }
 
-- (void)setLength:(NSUInteger)len { _bytes.resize(len); }
+// Real Foundation zeroes the bytes -setLength: grows into, and the backing vector no longer does
+// that for us (see eden_default_init_allocator in NSData.h), so do it here explicitly. Shrinking
+// has nothing to initialise. Callers that are about to overwrite everything anyway should use
+// -setLengthUninitialized: instead.
+- (void)setLength:(NSUInteger)len {
+    size_t old = _bytes.size();
+    _bytes.resize(len);
+    if (len > old) memset(_bytes.data() + old, 0, len - old);
+}
+
+- (void)setLengthUninitialized:(NSUInteger)len { _bytes.resize(len); }
 
 @end

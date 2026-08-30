@@ -14,8 +14,30 @@
 // read bottoms out in the fread() below (via NSData readDataOfLength:), whether it is served from
 // the lazy Eden.eden node's block cache or triggers a synchronous XHR/readSync range fetch. Report
 // each fread's wall time to MeshTiming_web.mm's accumulator; it is weak so a build that excludes
-// that TU (none today) still links. Two emscripten_get_now() calls per column read = noise.
+// that TU (none today) still links.
+//
+// B6: that comment used to end "two emscripten_get_now() calls per column read = noise", and it
+// was wrong on both counts. At the time -readDataOfLength: was called EIGHT times per bundled-map
+// column (a 2-byte length prefix plus a payload, for each of the 4 RLE bands), so a column cost 16
+// emscripten_get_now() calls -- each one a wasm->JS boundary crossing -- not 2. (B6 also fixed the
+// caller: fmh_readColumnRawFromDefault now reads the record in ONE call.) And it was not noise:
+// this probe is deliberately not EDEN_DIAGNOSTICS-gated (see MeshTiming_web.mm's header), so
+// build-rel, the build players actually run, paid it on every read of the world file. Worse for
+// the row that found it, the overhead sat INSIDE the thing B6 had to measure, so an unmodified
+// before/after would have credited the fix with removing its own instrumentation.
+//
+// So the timing is now opt-in at runtime and OFF by default: a probe that wants the B1 split calls
+// eden_debug_set_io_timing(1) first and accepts the distortion knowingly. Everything else -- every
+// shipped build, and every before/after that is not specifically about fread cost -- pays one
+// predictable branch on a static bool. The read counters stay free either way.
 extern "C" __attribute__((weak)) void eden_mt_note_io(double ms);
+
+static bool g_io_timing = false;
+
+// Exported so tools/headless-mesh-burst-probe.js --io-timing (and any future probe) can turn the
+// B1 split back on for a window. KEEPALIVE, and not diagnostics-gated, for the same reason
+// MeshTiming_web.mm's exports are not: the interesting measurement is of build-rel.
+extern "C" EMSCRIPTEN_KEEPALIVE void eden_debug_set_io_timing(int on) { g_io_timing = (on != 0); }
 
 @implementation NSFileHandle
 
@@ -128,11 +150,21 @@ static void eden_fire_deferred_backup(NSFileHandle *fh) {
 - (NSData *)readDataOfLength:(NSUInteger)length {
     if (!_fp || length == 0) return [NSData data];
     NSMutableData *d = [NSMutableData dataWithCapacity:length];
-    [d setLength:length];
-    double _t0 = emscripten_get_now();
-    size_t got = fread(d->_bytes.data(), 1, length, _fp);
-    if (eden_mt_note_io) eden_mt_note_io(emscripten_get_now() - _t0);
-    [d setLength:(NSUInteger)got];
+    // B6: -setLength: has to zero what it grows into, because that is what real Foundation does
+    // and callers elsewhere may lean on it. Here the very next statement overwrites every one of
+    // those bytes with fread(), so the fill is pure waste -- and this is the world file's read
+    // path, called for every column of every chunk-streaming burst. -setLengthUninitialized: is
+    // the shim-only escape hatch for exactly this shape: grow, then immediately fill.
+    [d setLengthUninitialized:length];
+    size_t got;
+    if (g_io_timing && eden_mt_note_io) {
+        double _t0 = emscripten_get_now();
+        got = fread(d->_bytes.data(), 1, length, _fp);
+        eden_mt_note_io(emscripten_get_now() - _t0);
+    } else {
+        got = fread(d->_bytes.data(), 1, length, _fp);
+    }
+    [d setLength:(NSUInteger)got];   // shrink only; nothing to initialise
     return d;
 }
 

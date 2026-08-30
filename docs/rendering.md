@@ -135,9 +135,17 @@ the `rt*` boundary that `prepareVBO()` already was:
   to a no-op and `mp_dispatch()` always answers "mesh it yourself" — the stock path, byte for byte.
   And "no free job slot → mesh inline" means a pool size of 0 disables the feature without removing
   it.
-- Measured effect on a teleport burst: frames over the 16.66 ms budget 5–7 per 5 bursts → 0–1,
-  frames over 8.3 ms 62–68 → 13–24, with the window still filling in the same wall clock and the
-  resulting geometry byte-identical to the inline mesher's.
+- The same pool also **decodes streamed columns** off-thread. `fmh_readColumnFromDefault` is split
+  into a main-thread raw read, a **pure** `fmh_decodeColumnBands()` (RLE run-expansion + the
+  `CC(x,z,y)`↔`CC(y,z,x)` band transpose) that a worker runs, and a main-thread publish that
+  re-homes the chunks and writes `blockarray`. A decode job owns a whole **column**, so all its
+  chunks are marked busy together. `FileManager::readColumnDeferred()` is the reload's entry point;
+  answering FALSE means "dispatched, not landed", and the column must not be marked resident yet.
+  `readColumn()` itself is unchanged and still synchronous for every other caller.
+- Measured effect on a teleport burst: frames over the 16.66 ms budget 4–7 per 5 bursts → 0,
+  frames over 8.3 ms 60–66 → 19–24, main-thread column read 129–147 → 110–119 ms, with the window
+  still filling in the same wall clock and the resulting geometry byte-identical to the inline
+  mesher's. The mesher (not the decoder) is what produced the frame-level change.
 
 ### VBO upload — `prepareVBO()` (`TerrainChunk.mm:1433`)
 Copies the plain fields into the `rt*` (render) fields, mallocs the per-chunk index

@@ -75,6 +75,7 @@ unsigned g_ioCount = 0;
 // no-engine-headers property — these are plain C entry points with no TerrainChunk in the signature.
 extern "C" void mp_getStats(double* snapshotMs, unsigned* dispatched, unsigned* inlined,
                             unsigned* published, unsigned* stale);
+extern "C" void mp_getDecodeStats(double* readRawMs, double* decodeMs, unsigned* decoded);
 extern "C" void mp_resetStats();
 
 // C linkage, called from the NSFileHandle shim (a different TU) around its fread(). A tiny
@@ -104,7 +105,7 @@ void eden_debug_mesh_timing_reset(void) {
 // EDEN_DIAGNOSTICS-only; this export deliberately is not, so it stays reachable in build-rel).
 EMSCRIPTEN_KEEPALIVE
 const char* eden_debug_mesh_timing(void) {
-    static char buf[768];
+    static char buf[1024];
     // B3 Stage 2's own numbers. snapshotMs is the ONE piece of work the worker mesher adds to the
     // main thread — the 8 KB pblocks+pcolors memcpy per dispatched chunk, 10.6 MB per 64z burst —
     // and it was unmeasured when Stage 2 was specified. dispatched/inlined say how often the pool
@@ -113,20 +114,30 @@ const char* eden_debug_mesh_timing(void) {
     double   snapshotMs = 0.0;
     unsigned dispatched = 0, inlined = 0, published = 0, stale = 0;
     mp_getStats(&snapshotMs, &dispatched, &inlined, &published, &stale);
+    // B3 Stage 3. When a column's decode is deferred it never enters FileManager::readColumn, so
+    // readMs above stops seeing it — these three are where that time went. readRawMs is what is
+    // LEFT on the main thread (the seek + fread of the raw RLE bytes); decodeMs is the
+    // run-expansion and band transpose, now on a worker. readMs + readRawMs is the honest
+    // main-thread column-read total to compare against a non-threaded build's readMs.
+    double   readRawMs = 0.0, decodeMs = 0.0;
+    unsigned decoded = 0;
+    mp_getDecodeStats(&readRawMs, &decodeMs, &decoded);
     snprintf(buf, sizeof(buf),
         "{\"meshMs\":%.3f,\"meshCount\":%u,\"meshMsMax\":%.3f,"
         "\"uploadMs\":%.3f,\"uploadCount\":%u,\"uploadMsMax\":%.3f,"
         "\"readMs\":%.3f,\"readCount\":%u,\"readMsMax\":%.3f,"
         "\"ioMs\":%.3f,\"ioCount\":%u,\"ioMsMax\":%.3f,"
         "\"snapshotMs\":%.3f,\"dispatched\":%u,\"inlined\":%u,"
-        "\"published\":%u,\"stale\":%u}",
+        "\"published\":%u,\"stale\":%u,"
+        "\"readRawMs\":%.3f,\"decodeMs\":%.3f,\"decodedColumns\":%u}",
         (double)__atomic_load_n(&g_meshNs, __ATOMIC_RELAXED) / 1e6,
         __atomic_load_n(&g_meshCount, __ATOMIC_RELAXED),
         (double)__atomic_load_n(&g_meshNsMax, __ATOMIC_RELAXED) / 1e6,
         g_uploadMs, g_uploadCount, g_uploadMsMax,
         g_readMs, g_readCount, g_readMsMax,
         g_ioMs, g_ioCount, g_ioMsMax,
-        snapshotMs, dispatched, inlined, published, stale);
+        snapshotMs, dispatched, inlined, published, stale,
+        readRawMs, decodeMs, decoded);
     return buf;
 }
 

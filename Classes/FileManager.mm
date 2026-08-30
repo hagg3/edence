@@ -14,6 +14,7 @@
 #import "TerrainGen2.h"
 #import "FileArchive.h"
 #import "FileManagerHelper.h"
+#import "MeshPool.h"
 #import "World.h"
 
 #include <vector>
@@ -1214,6 +1215,24 @@ void FileManager::saveColumn(int cx,int cz){
 extern block8* blockarray;
 extern int g_offcx;
 extern int g_offcz;
+BOOL FileManager::readColumnDeferred(int cx,int cz,NSFileHandle* rcfile){
+    // Only ONE case can be deferred: a column the CURRENT world's directory does not have, on a
+    // default-seed world, which readColumn() below would satisfy from the bundled map via
+    // fmh_readColumnFromDefault(). Everything else -- a column this world has saved (a straight
+    // 32 KB read, no decode to move), a non-default seed (procedural generation, which touches
+    // TerrainGen state) -- falls through to the unchanged synchronous path. The duplicated lookup
+    // is one hashmap_get; duplicating readColumn() itself is what this avoids.
+    Terrain* ter=World::getWorld->terrain;
+    int n=twoToOne(cx,cz);
+    if(n!=0&&ter->tgen->LEVEL_SEED==DEFAULT_LEVEL_SEED){
+        ColumnIndex* colIndex=NULL;
+        hashmap_get(indexes,n,(any_t*)&colIndex);
+        if(colIndex==NULL&&mp_dispatchColumnDecode(cx,cz))return FALSE;
+    }
+    readColumn(cx,cz,rcfile);
+    return TRUE;
+}
+
 void FileManager::readColumn(int cx,int cz,NSFileHandle* rcfile){
 	Terrain* ter=World::getWorld->terrain;
 	ColumnIndex* colIndex=NULL;

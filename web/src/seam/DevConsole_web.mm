@@ -13,6 +13,7 @@
 #include "../../../Classes/World.h"
 #include "../../../Classes/Constants.h"
 #include "../../../Classes/Model.h"
+#include "../../../Classes/FileManagerHelper.h"   // B6 read-path benchmark, below
 #include <emscripten/emscripten.h>
 #include <cstdio>
 
@@ -92,5 +93,89 @@ int eden_console_getblock(int x, int z, int y) {
     if (!World::getWorld || !World::getWorld->terrain) return -1;
     return World::getWorld->terrain->getLand(x, z, y);
 }
+
+// ---- B6: an isolated, low-noise benchmark of the shim's file-read path ----------------------
+// The chunk-reload burst probe (tools/headless-mesh-burst-probe.js) measures the read path inside
+// a live teleport, where it shares a run with meshing, worker scheduling, lighting and the block
+// cache's own warm-up. Its run-to-run spread on this number is +-20%, which is wider than the
+// whole effect B6 is trying to move -- so it can say whether the burst got better, but it cannot
+// say whether a change to NSFileHandle did anything.
+//
+// This runs the same fmh_readColumnRawFromDefault() the burst runs, over a fixed, spatially
+// contiguous block of bundled-map columns, `iters` times, and returns the total wall time. Nothing
+// else touches the file, no terrain state is written (this stops at the RAW read -- no decode, no
+// publish), and after the first iteration the lazy Eden.eden node's block cache is warm, so what
+// is left is exactly: seek + 8 x -readDataOfLength: per column, which is what B6 is about.
+//
+// `n` columns starting at (cx0,cz0) walking a square, in CHUNK-COLUMN coordinates (the same units
+// FileManager's chunkOffsetX/Z are in). Returns milliseconds, or -1 if it could not allocate.
+EMSCRIPTEN_KEEPALIVE
+double eden_debug_bench_column_read(int cx0, int cz0, int side, int iters) {
+    const int bands = fmh_defaultBandCount();
+    if (bands <= 0 || side <= 0 || iters <= 0) return -1.0;
+    unsigned char* raw = (unsigned char*)malloc((size_t)bands * FMH_BAND_RAW_MAX);
+    if (!raw) return -1.0;
+    int lens[CHUNKS_PER_COLUMN_MAX];
+    double t0 = emscripten_get_now();
+    for (int it = 0; it < iters; it++)
+        for (int dz = 0; dz < side; dz++)
+            for (int dx = 0; dx < side; dx++)
+                (void)fmh_readColumnRawFromDefault(cx0 + dx, cz0 + dz, raw, lens);
+    double ms = emscripten_get_now() - t0;
+    free(raw);
+    return ms;
+}
+
+// How many of those columns the bundled map actually has, so the harness can report a per-column
+// cost against real work rather than against misses (a miss returns before reading anything).
+EMSCRIPTEN_KEEPALIVE
+int eden_debug_bench_column_hits(int cx0, int cz0, int side) {
+    const int bands = fmh_defaultBandCount();
+    if (bands <= 0 || side <= 0) return 0;
+    unsigned char* raw = (unsigned char*)malloc((size_t)bands * FMH_BAND_RAW_MAX);
+    if (!raw) return 0;
+    int lens[CHUNKS_PER_COLUMN_MAX];
+    int hits = 0;
+    for (int dz = 0; dz < side; dz++)
+        for (int dx = 0; dx < side; dx++)
+            if (fmh_readColumnRawFromDefault(cx0 + dx, cz0 + dz, raw, lens)) hits++;
+    free(raw);
+    return hits;
+}
+
+// Total raw RLE bytes across those columns, i.e. what a "read the whole record in one call" scheme
+// would have to size itself against. Reported by tools/headless-column-read-bench.js next to the
+// timing, because the answer is what decides how big a single-call read may safely be: in a browser
+// the file is the lazy Eden.eden node fetching 32 KB blocks over sync XHR, so read-ahead past what
+// the caller wanted costs a real copy (B6 measured a fixed 16 KB read-ahead as a 60% REGRESSION,
+// which is how this number came to be worth exporting).
+static int g_bench_max_record = 0;
+
+EMSCRIPTEN_KEEPALIVE
+int eden_debug_bench_column_bytes(int cx0, int cz0, int side) {
+    const int bands = fmh_defaultBandCount();
+    g_bench_max_record = 0;
+    if (bands <= 0 || side <= 0) return 0;
+    unsigned char* raw = (unsigned char*)malloc((size_t)bands * FMH_BAND_RAW_MAX);
+    if (!raw) return 0;
+    int lens[CHUNKS_PER_COLUMN_MAX];
+    long long total = 0;
+    int worst = 0;
+    for (int dz = 0; dz < side; dz++)
+        for (int dx = 0; dx < side; dx++)
+            if (fmh_readColumnRawFromDefault(cx0 + dx, cz0 + dz, raw, lens)) {
+                int rec = 0;
+                for (int i = 0; i < bands; i++) rec += lens[i] + 2;   // +2 = the length prefix
+                total += rec;
+                if (rec > worst) worst = rec;
+            }
+    free(raw);
+    g_bench_max_record = worst;
+    return (int)total;
+}
+
+// The largest single record the last eden_debug_bench_column_bytes() call saw.
+EMSCRIPTEN_KEEPALIVE
+int eden_debug_bench_column_maxbytes(void) { return g_bench_max_record; }
 
 } // extern "C"

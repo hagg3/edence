@@ -148,9 +148,10 @@ for (const f of ['eden.js', 'eden.wasm', 'eden.data']) {
 // real headers withheld — `node tools/build-dist.js --build=thr && node tools/serve.js 8123 dist
 // --no-coi` — which is what the deployed host actually looks like.
 //
-// EDEN_THREADED still defaults OFF (audit row A1's reasoning, unchanged): threading is not yet a
-// player-visible win, since off-thread meshing — the actual prize — is not written. What changed
-// in pass 65 is only that hosting is no longer the thing blocking it.
+// Off-thread meshing (B3) landed 2026-08-27 and as of 2026-08-30 `.github/workflows/pages.yml`
+// ships the threaded Release build as the deployed default (`?build=thr`), with the single-threaded
+// Release tree still built and shipped as the isolation-failed fallback. `EDEN_THREADED` still
+// defaults OFF at the CMake level (audit row A1) so `build-st` stays single-threaded locally.
 function hashFile(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex').slice(0, 10);
 }

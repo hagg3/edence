@@ -31,40 +31,58 @@ jobs:
           version: 3.1.74
           actions-cache-folder: emsdk-cache
 
-      - name: Configure (Release, single-threaded)
+      # Two Release builds ship: the threaded one is what visitors get (?build=thr, cross-origin
+      # isolation synthesised by public/eden-coi.js + service-worker.js on the header-less Pages
+      # host), and the single-threaded one is the fail-closed fallback eden-host.js's
+      # edenSettleBuildDir() drops to (as ../build-st/) when a browser can't be isolated.
+      - name: Configure (Release, single-threaded fallback)
         working-directory: web
         run: emcmake cmake -B build-rel -DCMAKE_BUILD_TYPE=Release -DEDEN_THREADED=OFF
 
+      - name: Configure (Release, threaded — the shipped default)
+        working-directory: web
+        run: emcmake cmake -B build-thr -DCMAKE_BUILD_TYPE=Release -DEDEN_THREADED=ON
+
       - name: Build
         working-directory: web
-        run: cmake --build build-rel -j"$(nproc)"
+        run: |
+          cmake --build build-rel -j"$(nproc)"
+          cmake --build build-thr -j"$(nproc)"
 
       - name: Assemble site
         working-directory: web
         run: |
           set -e
           rm -rf _site
-          mkdir -p _site/public _site/build-rel
+          mkdir -p _site/public _site/build-rel _site/build-st _site/build-thr
 
           # Real files, not the absolute-path symlinks CMake just (re)created on this runner.
           cp -RL public/. _site/public/
 
           # Registered from eden-st.html as '../service-worker.js', i.e. resolved against the
           # site root — was missing here entirely (never copied into _site), so every deployed
-          # page load 404'd on it. Non-fatal (registration failure is caught), but breaks the
-          # PWA/offline-shell feature this file exists for.
+          # page load 404'd on it. It now also carries COOP/COEP for the threaded build.
           cp -f service-worker.js _site/service-worker.js
 
-          cp -f build-rel/eden.js _site/build-rel/
-          cp -f build-rel/eden.wasm _site/build-rel/
-          [ -f build-rel/eden.data ] && cp -f build-rel/eden.data _site/build-rel/ || true
+          # Threaded build -> ?build=thr (../build-thr/).
+          cp -f build-thr/eden.js _site/build-thr/
+          cp -f build-thr/eden.wasm _site/build-thr/
+          [ -f build-thr/eden.data ] && cp -f build-thr/eden.data _site/build-thr/ || true
+
+          # Single-threaded Release -> both ?build=rel (../build-rel/) and the isolation-failed
+          # fallback path (../build-st/). Same bytes, two names.
+          for d in build-rel build-st; do
+            cp -f build-rel/eden.js "_site/$d/"
+            cp -f build-rel/eden.wasm "_site/$d/"
+            [ -f build-rel/eden.data ] && cp -f build-rel/eden.data "_site/$d/" || true
+          done
 
           cat > _site/index.html <<'EOF'
           <!doctype html>
           <meta charset="utf-8">
-          <meta http-equiv="refresh" content="0; url=public/eden-st.html?build=rel">
+          <meta http-equiv="refresh" content="0; url=public/eden-st.html?build=thr">
           <p>Loading Eden: World Builder… if nothing happens,
-          <a href="public/eden-st.html?build=rel">click here</a>.</p>
+          <a href="public/eden-st.html?build=thr">click here</a>.</p>
           EOF
 
       - uses: actions/upload-pages-artifact@v3
