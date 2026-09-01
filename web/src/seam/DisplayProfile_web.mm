@@ -61,11 +61,24 @@ extern float eden_display_layout;
 // mitigation ("keep the pinned profile as the default until the new path is verified on a real
 // phone") expressed as data rather than as a flag: the unexercised path is opt-in on touch, and a
 // touch player who changes nothing gets a bit-identical layout to the one that shipped.
-static const EdenProfile kProfiles[2] = {
+//
+// LOW-MEM is not a third INPUT profile — it is the ROADMAP Phase M / M5.2 overlay. Only its
+// fps_cap / dpr_cap / render_scale columns are ever read (by Settings_web.mm's seeder, when
+// eden_low_memory() is set); ui_scale / layout / touch_chrome still come from the desktop-or-touch
+// input profile underneath. The values: dpr_cap 1x (index 0) and render_scale 75% (index 1) drop
+// the drawing-buffer / compositor cost M0 measured at ~30-45 MB on a 2 GB device, and fps_cap 45
+// (index 2) trims the sustained GPU load that pairs with it. Adding this row is exactly the
+// extension shape this comment block describes.
+static const EdenProfile kProfiles[3] = {
     // name       ui_scale  layout  fps_cap  dpr_cap  render_scale  touch_chrome
     {  "desktop",        2,      2,       0,       2,            2,            0 },
     {  "touch",          4,      1,       3,       1,            2,            1 },
+    {  "low-mem",        4,      1,       2,       0,            1,            1 },
 };
+
+// ROADMAP Phase M / M5.2 — the low-memory overlay flag. Plain mutable global in the same style as
+// Settings_web.mm's port-owned settings; read only through eden_low_memory().
+static bool g_low_memory = false;
 
 // Option-list indexes, spelled out so the arithmetic below never contains a bare literal that has
 // to be cross-referenced against Settings_web.mm's schema strings.
@@ -124,9 +137,12 @@ extern "C" int eden_active_profile(void) {
 }
 
 extern "C" const EdenProfile* eden_profile_get(int id) {
-    if (id != EDEN_PROFILE_TOUCH) id = EDEN_PROFILE_DESKTOP;
+    if (id != EDEN_PROFILE_TOUCH && id != EDEN_PROFILE_LOWMEM) id = EDEN_PROFILE_DESKTOP;
     return &kProfiles[id];
 }
+
+extern "C" EMSCRIPTEN_KEEPALIVE void eden_set_low_memory(int on) { g_low_memory = (on != 0); }
+extern "C" EMSCRIPTEN_KEEPALIVE int eden_low_memory(void) { return g_low_memory ? 1 : 0; }
 
 extern "C" const EdenProfile* eden_profile_active(void) {
     return eden_profile_get(eden_active_profile());

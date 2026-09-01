@@ -76,9 +76,89 @@ function showToast(text) {
 // eden.js <script src> and Module.locateFile are both evaluated after that call), so the
 // downgrade is seen by everything that matters.
 const EDEN_BUILD_PARAM = new URLSearchParams(location.search).get('build');
+// ROADMAP Phase M / M0 (temporary — revert with the probe): measurement trees the memory probe
+// drives. The *-thr* ones are threaded and need cross-origin isolation just like ?build=thr.
+const EDEN_M0_BUILDS = {
+  relwdiag: '../build-relwdiag/', 'relwdiag-cap512': '../build-relwdiag-cap512/',
+  relthr: '../build-relthr/', 'relthr-cap512': '../build-relthr-cap512/',
+};
+const EDEN_M0_THREADED = new Set(['relthr', 'relthr-cap512']);
 let EDEN_BUILD_DIR = EDEN_BUILD_PARAM === 'rel' ? '../build-rel/'
   : EDEN_BUILD_PARAM === 'thr' ? '../build-thr/'
+  : EDEN_M0_BUILDS[EDEN_BUILD_PARAM] ? EDEN_M0_BUILDS[EDEN_BUILD_PARAM]
   : '../build-st/';
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// ROADMAP Phase M / M5.1 + M5.2 — low-memory / mobile viability.
+//
+// M5.1: the deployed site sends EVERY visitor to ?build=thr, and the threaded build is known not
+// to finish loading on a 2 GB iPad Air 2 ("stuck on Starting… forever"). navigator.deviceMemory
+// does not exist on Safari, so a device heuristic cannot catch that case. Instead:
+// edenArmThreadedLoadFailsafe() starts a timer when a threaded tree is about to load; if the
+// module has not initialised by then, it remembers the failure in localStorage and reloads
+// single-threaded. edenSettleBuildDir() honours that memory on every subsequent visit, so the
+// second load is fast and needs no timeout. `?lowmem=retry` clears the memory for one attempt;
+// `?lowmem=1` / `?lowmem=off` force it on/off by hand.
+//
+// M5.2: EDEN_LOW_MEMORY is also fed to the engine (Module._eden_set_low_memory, from
+// eden-st.html's onRuntimeInitialized) so DisplayProfile_web.mm's kProfiles[EDEN_PROFILE_LOWMEM]
+// row seeds a leaner video preset (1x pixel ratio, 75% render scale). navigator.deviceMemory ≤ 4
+// feeds the video preset only — it is too coarse to deny a device the threaded build.
+const EDEN_LOWMEM_KEY = 'eden.lowmem';        // '1' once a device is known/declared low-memory
+const EDEN_LOWMEM_PARAM = new URLSearchParams(location.search).get('lowmem');
+
+function edenLowMemStored() {
+  try { return localStorage.getItem(EDEN_LOWMEM_KEY) === '1'; } catch (e) { return false; }
+}
+function edenLowMemSetStored(on) {
+  try {
+    if (on) localStorage.setItem(EDEN_LOWMEM_KEY, '1');
+    else localStorage.removeItem(EDEN_LOWMEM_KEY);
+  } catch (e) { /* private mode / disabled storage — the session-scoped path still works */ }
+}
+// Apply the by-hand overrides once, at load.
+if (EDEN_LOWMEM_PARAM === '1' || EDEN_LOWMEM_PARAM === 'on') edenLowMemSetStored(true);
+else if (EDEN_LOWMEM_PARAM === 'off' || EDEN_LOWMEM_PARAM === '0' || EDEN_LOWMEM_PARAM === 'retry') {
+  edenLowMemSetStored(false);
+}
+
+// Does the engine get the low-memory video preset this session? Stored flag, an explicit ?lowmem=1,
+// or a Blink deviceMemory reading of 4 GB or less. ?lowmem=off wins outright.
+const EDEN_LOW_MEMORY =
+  EDEN_LOWMEM_PARAM === 'off' || EDEN_LOWMEM_PARAM === '0' ? false
+  : edenLowMemStored() || EDEN_LOWMEM_PARAM === '1' || EDEN_LOWMEM_PARAM === 'on' ||
+    (typeof navigator !== 'undefined' && navigator.deviceMemory > 0 && navigator.deviceMemory <= 4);
+
+// Was the threaded build previously found not to load on this device? (Distinct from EDEN_LOW_MEMORY
+// — deviceMemory ≤ 4 does NOT imply this, only a real observed load failure or an explicit request
+// does.) ?lowmem=retry forces one more threaded attempt regardless.
+function edenThreadedDowngradeRemembered() {
+  return EDEN_LOWMEM_PARAM !== 'retry' && edenLowMemStored();
+}
+
+// Started from eden-st.html's edenLoadModule(), right after the eden.js <script> is appended, and
+// only when a threaded tree is what got appended. `moduleReady` (declared at the top of this file)
+// flips true from Module.onRuntimeInitialized.
+function edenArmThreadedLoadFailsafe() {
+  const threaded = EDEN_BUILD_DIR === '../build-thr/' || EDEN_M0_THREADED.has(EDEN_BUILD_PARAM);
+  if (!threaded) return;
+  let secs = parseInt(new URLSearchParams(location.search).get('thrtimeout'), 10);
+  if (!(secs >= 15 && secs <= 180)) secs = 45;   // a cold iPad download of ~17 MB + the world is slow
+  setTimeout(() => {
+    if (moduleReady) return;
+    console.warn('[eden-host] threaded build has not initialised after ' + secs + 's — remembering ' +
+      'the failure and reloading single-threaded (ROADMAP Phase M / M5.1). ?lowmem=retry to retry.');
+    edenLowMemSetStored(true);
+    statusEl.textContent = 'Threaded build did not finish loading — switching to single-threaded…';
+    // Reload with ?lowmem=retry stripped (leaving it would re-clear the flag we just set and loop
+    // straight back into the failed threaded attempt). edenSettleBuildDir() then sees the stored
+    // flag and downgrades to build-st, the guaranteed-populated fallback tree.
+    const u = new URL(location.href);
+    u.searchParams.delete('lowmem');
+    location.replace(u.toString());
+  }, secs * 1000);
+}
+// ─────────────────────────────────────────────────────────────────────────────────────────────
 
 // Audit row 36/C1, pass 65 — FAIL CLOSED. Called by eden-st.html from EdenCOI.whenSettled(), i.e.
 // after public/eden-coi.js has had its chance to obtain cross-origin isolation (service worker +
@@ -91,7 +171,22 @@ let EDEN_BUILD_DIR = EDEN_BUILD_PARAM === 'rel' ? '../build-rel/'
 // instead is strictly better in every case: it is the same game, it always works, and the reason
 // for the downgrade is stated on the status line rather than left to devtools archaeology.
 function edenSettleBuildDir() {
-  if (EDEN_BUILD_PARAM !== 'thr' || self.crossOriginIsolated) return;
+  const threaded = EDEN_BUILD_PARAM === 'thr' || EDEN_M0_THREADED.has(EDEN_BUILD_PARAM);
+  if (!threaded) return;
+
+  // ROADMAP Phase M / M5.1: a remembered load failure on this device downgrades before we even
+  // try, so the common case (revisiting on a 2 GB iPad) is one fast single-threaded boot rather
+  // than a 45 s wait for the failsafe timer.
+  if (edenThreadedDowngradeRemembered()) {
+    EDEN_BUILD_DIR = '../build-st/';
+    console.warn('[eden-host] the threaded build previously failed to load on this device ' +
+      '(ROADMAP Phase M / M5.1) — running single-threaded. Append ?lowmem=retry to try again.');
+    statusEl.textContent = 'Threaded build previously failed here — running single-threaded.';
+    showToast('Running single-threaded (threaded build failed here before)');
+    return;
+  }
+
+  if (self.crossOriginIsolated) return;
   EDEN_BUILD_DIR = '../build-st/';
   const why = window.EdenCOI ? window.EdenCOI.reason() : 'eden-coi.js did not load';
   console.warn('[eden-host] ?build=thr needs a cross-origin-isolated page (COOP: same-origin + ' +

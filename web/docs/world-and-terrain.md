@@ -31,6 +31,14 @@ hits the same OOM this section describes, unmitigated — nothing here reduces t
 itself. Live-verified in real Safari (desktop profile correctly does NOT toast; the JSON `height`
 field round-trips correctly for both a synthesized 64z save and the checked-in 256z specimen).
 
+**Refused outright on a low-memory device (ROADMAP Phase M / M5.3).** When the page has set the
+low-memory flag (`eden_set_low_memory`, `src/seam/DisplayProfile_web.mm` — see
+[ui.md](ui.md#low-memory-overlay) and `web-port-memory-plan.md` §M5), `World::loadWorld` reads
+`probeWorldHeight` first and, for a 256z world, bails *before* `allocateMemory()` through
+`eden_report_load_failure(name, "TALL_WORLD_LOW_MEM")` — terrain untouched, parked in the menu.
+`eden-loaderror.js` recognises that reason token and shows a "World needs more memory" dialog
+pointing at Settings → Storage → "Convert to 64z" instead of the corrupt-save recovery dialog.
+
 ## The 18×18 window is a hard floor on web too
 The resident window size (`T_SIZE` etc.) is baked into `SIZEOF_COLUMN`/the save
 format (root docs), so it can't be shrunk to save browser memory without breaking

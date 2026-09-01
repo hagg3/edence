@@ -365,6 +365,21 @@ M.postRun.push(async () => {
     check('clamp: a 32:9 viewport is clamped to the maximum aspect',
           Math.abs(ultrawide.aspect_x1000 / 1000 - 2.40) < 0.01, ultrawide.aspect_x1000);
 
+    // ---- 6. ROADMAP Phase M / M5.2 — the low-memory overlay flag ---------------------------------
+    // The page sets this before eden_settings_init() so DisplayProfile_web.mm's
+    // kProfiles[EDEN_PROFILE_LOWMEM] row seeds a leaner video preset. The seeding itself is a
+    // one-shot that has already fired by the time this test can toggle the flag (so it is a browser-
+    // leg check), but the export contract the page depends on is guarded here.
+    check('lowmem: the flag exports exist',
+          typeof M._eden_set_low_memory === 'function' && typeof M._eden_low_memory === 'function',
+          `${typeof M._eden_set_low_memory}/${typeof M._eden_low_memory}`);
+    M._eden_set_low_memory(1);
+    check('lowmem: eden_low_memory() follows eden_set_low_memory(1)', M._eden_low_memory() === 1,
+          M._eden_low_memory());
+    M._eden_set_low_memory(0);
+    check('lowmem: eden_low_memory() follows eden_set_low_memory(0)', M._eden_low_memory() === 0,
+          M._eden_low_memory());
+
     finish();
 });
 

@@ -178,6 +178,11 @@ fixes (a failed load previously still crashed the engine a frame or two after th
 dialog appeared, and the Restore button previously destroyed the very backup it was
 meant to restore) — both now fixed and live-verified end-to-end.
 
+**Tall-world variant (ROADMAP Phase M / M5.3).** When the load-failure *reason* is the exact token
+`TALL_WORLD_LOW_MEM` — `World::loadWorld`'s pre-flight refusal of a 256z world on a
+low-memory-flagged device, not a corrupt file — `buildTallWorld()` renders a different panel
+("World needs more memory", no Restore button, points at Settings → Storage → "Convert to 64z").
+
 ## Alert/dialog seams (`src/seam/seam_link_stubs.mm`)
 Real DOM dialogs (`EM_ASM`) replace what used to be auto-answer stubs:
 - World-type dialog (Flat/Normal) — falls back to auto-answering "Normal" when
@@ -339,6 +344,16 @@ P_ASPECT_RATIO = SCREEN_WIDTH / SCREEN_HEIGHT        # ALWAYS derived — see be
   the same as picking the profile's value by hand — it re-resolves if the input mode changes.
   Deliberately *not* seeded by the profile-defaults writer for that reason; `dpr_cap`/`fps_cap`/
   `render_scale`, which have no `Auto` option, still are.
+- <a name="low-memory-overlay"></a>**A third row, `low-mem`, is an *overlay*, not an input profile
+  (ROADMAP Phase M / M5.2).** `eden_active_profile()` never returns it — the page calls
+  `eden_set_low_memory(1)` (before `eden_settings_init`) when `navigator.deviceMemory ≤ 4`, when a
+  prior threaded-build load-failure downgrade is remembered, or on `?lowmem=1`. While set,
+  Settings_web.mm's profile-default seeder takes `dpr_cap` / `render_scale` (and `fps_cap` if the
+  row sets it) from `kProfiles[EDEN_PROFILE_LOWMEM]` — 1× pixel ratio, 75% render scale, 45 fps —
+  instead of the desktop/touch row underneath; `ui_scale` / layout / control chrome are unaffected.
+  Still a *default*: a row the player has touched wins. It also makes `World::loadWorld` refuse a
+  256z world (see [world-and-terrain.md](world-and-terrain.md), and the load-failure dialog's
+  tall-world variant below).
 - **A stock bug not reproduced:** `Classes/EAGLView.mm:138-143` only recomputes `P_ASPECT_RATIO`
   inside `if(IS_WIDESCREEN)`, leaving the other branch on an iPad 4:3 default that matched no live
   layout. This always derives it. (iPad's own 4:3 branch is *not* resurrected — it is commented out

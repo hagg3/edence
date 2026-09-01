@@ -45,7 +45,7 @@
 extern "C" {
 #endif
 
-enum { EDEN_PROFILE_DESKTOP = 0, EDEN_PROFILE_TOUCH = 1 };
+enum { EDEN_PROFILE_DESKTOP = 0, EDEN_PROFILE_TOUCH = 1, EDEN_PROFILE_LOWMEM = 2 };
 
 // Every field is an INDEX into the option list of the identically-named row in Settings_web.mm's
 // kSettings[], except `touch_chrome`. Indexes rather than values so the profile table and the
@@ -61,10 +61,23 @@ typedef struct EdenProfile {
     int touch_chrome;    // 1 = draw the on-screen joystick / jump / crouch buttons
 } EdenProfile;
 
-// EDEN_PROFILE_DESKTOP or EDEN_PROFILE_TOUCH, following the input-mode arbitration.
+// EDEN_PROFILE_DESKTOP or EDEN_PROFILE_TOUCH, following the input-mode arbitration. Never returns
+// EDEN_PROFILE_LOWMEM — that one is not an input profile, it is an orthogonal "this device is short
+// on RAM" overlay (ROADMAP Phase M / M5) that only supplies the three video-preset fields and is
+// applied on top of whichever input profile is active. Reach it with eden_profile_get() directly.
 int eden_active_profile(void);
 const EdenProfile* eden_profile_get(int id);
 const EdenProfile* eden_profile_active(void);
+
+// Low-memory device overlay (ROADMAP Phase M / M5.2). Set by the page BEFORE eden_settings_init()
+// runs — from public/eden-host.js, when navigator.deviceMemory is low, when a prior threaded-build
+// load-failure downgrade is remembered in localStorage, or ?lowmem=1. While on, Settings_web.mm's
+// profile-default seeder takes dpr_cap / render_scale (and fps_cap if set) from
+// kProfiles[EDEN_PROFILE_LOWMEM] instead of the input profile's, and the engine refuses to open a
+// 256-block-tall world (World::loadWorld -> eden_report_load_failure). Player overrides still win —
+// this only changes the *default* for a row the player has never touched.
+void eden_set_low_memory(int on);
+int  eden_low_memory(void);
 
 // The page's real canvas/viewport box, in CSS pixels. Only the RATIO is used (the pixel buffer is
 // sized separately by eden_set_drawable_size). Re-derives the metrics and re-lays-out the UI.

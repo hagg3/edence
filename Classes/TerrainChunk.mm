@@ -121,7 +121,8 @@ TerrainChunk::TerrainChunk(const int* boundz,Terrain* terrain){
     rtindices=NULL;
 	ter=terrain;
 	vertexBuffer=vertexBuffer2=elementBuffer=0;
-	
+	vbCapacity=vb2Capacity=0;
+
     num_objects=0;
 	
 	
@@ -1565,6 +1566,29 @@ int TerrainChunk::rebuild2(){   //here be dragons//
     return 1;
 	
 }
+// M3(a) (ROADMAP Phase M): persistent chunk VBOs. prepareVBO() used to glDeleteBuffers +
+// glGenBuffers all three names on every re-mesh -- a window reload re-meshes every resident chunk,
+// so a reload burst did ~1,500 buffer create/delete calls in a couple of seconds, and a WebGL
+// implementation may keep a deleted buffer alive until the GPU has drained it. Same fix row E3 gave
+// the object batches (Terrain.mm objBatchDraw): keep the name, track its byte capacity, and
+// glBufferSubData when the new geometry fits, glBufferData (grow only, never shrink) when it does
+// not. prepareVBO() is the worker->main publish barrier and runs on the main thread, so an in-place
+// re-spec here is no less safe than the per-frame glBufferData render() already does on elementBuffer.
+static void chunkUploadArray(GLuint* name,int* capBytes,const void* data,int bytes){
+    if(bytes<=0)return;
+    if(*name==0){
+        glGenBuffers(1,name);
+        if(*name==0)return;
+        *capBytes=0;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER,*name);
+    if(bytes>*capBytes){
+        glBufferData(GL_ARRAY_BUFFER,bytes,data,GL_STATIC_DRAW);
+        *capBytes=bytes;
+    }else{
+        glBufferSubData(GL_ARRAY_BUFFER,0,bytes,data);
+    }
+}
 void TerrainChunk::prepareVBO(){
     rebuildCounter=0;
     if(clearOldVerticesOnly){
@@ -1599,12 +1623,13 @@ void TerrainChunk::prepareVBO(){
         if(vertexBuffer2)
             glDeleteBuffers(1, &vertexBuffer2);
         if(vertexBuffer)
-            glDeleteBuffers(1, &vertexBuffer);    
+            glDeleteBuffers(1, &vertexBuffer);
         if(elementBuffer)
             glDeleteBuffers(1, &elementBuffer);
         vertexBuffer=0;
         vertexBuffer2=0;
         elementBuffer=0;
+        vbCapacity=vb2Capacity=0;
         
         if(verticesbg)
         free(verticesbg);
@@ -1670,32 +1695,18 @@ void TerrainChunk::prepareVBO(){
         
     }
     
-    if(vertexBuffer2)
-        glDeleteBuffers(1, &vertexBuffer2);
-    if(vertexBuffer)
-        glDeleteBuffers(1, &vertexBuffer);    
-    if(elementBuffer)
-        glDeleteBuffers(1, &elementBuffer);
-    vertexBuffer=0;
-    vertexBuffer2=0;
-    elementBuffer=0;
-    
+    // M3(a): re-upload into the persistent buffer names rather than delete/recreate them. render()
+    // early-returns on rtn_vertices==0 and render2() is only called for chunks with rtn_vertices2>0
+    // (Terrain.mm:2721), so a name left allocated with stale contents is never drawn.
     if(rtn_vertices){
-        glGenBuffers(1, &vertexBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(vertexStructSmall)*rtn_vertices, verticesbg, GL_STATIC_DRAW);
-        
-        glGenBuffers(1,&elementBuffer);
-               
+        chunkUploadArray(&vertexBuffer, &vbCapacity, verticesbg, sizeof(vertexStructSmall)*rtn_vertices);
+        if(elementBuffer==0)
+            glGenBuffers(1,&elementBuffer);
     }
-    
+
     if(rtn_vertices2){
-        glGenBuffers(1, &vertexBuffer2);
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer2);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(vertexStructSmall)*rtn_vertices2, verticesbg2, GL_STATIC_DRAW);
-        
-        
-    } 
+        chunkUploadArray(&vertexBuffer2, &vb2Capacity, verticesbg2, sizeof(vertexStructSmall)*rtn_vertices2);
+    }
     if(verticesbg)
         free(verticesbg);
     if(verticesbg2)
@@ -1879,6 +1890,7 @@ void TerrainChunk::unbuild(){
     vertexBuffer=0;
     vertexBuffer2=0;
     elementBuffer=0;
+    vbCapacity=vb2Capacity=0;
 }
 
 TerrainChunk::~TerrainChunk(){
@@ -1923,6 +1935,7 @@ TerrainChunk::~TerrainChunk(){
     vertexBuffer=0;
     vertexBuffer2=0;
     elementBuffer=0;
+    vbCapacity=vb2Capacity=0;
 	
 }
 

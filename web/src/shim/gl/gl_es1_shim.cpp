@@ -25,7 +25,9 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 // GROUP 2d's draw path is written against the GLES2 entry points (shaders, uniforms,
 // vertex attributes) that the ES1 header above does not declare. Including both is safe:
 // every shared enum and typedef has identical definitions in the two headers, and the
@@ -189,6 +191,49 @@ static GLfloat g_light_model_ambient[4] = {0.2f, 0.2f, 0.2f, 1.0f};
 // present nowhere near its cause.
 static GLuint g_bound_array_buffer = 0;
 static GLuint g_bound_element_buffer = 0;
+
+// --- GL buffer-byte accounting (ROADMAP Phase M / M0) --------------------------------------
+// The number that turns "GL buffer lifetime — Unknown" (web-port-memory-plan.md §M3) into a
+// lever or a dead end: how many bytes of vertex/index data the app currently has resident in
+// driver-side GL buffers, and how much churn the reload burst puts through create/delete.
+// GL is main-thread-only (root CLAUDE.md convention #4), so no atomics. Deliberately NOT gated
+// on EDEN_DIAGNOSTICS — same reasoning as MeshTiming_web.mm: it must read in build-rel, the
+// build players actually run. `bytes` is what the app ASKED for via glBufferData; the driver
+// rounds each name up to at least a page (16 KB on iOS), so RSS-minus-this is driver overhead.
+static std::unordered_map<GLuint, size_t> g_glbuf_sizes;
+static size_t   g_glbuf_bytes      = 0;
+static size_t   g_glbuf_peakBytes  = 0;
+static unsigned g_glbuf_count      = 0;   // live buffer names that have had glBufferData
+static unsigned g_glbuf_peakCount  = 0;
+static unsigned g_glbuf_creates    = 0;   // names handed out by glGenBuffers, cumulative
+static unsigned g_glbuf_deletes    = 0;   // names passed to glDeleteBuffers, cumulative
+
+static void eden_gl_buf_note_data(GLenum target, size_t size) {
+    GLuint name = (target == GL_ELEMENT_ARRAY_BUFFER) ? g_bound_element_buffer
+                                                      : g_bound_array_buffer;
+    if (name == 0) return;   // client-memory path / no buffer bound
+    auto it = g_glbuf_sizes.find(name);
+    if (it == g_glbuf_sizes.end()) {
+        g_glbuf_sizes.emplace(name, size);
+        g_glbuf_bytes += size;
+        ++g_glbuf_count;
+    } else {
+        g_glbuf_bytes = g_glbuf_bytes - it->second + size;   // glBufferData reallocates
+        it->second = size;
+    }
+    if (g_glbuf_bytes > g_glbuf_peakBytes) g_glbuf_peakBytes = g_glbuf_bytes;
+    if (g_glbuf_count > g_glbuf_peakCount) g_glbuf_peakCount = g_glbuf_count;
+}
+
+static void eden_gl_buf_note_delete(GLuint name) {
+    if (name == 0) return;
+    ++g_glbuf_deletes;
+    auto it = g_glbuf_sizes.find(name);
+    if (it == g_glbuf_sizes.end()) return;
+    g_glbuf_bytes -= it->second;
+    --g_glbuf_count;
+    g_glbuf_sizes.erase(it);
+}
 
 // Viewport, mirrored from the glViewport wrapper so glGetIntegerv(GL_VIEWPORT) COULD answer it.
 // WebGL2 *can* answer this natively, but the mirror is what serves the pre-context window and
@@ -731,6 +776,7 @@ bool eden_gl_dbg_active() {
 } // namespace
 
 void eden_gl_glGenBuffers(GLsizei n, GLuint* buffers) {
+    if (n > 0) g_glbuf_creates += (unsigned)n;   // M0 buffer-churn accounting
     if (eden_gl_have_context()) { glGenBuffers(n, buffers); return; }
     eden_gl_warn_once();
     for (GLsizei i = 0; i < n; ++i) buffers[i] = ++g_fake_object_name;
@@ -749,8 +795,16 @@ void eden_gl_glGenTextures(GLsizei n, GLuint* textures) {
     }
 
 EDEN_GL_GUARD_VOID(glDeleteTextures, (GLsizei n, const GLuint* t), (n, t))
-EDEN_GL_GUARD_VOID(glBufferData, (GLenum t, GLsizeiptr s, const void* d, GLenum u), (t, s, d, u))
 EDEN_GL_GUARD_VOID(glBufferSubData, (GLenum t, GLintptr o, GLsizeiptr s, const void* d), (t, o, s, d))
+
+// glBufferData: not a plain passthrough — M0 (web-port-memory-plan.md) needs the resident
+// byte count. It reallocates the store for the buffer currently bound to `target`, so this is
+// where the app's driver-side geometry footprint is set.
+void eden_gl_glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
+    eden_gl_buf_note_data(target, size > 0 ? (size_t)size : 0u);
+    if (eden_gl_have_context()) { glBufferData(target, size, data, usage); return; }
+    eden_gl_warn_once();
+}
 EDEN_GL_GUARD_VOID(glBindTexture, (GLenum target, GLuint texture), (target, texture))
 EDEN_GL_GUARD_VOID(glBlendFunc, (GLenum s, GLenum d), (s, d))
 EDEN_GL_GUARD_VOID(glDepthMask, (GLboolean flag), (flag))
@@ -1470,6 +1524,7 @@ static void eden_gl_forget_deleted_buffers(GLsizei n, const GLuint* buffers) {
     for (GLsizei i = 0; i < n; ++i) {
         const GLuint name = buffers[i];
         if (name == 0) continue;
+        eden_gl_buf_note_delete(name);   // M0 buffer-byte accounting
         for (int slot = 0; slot < ATTR_COUNT; ++slot) {
             if (g_attrCache[slot].buffer == name) g_attrCache[slot] = AttrCache();
         }
@@ -2018,6 +2073,31 @@ void eden_gl_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void*
 // counter starting at 0, or two calls aliasing the same name) would silently corrupt every
 // chunk's buffer bookkeeping in exactly the headless configuration this project's own test suite
 // runs under — and nothing asserted it.
+// M0 (ROADMAP Phase M): resident GL buffer bytes + create/delete churn. JSON, static buffer,
+// same shape as MeshTiming_web.mm's exports and deliberately NOT EDEN_DIAGNOSTICS-gated — the
+// whole point is to read it in build-rel / build-relthr.
+extern "C" EMSCRIPTEN_KEEPALIVE
+const char* eden_debug_gl_buffer_bytes(void) {
+    static char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "{\"count\":%u,\"bytes\":%llu,\"peakCount\":%u,\"peakBytes\":%llu,"
+        "\"creates\":%u,\"deletes\":%u}",
+        g_glbuf_count, (unsigned long long)g_glbuf_bytes,
+        g_glbuf_peakCount, (unsigned long long)g_glbuf_peakBytes,
+        g_glbuf_creates, g_glbuf_deletes);
+    return buf;
+}
+
+// Reset the peak/churn accumulators (not the live count/bytes) so a probe can measure one
+// window — e.g. a single teleport reload burst — rather than a cumulative-since-boot figure.
+extern "C" EMSCRIPTEN_KEEPALIVE
+void eden_debug_gl_buffer_bytes_reset(void) {
+    g_glbuf_peakBytes = g_glbuf_bytes;
+    g_glbuf_peakCount = g_glbuf_count;
+    g_glbuf_creates = 0;
+    g_glbuf_deletes = 0;
+}
+
 #ifdef EDEN_DIAGNOSTICS
 extern "C" EMSCRIPTEN_KEEPALIVE
 int eden_gl_selftest_run(void) {

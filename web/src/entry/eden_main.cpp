@@ -58,6 +58,10 @@ EM_JS(void, eden_frame_post_hook, (), {
 });
 #endif
 
+#ifdef __EMSCRIPTEN__
+extern "C" void eden_heap_pressure_tick(void);  // src/seam/HeapProbe_web.mm
+#endif
+
 static void eden_frame_tick() {
     eden_web::EdenAppDelegate* app = eden_web::eden_seam_get_app_delegate();
     if (app && app->viewController.isAnimating()) {
@@ -87,6 +91,10 @@ static void eden_frame_tick() {
     }
 
 #ifdef __EMSCRIPTEN__
+    // ROADMAP Phase M / M1: -sMAXIMUM_MEMORY made "out of linear memory" a reachable end to a
+    // session, so something has to watch the approach. Self-throttling to once every 600 frames
+    // and one-shot per threshold — see src/seam/HeapProbe_web.mm.
+    eden_heap_pressure_tick();
     eden_frame_post_hook();
 #endif
 }

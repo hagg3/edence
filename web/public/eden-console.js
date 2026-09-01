@@ -54,6 +54,7 @@
       appendLine('spawn <type>            spawn a creature at your position (numeric TYPE_*/M_* id)');
       appendLine('setblock <x> <z> <y> <t> set a block (Terrain arg order — y is still up, but last)');
       appendLine('stats                   world/player snapshot');
+      appendLine('mem                     wasm heap use vs the -sMAXIMUM_MEMORY cap');
       return;
     }
     if (cmd === 'tp') {
@@ -88,6 +89,16 @@
       appendLine(utf8(M()._eden_console_world_stats()));
       return;
     }
+    // ROADMAP Phase M / M1 step 5: the cap is a hard abort, so it needs a surface a player or a
+    // bug report can read on demand, not only the one-shot 80%/90% warnings the frame loop emits.
+    if (cmd === 'mem') {
+      var h = JSON.parse(utf8(M()._eden_debug_heap()));
+      var mb = function (n) { return (n / 1048576).toFixed(1) + ' MB'; };
+      appendLine('heap in use   ' + mb(h.sbrkTop) + '  (peak this session ' + mb(h.peakSbrkTop) + ')');
+      appendLine('heap reserved ' + mb(h.heapSize) + '  of a ' + mb(h.heapMax) + ' cap  ->  ' + h.usedPct + '% used');
+      appendLine('note: heap use grows ~22 MB per world load and is not reclaimed (Phase M / M6).');
+      return;
+    }
     appendLine('unknown command: ' + cmd + ' (try "help")', true);
   }
 
@@ -106,7 +117,7 @@
 
     var input = UI.el('input', 'eden-field');
     input.type = 'text';
-    input.placeholder = 'help / tp x y z / spawn <type> / setblock x z y t / stats';
+    input.placeholder = 'help / tp x y z / spawn <type> / setblock x z y t / stats / mem';
     input.autocomplete = 'off';
     input.spellcheck = false;
     input.addEventListener('keydown', function (e) {

@@ -270,9 +270,20 @@ static void eden_apply_profile_defaults(void) {
     if (g_profileDefaultsApplied || !g_loaded) return;
     g_profileDefaultsApplied = true;
     const EdenProfile* p = eden_profile_active();
-    eden_seed_profile_default("dpr_cap",      p->dpr_cap);
-    eden_seed_profile_default("fps_cap",      p->fps_cap);
-    eden_seed_profile_default("render_scale", p->render_scale);
+    int dpr = p->dpr_cap, fps = p->fps_cap, rs = p->render_scale;
+    // ROADMAP Phase M / M5.2: the low-memory overlay replaces the video-preset defaults with the
+    // leaner kProfiles[EDEN_PROFILE_LOWMEM] row (1x pixel ratio, 75% render scale, 45 fps). It is
+    // set by the page before this runs; still only a DEFAULT, so g_hadStored[] (a row the player
+    // touched) wins exactly as with the input profile.
+    if (eden_low_memory()) {
+        const EdenProfile* lm = eden_profile_get(EDEN_PROFILE_LOWMEM);
+        dpr = lm->dpr_cap;
+        rs  = lm->render_scale;
+        if (lm->fps_cap) fps = lm->fps_cap;
+    }
+    eden_seed_profile_default("dpr_cap",      dpr);
+    eden_seed_profile_default("fps_cap",      fps);
+    eden_seed_profile_default("render_scale", rs);
 }
 
 static void eden_apply_input_profile(void) {

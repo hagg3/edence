@@ -214,6 +214,11 @@
       // Auto, so seeding it second would derive the whole point space against the wrong profile,
       // then correct it one macrotask later — a visible re-layout on every touch-device boot.
       Module._eden_set_detected_touch(window.matchMedia('(pointer: coarse)').matches ? 1 : 0);
+      // ROADMAP Phase M / M5.2: flag the low-memory video preset BEFORE eden_settings_init() runs
+      // (in the rAF loop below via EdenSettings.tick), so DisplayProfile_web.mm's
+      // kProfiles[EDEN_PROFILE_LOWMEM] row seeds dpr_cap/render_scale for a row the player has
+      // never touched. Same "must precede the profile-default seeder" ordering as the line above.
+      Module._eden_set_low_memory(EDEN_LOW_MEMORY ? 1 : 0);
       // Q2 perf audit: applyDisplayMode() used to run every rAF frame (forced layout read +
       // style write, forever); now it's event-driven (resize/fullscreenchange/display_mode
       // change), so it needs one explicit call here to size the canvas for the first frame.
@@ -372,6 +377,10 @@
     edenScript.async = true;
     edenScript.src = EDEN_BUILD_DIR + (EDEN_ASSET_MAP['eden.js'] || 'eden.js');
     document.body.appendChild(edenScript);
+    // ROADMAP Phase M / M5.1: if a threaded tree was what we just appended, start the "did it
+    // actually load?" failsafe — on a device where it never finishes, this is what gets the
+    // player to a playable single-threaded build instead of a permanent "Starting…" screen.
+    edenArmThreadedLoadFailsafe();
   }
   if (window.EdenCOI) window.EdenCOI.whenSettled(edenLoadModule); else edenLoadModule();
 

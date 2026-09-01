@@ -24,6 +24,12 @@
 // below for why the engine's own state machine now consults it. Only linked when the web seam
 // sources are built; a from-scratch iOS build would need its own stub.
 extern "C" int eden_load_failed(void);
+// Web port hook (web/src/seam/DisplayProfile_web.mm) — ROADMAP Phase M / M5.3. Non-zero when the
+// page has flagged this device as too RAM-poor for the port's 256z ("New Dawn") worlds. loadWorld
+// below refuses such a world through the same eden_report_load_failure() channel a corrupt save
+// uses, so the JS recovery dialog can point the player at Settings -> Storage -> "Convert to 64z".
+extern "C" int eden_low_memory(void);
+extern "C" void eden_report_load_failure(const char* world_file_name, const char* reason);
 
 //@synthesize cam, terrain, player, hud,fm/*,FLIPPED*/,effects,realtime,bestGraphics,doneLoading;
 //@synthesize game_mode,menu;
@@ -334,7 +340,20 @@ void World::loadWorld(NSString* name){
         // and the chunk table, and the only place it is written down is the save file's header.
         // Probe it here (a 96-byte read of a file we are about to open anyway); a world that does
         // not exist yet is 64z, which is what makes "new worlds stay 64z" true by construction.
-        eden_set_world_height(fm->probeWorldHeight(name,TRUE));
+        int probed_height=fm->probeWorldHeight(name,TRUE);
+        // ROADMAP Phase M / M5.3: a 256z world costs ~+64 MB of window arrays plus 4x the chunk
+        // objects and GL buffers on top of the 64z budget. On a device the page has flagged as
+        // low-memory that is very likely never viable, and a clear "too large for this device"
+        // beats a tab kill with an unsaved world. Bail the same way the doneLoading==2 corrupt-load
+        // check below does (terrain untouched, parked in the menu) and let eden-loaderror.js own
+        // the message + the "Convert to 64z" pointer.
+        if(probed_height>=T_HEIGHT_MAX && eden_low_memory()){
+            eden_report_load_failure([name UTF8String],"TALL_WORLD_LOW_MEM");
+            doneLoading=0;
+            menu->loading=0;
+            return;
+        }
+        eden_set_world_height(probed_height);
         if(LOW_MEM_DEVICE){
             menu->deactivate();
             

@@ -123,6 +123,12 @@ loading; `doneLoading` acts as the state: 0 idle → 1 loading → 2 finished.
   keeps rendering the menu + progress bar (progress = `terrain->counter/324`,
   i.e. 18×18 columns).
 - `LOW_MEM_DEVICE`: fully synchronous on the main thread.
+- **Pre-flight 256z refusal (web port, 2026-08-31, ROADMAP Phase M / M5.3):** before
+  `allocateMemory()`, `loadWorld` reads `probeWorldHeight`; if the world is 256z **and**
+  `eden_low_memory()` (web seam flag the page sets on a RAM-poor device) is set, it reports
+  `eden_report_load_failure(name, "TALL_WORLD_LOW_MEM")` and resets `doneLoading`/`menu->loading`
+  without touching `Terrain` — same bail shape as the corrupt-save check below, but from the main
+  thread before any allocation. A from-scratch iOS build links a stub returning 0 here.
 - On completion: unload menu textures, `loadGameAssets`, reset camera/player,
   `LoadModels` (creatures' POD files), switch to WAIT→PLAY.
 - **The `doneLoading==2` transition does not, by itself, mean the load succeeded** —

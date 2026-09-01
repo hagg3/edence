@@ -149,10 +149,21 @@ the `rt*` boundary that `prepareVBO()` already was:
 
 ### VBO upload — `prepareVBO()` (`TerrainChunk.mm:1433`)
 Copies the plain fields into the `rt*` (render) fields, mallocs the per-chunk index
-scratch `rtindices`, deletes old GL buffers, creates `vertexBuffer` (stream 1),
-`vertexBuffer2` (stream 2), `elementBuffer`, uploads with `GL_STATIC_DRAW`, frees the
-staging arrays. The plain/`rt` split is leftover double-buffering from the removed
-background meshing thread — today both halves are always in sync.
+scratch `rtindices`, uploads the two vertex streams and (re)creates `elementBuffer`,
+then frees the staging arrays. The plain/`rt` split is leftover double-buffering from the
+removed background meshing thread — today both halves are always in sync.
+
+**Since ROADMAP Phase M / M3(a) (2026-08-31) the GL buffer names persist across re-meshes.**
+`prepareVBO` used to `glDeleteBuffers` + `glGenBuffers` all three names every rebuild, so a
+full-window reload burst did ~1,500 buffer create/delete calls in a couple of seconds. Now
+`chunkUploadArray()` keeps each name, tracks its byte capacity (`vbCapacity`/`vb2Capacity`,
+never shrinks) and re-uploads with `glBufferSubData` when the new geometry fits, `glBufferData`
+only to grow — the same pattern row E3 gave the object batches. The names are still deleted for
+real in `unbuild()`, the destructor, and the `clearOldVerticesOnly` clear path. `render()`
+early-returns on `rtn_vertices==0` and `render2()` only runs for chunks with `rtn_vertices2>0`,
+so a name left allocated with stale contents is never drawn. Done for driver/CPU churn, not
+memory — the buffers live in the browser's GPU process (see `WORKING/web-port-memory-plan.md`
+§M3).
 
 **`render()`'s only "is there geometry" test is `rtn_vertices==0`, so every `rt*` field has to
 say "empty" from construction, not from the first `prepareVBO()`.** The constructor did not

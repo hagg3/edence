@@ -250,6 +250,7 @@ set(EDEN_SEAM_SOURCES
   src/seam/Menu_web.mm  # C accessors the DOM main menu (public/eden-menu.js) drives Menu.mm through. NOT a replacement — see file header.
   src/seam/LoadFailure_web.mm  # C4: corrupt/truncated-save signal for FileManager.mm's loadWorld() + .bak restore. See file header.
   src/seam/MeshTiming_web.mm  # row 36/C1: measures mesh-CPU vs VBO-upload cost per chunk, --wrap of TerrainChunk::rebuild2/prepareVBO. See file header.
+  src/seam/HeapProbe_web.mm  # ROADMAP Phase M / M0: eden_debug_heap() — heap high-water readable in Release + threaded. See file header.
   src/seam/SimpleAudioEngine_web.mm  # P5 audio (Web Audio + streaming music). See file header.
   # P4 landed by un-excluding the REAL FileManager.mm/FileManagerHelper.mm (see EDEN_SEAM_EXCLUDE
   # above) rather than writing FileManager_web.mm — no seam replacement needed here.
@@ -599,8 +600,65 @@ if(EMSCRIPTEN)
     # IF THE INITIAL SIZE IS EVER TOO SMALL, NOTHING BREAKS: growth is still on, so an
     # under-estimate costs a growth event, while an over-estimate is committed memory nobody uses.
     # When in doubt, err low.
+    #
+    # ROADMAP Phase M / M4, 2026-08-31 — RE-MEASURED and KEPT AT 96 MB. The row asked whether the
+    # up-front commit a phone that dies at the menu pays could be trimmed. `headless-memory-probe.js`
+    # against a scratch tree at 80 MB initial: growth profile is IDENTICAL to 96 MB (3 events,
+    # requests 109/113/128 MB, same 144 MB peak) — the linear step already neutralised the old
+    # geometric-overshoot penalty that made the pre-2026 sweep read "80 -> 166 MB". So 80 MB is
+    # peak-neutral and would save ~16 MB up-front ONLY for a session whose demand never exceeds
+    # 80 MB. Not taken, for two reasons: (1) real menu demand measured 93 MB by
+    # `headless-heap-ceiling-probe.js` (the -O0 memory-probe menu phase understates it), so 80 MB
+    # regrows to 96 MB immediately anyway; (2) this flag is shared with the THREADED build, where an
+    # extra growth event is a realloc-and-copy of a SharedArrayBuffer that invalidates every worker
+    # heap view (-Wpthreads-mem-growth). Net: the ~30 MB the row was theoretically worth is really
+    # ~0. Closed no-change.
     -sINITIAL_MEMORY=100663296
     -sMEMORY_GROWTH_LINEAR_STEP=16777216
+    # ROADMAP Phase M / M1, 2026-08-31. Emscripten's DEFAULT maximum is 2 GB, and leaving it unset
+    # bakes `maximum:32768` into the module's WebAssembly.Memory (visible in build-relthr/eden.js).
+    # For the THREADED build that is a shared memory, which cannot grow by realloc-and-copy, so the
+    # engine reserves the whole 2 GB of ADDRESS SPACE up front. That reservation is the leading
+    # suspect for the iPad Air 2 (2 GB RAM) failing to load `?build=thr` at all.
+    #
+    # WHAT M0 MEASURED, so this is not oversold (WORKING/web-port-memory-plan.md §"M0 results"):
+    # on desktop WebKit the reservation is VIRTUAL, not resident — `vmmap` shows the same 4.3 G
+    # virtual region whether the maximum is 2 GB or 512 MB, and capping moved the tab's physical
+    # footprint by roughly nothing (311 -> 307 MB idle). So this flag is NOT a footprint win on a
+    # desktop Mac and must not be claimed as one. It is here for the two cases desktop WebKit does
+    # not model: Blink charges committed SharedArrayBuffer differently (the user's ~1.9 GB Chromium
+    # reading is exactly the shape of a 2 GB maximum), and a 2 GB device can fail a 2 GB virtual
+    # reservation that a 64 GB Mac shrugs off.
+    #
+    # SIZING — measured, `node tools/headless-heap-ceiling-probe.js` (written for this row; it is
+    # the only probe here that reports the 256z ceiling rather than the 64z one):
+    #
+    #   menu, no world ...............................................  93 MB
+    #   64z world loaded + saved .....................................  116 MB
+    #   256z world loaded, 5 teleport bursts, save ...................  232 - 240 MB   <- the real
+    #     ceiling for ONE world load; the 64z number every other probe reports is ~110 MB low
+    #
+    # AND THE REASON THIS IS 768 MB AND NOT THE 512 MB THE PLAN PROPOSED: the same probe's
+    # fragmentation torture run found that peak linear memory is NOT bounded by the biggest world
+    # a session opens. Every world load leaks ~22 MB that is never reused, at BOTH heights, with
+    # no plateau — reloading the SAME 256z world 8 times walks sbrkTop 240 -> 426 MB in a dead
+    # straight line (~23 MB/load), and 64z leaks the same fixed ~22 MB once the freed 256z arena
+    # is used up. So "peak" is a function of how many worlds the player opens, not of world size,
+    # and a cap sized on a single load turns a long session into a HARD ABORT (-sMALLOC=emmalloc
+    # with the default ABORTING_MALLOC=true aborts cleanly with a message — but it is still a lost
+    # session). 768 MB buys ~24 world loads at 256z / ~29 at 64z above the ceiling, where 512 MB
+    # would have bought ~12. It still deletes the 2 GB reservation, which is the entire point of
+    # the row; the extra 256 MB is address space nobody commits.
+    #
+    # The leak itself is the real bug and it is NOT fixed here — it is filed as Phase M row M6.
+    # WHEN M6 LANDS, BRING THIS BACK DOWN TO 512 MB: with a bounded peak, 512 MB is 2.1x the
+    # measured 256z ceiling and the sizing method's 1.5x rule applies again as written.
+    #
+    # Failing safe: eden_heap_pressure_tick() (src/seam/HeapProbe_web.mm) warns once at 80% and
+    # once at 90% of this number, so the first field report of a cap abort arrives as "Eden: wasm
+    # heap at 82% of its 768 MB cap" and not as an unexplained crash. Rollback is deleting this
+    # one line.
+    -sMAXIMUM_MEMORY=805306368
     # P4: the wasm STACK is separate from INITIAL_MEMORY and defaults to only 64 KB. Terrain::render
     # declares `vertexObject objVertices[300*6*6]` (10800 * 64 B ≈ 690 KB) as a plain LOCAL, plus the
     # mesher's own large frames — the iOS build had a multi-MB thread stack, so these never mattered.
@@ -847,11 +905,16 @@ if(EMSCRIPTEN)
     # so Emscripten defers the thread's start until the next event-loop turn. The engine polls
     # `doneLoading` per frame rather than joining, so a deferred start is survivable — but a
     # pooled worker makes it deterministic, and the pool is what a meshing pool will grow out of.
-    # 8 = 1 world-load thread + MP_WORKERS (2, Classes/MeshPool.mm) + headroom. Raised from 4 when
-    # B3 Stage 2 landed the mesh pool: the pool creates its workers lazily on the first dispatch,
-    # from the main thread, and a pool that is already exhausted turns that into a deferred start
-    # (survivable — mp_start() falls back to inline meshing — but not something to run into by
-    # arithmetic). Pooled workers that are never used cost one idle Worker each.
+    # 4 = 1 world-load thread + MP_WORKERS (2, Classes/MeshPool.mm) + 1 slot of slack. Pooled
+    # workers that are never used still cost one idle Worker each: Phase M / M0 (2026-08-30)
+    # measured the 8-slot pool at ~112 MB resident (~14 MB per idle Worker realm), so dropping 4
+    # of them is a measured ~55 MB — the reason for the 8 → 4 cut here (Phase M / M2, 2026-08-31).
+    # It was 8 from B3 Stage 2 through M1: the mesh pool creates its workers lazily on the first
+    # dispatch, from the main thread, and a pool that is already exhausted turns that into a
+    # deferred start (survivable — mp_start() falls back to inline meshing, exercised naturally in
+    # the B3 Safari run — but B3's over-budget win erodes silently if it happens under load). 4
+    # keeps one slot over the 3-concurrently-live count; don't go to 3 without re-checking the
+    # inline-fallback counters in safari-threaded-mesher-check.js.
     #
     # -sALLOW_MEMORY_GROWTH + -pthread emits `-Wpthreads-mem-growth` (growing a SharedArrayBuffer
     # invalidates every JS-side heap view in every worker). Accepted, not ignored: this port's
@@ -859,7 +922,7 @@ if(EMSCRIPTEN)
     # so growth happens a handful of times per session, not per frame.
     list(APPEND EDEN_LINK_FLAGS
       -pthread
-      -sPTHREAD_POOL_SIZE=8
+      -sPTHREAD_POOL_SIZE=4
     )
     target_compile_options(eden PRIVATE -pthread)
   else()

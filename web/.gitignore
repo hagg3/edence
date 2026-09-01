@@ -8,6 +8,9 @@
 /build-relwdiag/
 # same, plus -DEDEN_THREADED=ON — the A/B baseline for B3 off-thread meshing
 /build-relthr/
+# ROADMAP Phase M / M0 — scratch trees with -sMAXIMUM_MEMORY=512MB, driven by tools/browser-memory-probe.js
+/build-relwdiag-cap512/
+/build-relthr-cap512/
 /dist/
 *.wasm
 *.wasm.map

@@ -167,6 +167,10 @@ public:
     GLuint query
     ;
 	GLuint    vertexBuffer,vertexBuffer2,elementBuffer;
+    // M3(a) (ROADMAP Phase M): byte capacity each GL buffer name is currently sized for, so
+    // prepareVBO() can re-upload into a persistent name instead of delete/recreating it every
+    // re-mesh. Never shrinks; reset to 0 wherever the name is actually deleted.
+    int       vbCapacity,vb2Capacity;
    // BOOL needsRebuild;
 
 	int pbounds[6];

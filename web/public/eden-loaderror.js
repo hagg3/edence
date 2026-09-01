@@ -67,7 +67,47 @@
     reloadAfterFlush();
   }
 
+  // ROADMAP Phase M / M5.3: World::loadWorld reports this exact token instead of a corrupt-save
+  // reason when it refuses a 256z world on a device the page flagged as low-memory. Same channel,
+  // different dialog — nothing is corrupt and there is no backup to restore, the world is simply
+  // too big for this device, and the remedy is the Storage tab's existing "Convert to 64z".
+  function buildTallWorld(worldName) {
+    var UI = window.EdenUI;
+    UI.ensureCSS();
+
+    var scrim = UI.scrim({ id: 'eden-loaderror-backdrop' });
+    scrim.style.zIndex = 'var(--eden-z-alert)';
+
+    var win = UI.window({
+      title: 'World needs more memory',
+      variant: 'dialog',
+      scrollbar: false,
+      role: 'alertdialog',
+    });
+    var warn = UI.icon('alert-triangle', { title: 'Warning' });
+    warn.style.width = 'calc(24 * var(--u))';
+    warn.style.height = 'calc(24 * var(--u))';
+    win.actions.appendChild(warn);
+
+    var stack = UI.el('div', 'eden-stack');
+    stack.appendChild(UI.el('p', 'eden-stack__text',
+      '"' + worldName + '" is a 256-block-tall world and needs more memory than this device has.'));
+    stack.appendChild(UI.el('p', 'eden-stack__text',
+      'Open it on a device with more RAM, or use Settings → Storage → “Convert to 64z” ' +
+      'to make a shorter copy that will load here.'));
+    stack.appendChild(UI.button({
+      size: 'md', tone: 'danger', icon: 'log-out', label: 'Back to menu', onClick: quitToMenu,
+    }));
+    win.content.appendChild(stack);
+
+    scrim.appendChild(win.root);
+    UI.bindButtonSounds(scrim);
+    S.root = scrim;
+    return scrim;
+  }
+
   function build(worldName, reason) {
+    if (reason === 'TALL_WORLD_LOW_MEM') return buildTallWorld(worldName);
     var UI = window.EdenUI;
     UI.ensureCSS();
 
