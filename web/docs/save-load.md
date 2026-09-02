@@ -22,12 +22,51 @@ doc covers only what backs that Foundation surface and how it becomes durable.
 > gotcha this surfaced (pass 42).
 
 ## Storage backend
-Saves land in `/documents` inside the wasm virtual filesystem, backed by
-**IDBFS** (`-lidbfs.js`), mounted with `{autoPersist: true}` in
-`public/eden-storage.js`. Every write/unlink/rename under `/documents` self-queues a
-debounced IndexedDB sync through IDBFS's own node_ops hooks — there is no engine-side
-hook and no `--wrap`; `Classes/` is untouched, the persistence is entirely a mount
-option.
+Saves land in `/documents` inside the wasm virtual filesystem. Which durable store sits under that
+mount is chosen at boot by `public/eden-storage.js` — there is no engine-side hook and no `--wrap`
+either way; `Classes/` is untouched and the persistence is entirely a mount choice.
+
+**OPFS is the backend since 2026-09-02 (ROADMAP Phase C / C2)**, with IDBFS as the fallback:
+
+| | OPFS (`public/eden-opfs.js` + `eden-opfs-worker.js`) | IDBFS (`-lidbfs.js`, `{autoPersist:true}`) |
+|---|---|---|
+| granularity | the byte ranges the engine actually wrote | **the whole file**, every save |
+| a 279 MB world's autosave | ~130 KB, off-thread | 279 MB `store.put` + a ~558 MB transient + a ~53 ms (desktop) / ~150–250 ms (mobile) synchronous stall |
+| where the write happens | a dedicated Worker, `FileSystemSyncAccessHandle.write(buf,{at})` | the main thread, structured-cloned into IndexedDB |
+| used when | `navigator.storage.getDirectory` exists and a sync access handle can be acquired | anything else, or `?storage=idb` |
+
+MEMFS is still the engine's filesystem in **both** cases — the OPFS backend is
+`MEMFS.mount()` plus hooks on `stream_ops.write` / `setattr` / `mknod` / `unlink` / `rename` that
+record an ordered op log, materialise the dirty ranges out of `node.contents` on a debounced flush,
+and post them to the worker. It is an Emscripten FS *type* (`{mount, syncfs}`) exactly like IDBFS,
+so `FS.syncfs(true|false, cb)` still means "populate" / "flush" and every existing caller
+(`eden-loaderror.js`'s restore-then-reload, `tools/safari-256z-authoring-live.js`) is unchanged.
+
+Two constraints worth carrying, both learned the expensive way in
+[`../../WORKING/opfs-backend-plan.md`](../../WORKING/opfs-backend-plan.md):
+
+- **A sync access handle is a Worker-only API, and the engine runs on the main thread** (this port
+  is deliberately not `PROXY_TO_PTHREAD`). So OPFS can back the durable mirror but *cannot* back
+  the engine's own synchronous reads — the world still costs one full copy of itself in the JS
+  heap while open. Removing that is `web-port-plan.md`'s D1, not this.
+- **"Use OPFS" is not the win by itself.** `createWritable()` *is* callable on the main thread, but
+  it writes through a swap file and copies the whole existing file first — exactly the cost this
+  replaced. The sync access handle is the win.
+
+The handle is also an exclusive **lock**, so a second tab cannot write. It does not fall back to
+IDBFS there (post-migration that store is empty, and a second writer would be worse anyway): it
+populates MEMFS from a lock-free `getFile()` read so the worlds are visible and playable, runs
+session-only, and says so through the storage-warning dialog.
+
+Existing players' worlds migrate out of IndexedDB on the first OPFS boot, in two phases: copy in
+one session, delete the IndexedDB database on the *next* boot that successfully reads those same
+worlds back out of OPFS (`localStorage['eden.opfs.migrated']`), so there is always one reload's
+worth of rollback. `?storage=idb` forces the old backend, `?storage=opfs` refuses to fall back.
+
+Regression cover: `tools/headless-opfs-mirror-test.js` (a node-`fs` sink stands in for the worker —
+`fs.writeSync(fd, buf, 0, len, at)` is the same primitive — and every flush is asserted
+byte-identical to MEMFS, on both save strategies, with a second process booting from the mirror
+alone). The worker/sync-handle half needs a browser: `tools/safari-opfs-live.js`.
 
 The bundled default world (`Eden.eden`) lives read-only at `/bundle/Eden.eden` and is
 resolved via the shimmed `NSBundle` — same role as the app-bundle copy on iOS. It is
@@ -135,12 +174,14 @@ that test into sampling; a silent off-by-one here would look like a worldgen bug
 filesystem bug.
 
 ## Boot-time populate
-Before `main()` can run, `Module.preRun` registers an async **IndexedDB → MEMFS
+Before `main()` can run, `Module.preRun` registers an async **durable store → MEMFS
 populate** as a run dependency (`public/eden-storage.js`) — this blocks `main()`/
-`Menu::loadWorlds` until existing saves are loaded off IndexedDB into the in-memory
-filesystem IDBFS backs. See [execution-flow.md](execution-flow.md) for where this
-sits relative to `main()`. Guarded on `typeof indexedDB` so headless `node eden.js`
-degrades gracefully to previous in-memory-only (MEMFS, no persistence) behavior.
+`Menu::loadWorlds` until existing saves have been read into the in-memory filesystem.
+It is ONE run dependency covering whichever backend wins, including a fallback that only
+becomes necessary after the OPFS worker has already failed: main() must not start in
+between. See [execution-flow.md](execution-flow.md) for where this sits relative to
+`main()`. Guarded on `typeof indexedDB` / `navigator.storage` so headless `node eden.js`
+degrades gracefully to in-memory-only (MEMFS, no persistence) behavior.
 
 ## Storage management UI
 A **Storage tab** (`src/seam/Storage_web.mm` + `public/eden-settings.js`) lists and
@@ -168,16 +209,25 @@ test: `tools/headless-256z-authoring-test.js` (also covers the New World height 
 - **Two save strategies, chosen by file size** (2026-08-25, 256z Stage 3 / B5). Below
   `g_save_inplace_threshold` (`Classes/Constants.h`, 16 MiB) nothing changed: the save is built
   in a `.savetmp` whole-file scratch copy and committed by one rename. At or above it the save
-  writes the world file in place behind a small `.savejrnl` rollback journal. The full design,
-  the failure it trades away, and the recovery path are in
-  [`../../docs/save-load.md`](../../docs/save-load.md) — they are engine-level, not web-specific.
+  writes the world file in place behind a small `.savejrnl` rollback journal — which **since
+  2026-09-02 (ROADMAP C3) also carries a pre-image record per dirty column**, so the in-place path
+  is fully atomic again rather than able to tear one column. The full design and the recovery path
+  are in [`../../docs/save-load.md`](../../docs/save-load.md) — they are engine-level, not
+  web-specific. What is web-specific is the *cost*, which only became visible here: under IDBFS the
+  extra journal write was invisible (the whole file was re-`put` per save regardless, ROADMAP C1),
+  and under C2's OPFS backend it is measurable and small — on the 279 MB 256z specimen a
+  steady-state autosave is unchanged at 127 KB read / 83 KB written, and a save with one edited
+  column goes 155 KB → 259 KB read, 214 KB → 345 KB written.
   What is **web**-specific is why the threshold has to exist at all:
   - The `copyItemAtPath:` shim reads the whole file into an `NSData` (a `std::vector<uint8_t>`) —
     i.e. a **transient wasm-heap allocation the size of the world**, on a 32-bit heap that this
     build grows from 96 MB and that a loaded 256z world already occupies ~413 MB of. A
     multi-gigabyte world cannot be saved that way at all, at any speed.
-  - MEMFS is JS-heap, so every copy is also a second full-size resident copy, and IDBFS's
-    `{autoPersist:true}` then has to push whatever changed into IndexedDB against a finite quota.
+  - MEMFS is JS-heap, so every copy is also a second full-size resident copy, and the persistence
+    layer then has to push whatever changed into a store with a finite quota. (Under IDBFS that
+    push was itself whole-file; ROADMAP C2's OPFS backend made it a delta, but the wasm-heap
+    `NSData` above is an engine-side cost no backend can touch — which is why the threshold still
+    exists.)
   - Measured with `tools/headless-save-io-probe.js` against a real 279 MB 256z specimen, saving
     with **nothing edited**: 558 MB read + 558 MB written per save before, 127 KB read +
     83 KB written after. Three whole-file copies were involved, not one — `copyItemAtPath:`,
@@ -187,7 +237,9 @@ test: `tools/headless-256z-authoring-test.js` (also covers the New World height 
     nothing to offer for such a world, by design, because the journal covers the failure it
     existed for and a permanently-stale second copy of a gigabyte world is not a fair trade.
 - `NSFileHandle`'s `-writeData:` now `fflush()`s, so a later `flushNow()`-style sync
-  can't silently persist a stdio-buffered/stale file to IndexedDB.
+  can't silently persist a stdio-buffered/stale file. (Under OPFS the same fflush is what makes
+  the dirty ranges visible to the mount's write hook at all — an unflushed stdio buffer is not a
+  write the FS layer has seen.)
 - `+fileHandleForWritingAtPath:` copies the existing file to a `.bak` sibling before
   overwrite. `+fileHandleForUpdatingAtPath:` is a separate opener (NOT an alias for
   `-Writing...` as of pass 42) that defers this same backup to the first actual
@@ -202,13 +254,18 @@ test: `tools/headless-256z-authoring-test.js` (also covers the New World height 
   only a pure read-then-close is now exempt. As of 2026-08-25 the backup is **also** skipped for
   any file at or above `g_save_inplace_threshold`, because it is itself a whole-file copy and
   was firing on the same save as `saveWorld`'s scratch copy (that is the third of the three
-  full-size copies the I/O probe found). The pending-backup path is stored as a
+  full-size copies the I/O probe found). As of 2026-09-02 it is **also** skipped for a
+  zero-length source — backing one up produces a 0-byte `.bak` that the load-failure dialog would
+  offer as a restorable previous save. C3 is what made that reachable (the rollback journal is now
+  appended to across a save, so it is opened through this handle on a path that was just removed
+  rather than written in one `createFileAtPath:`), but the hole existed for any freshly-created
+  world file. The pending-backup path is stored as a
   plain `strdup`'d C string ivar, not a retained `NSString*` — see the comment in
   `NSFileHandle.mm` for why (this class's ivar-offset layout was only ever measured
   with one own ivar, and adding an ObjC-object ivar hit a real, reproducible "function
   signature mismatch" crash; a C string sidesteps it).
-- `navigator.storage.persist()` is requested so the browser doesn't evict the
-  IndexedDB-backed origin under storage pressure.
+- `navigator.storage.persist()` is requested so the browser doesn't evict the origin's storage
+  under pressure — it covers OPFS and IndexedDB alike.
 - **A failed load must also be caught by the caller, not just detected.** Pass 42
   found that `FileManager::loadWorld()` correctly detecting and reporting a corrupt
   save wasn't sufficient on its own — `World::loadWorld()`'s `doneLoading` state

@@ -91,6 +91,9 @@ does NOT zero what it grows into, because every grow site here overwrites those 
 statement (B6, 2026-08-28). `-setLength:` re-adds the zero-fill explicitly so it still matches real
 Foundation; the shim-only `-setLengthUninitialized:` is the escape hatch for "grow, then fill
 completely", which is what the file-read path does.
+`-dealloc` destroys `_bytes` explicitly — mandatory for any class here with a C++ ivar, since the
+runtime emits no `.cxx_destruct` (see `web/docs/objc-runtime.md`; missing it here was the bulk of
+the ~22 MB-per-world-load leak fixed by Phase M / M6, 2026-09-02).
 All implemented (trivial). `initWithContentsOfFile:`/`writeToFile:` are the **P4** seam
 (FileManager's actual save I/O) — implemented here over plain `fopen`/`FILE*` for P1 headless
 correctness; P4 swaps the *seam* (FileManager.mm's callers), not this class, to OPFS.

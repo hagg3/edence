@@ -393,9 +393,16 @@
     } else if (ES.isPersistent()) {
       persistText = 'Saved locally in this browser. Worlds survive a reload but live only on ' +
         'this device — clearing site data removes them.';
+    } else if (ES.backend && ES.backend() === 'readonly') {
+      // ROADMAP C2: the OPFS sync access handle is an exclusive lock, so a second tab can read
+      // these worlds but must not write them. Say so here as well as in the one-shot dialog —
+      // this panel is where a player goes to ask "are my worlds safe".
+      persistText = 'Eden is open in another tab, so this tab is read-only: your worlds are ' +
+        'listed and playable here, but changes made in THIS tab will not be saved. Close the ' +
+        'other tab and reload to play normally.';
     } else {
-      persistText = 'Not persistent this session. Worlds will be lost on reload (no IndexedDB ' +
-        'available — e.g. private browsing on some browsers).';
+      persistText = 'Not persistent this session. Worlds will be lost on reload (no browser ' +
+        'storage available — e.g. private browsing on some browsers).';
     }
     var summary = UI.section({ title: 'This device', desc: persistText });
     var totals = UI.el('div', 'eden-listrow__sub',

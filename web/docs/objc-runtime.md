@@ -84,6 +84,35 @@ being measured directly.
 - `EdenConcreteString` — `std::string`-backed concrete subclass for runtime-built
   strings.
 
+## C++ ivars are neither constructed nor destroyed — every class that has one owes a `-dealloc`
+This runtime emits no `.cxx_construct`/`.cxx_destruct`: `class_createInstance()` is a `calloc`
+and `object_dispose()` is a bare `free()`. A C++ ivar therefore starts life as an all-zero object
+(fine in practice — a zeroed `std::vector` reads as a valid empty one, a zeroed `std::string` as a
+valid empty short string) and **dies without its destructor running, leaking whatever it had on the
+heap**. Nothing warns; the class works perfectly and just grows the heap.
+
+**Rule: any shim class with a non-POD ivar must implement `-dealloc` that explicitly destroys it
+and then calls `[super dealloc]`** (destroy before the storage is freed):
+```objc
+- (void)dealloc {
+    _bytes.~eden_byte_vector();   // a named typedef, so the destructor can be spelled
+    [super dealloc];
+}
+```
+This has now bitten the port four times, each time found only by measurement:
+`NSUserDefaults` (a `std::unordered_map` that also *crashed*, since an all-zero one is not valid),
+`NSAutoreleasePool` (fixed by holding the vector behind a pointer + `delete`), and then
+`NSData`/`NSMutableData`, `NSArray`/`NSSet` and `EdenConcreteString`/`NSMutableString` — the last
+three found by ROADMAP Phase M / M6, where together they were **the ~22 MB every world load leaked**
+(the texture loader's ~25 `+dataWithContentsOfFile:` PNG buffers and the column streamer's ~48 KB
+`NSMutableData` per bundled-map column). `tools/headless-alloc-leak-probe.js` is the harness that
+found them and the one to re-run if a new shim class grows a C++ ivar.
+
+Two corollaries worth keeping:
+- **`-dealloc` on the base class is enough**; mutable subclasses inherit it. Don't add a second one.
+- **Destroy the container, not its contents.** `NSArray`/`NSSet` here do not retain what is put in
+  them, so releasing their elements in `-dealloc` would over-release.
+
 ## `RuntimeError: function signature mismatch`
 Under this ABI, this almost always means **a message was sent to a class with no
 `@implementation`** (a missing `@implementation` still links fine — it just

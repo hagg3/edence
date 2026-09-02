@@ -28,6 +28,21 @@
 }
 - (BOOL)containsObject:(id)obj { return [self indexOfObject:obj] != NSNotFound; }
 
+
+// ROADMAP Phase M / M6. `_items` is a std::vector ivar and this port's hand-written ObjC runtime
+// emits no `.cxx_destruct` — object_dispose() is a bare free() — so without this the vector's heap
+// buffer is leaked every time an array dies. Same hazard NSData.mm, NSUserDefaults.mm and
+// NSAutoreleasePool.mm document; see NSData.mm's -dealloc for the full note and why an explicit
+// destructor call on a calloc'd-never-constructed vector is safe.
+//
+// It destroys the VECTOR, not its contents: this shim's arrays and sets do not retain what is put
+// in them (+arrayWithObjects:/-addObject: just push_back), so releasing here would over-release.
+// NSMutableArray inherits this.
+- (void)dealloc {
+    _items.~eden_id_vector();
+    [super dealloc];
+}
+
 @end
 
 @implementation NSMutableArray
@@ -86,6 +101,12 @@
         return (NSUInteger)_items.size();
     }
     return 0; // single-pass: whole set handed back in the first call
+}
+
+// Same as NSArray's — see its -dealloc. NSMutableSet inherits this.
+- (void)dealloc {
+    _items.~eden_id_vector();
+    [super dealloc];
 }
 
 @end

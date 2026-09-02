@@ -133,13 +133,17 @@ typedef long NSComparisonResult;
 
 @end
 
+// A named type for the _std ivar below, so -dealloc can spell the explicit destructor call
+// (`~eden_std_string`) — see NSString.mm's -dealloc for why one has to exist at all.
+typedef std::string eden_std_string;
+
 // The heap-allocated, std::string-backed member of the cluster — what every NSString factory
 // method actually returns. Engine code only ever sees it through an `NSString *`, exactly as
 // on real Foundation (where the concrete class is the equally-private __NSCFString).
 @interface EdenConcreteString : NSString {
 @public
-    std::string _std; // shim-internal; engine code never touches this (nor could it — the
-                      // engine's variables are all typed `NSString *`, which has no _std).
+    eden_std_string _std; // shim-internal; engine code never touches this (nor could it — the
+                          // engine's variables are all typed `NSString *`, which has no _std).
 }
 + (EdenConcreteString *)stringWithStd:(const std::string &)s; // autoreleased, shim-internal
 - (std::string &)stdString;                                   // mutable access for NSMutableString

@@ -453,6 +453,19 @@ std::string eden_format_nsstring(const char *fmt, va_list args) {
 - (const char *)UTF8String { return _std.c_str(); }
 - (NSUInteger)length { return (NSUInteger)_std.size(); }
 
+// ROADMAP Phase M / M6. `_std` is a std::string ivar and this port's hand-written ObjC runtime
+// emits no `.cxx_destruct` — object_dispose() is a bare free() — so without this, every string
+// longer than libc++'s 22-byte short-string buffer leaked its heap buffer when it died. Same
+// hazard NSData.mm, NSUserDefaults.mm and NSAutoreleasePool.mm document; NSData.mm's -dealloc has
+// the full note, including why an explicit destructor call on a calloc'd-never-constructed object
+// is safe (an all-zero std::string reads as a valid empty SHORT string, which owns nothing).
+// NSMutableString inherits this; NSConstantString does not (it is immortal and overrides -dealloc
+// to do nothing, one class up the hierarchy from here).
+- (void)dealloc {
+    _std.~eden_std_string();
+    [super dealloc];
+}
+
 @end
 
 // ----------------------------------------------------------------------------------------

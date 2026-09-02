@@ -10,9 +10,13 @@
 #import "NSObject.h"
 #include <vector>
 
+// A named type for the ivar so -dealloc can spell the explicit destructor call (`~eden_id_vector`)
+// — see the -dealloc comment in NSArray.mm for why one has to exist at all.
+typedef std::vector<id> eden_id_vector;
+
 @interface NSArray : NSObject {
 @public
-    std::vector<id> _items;
+    eden_id_vector _items;
 }
 + (NSArray *)array;
 + (NSArray *)arrayWithObjects:(id)first, ...; // nil-terminated, classic Foundation varargs form
@@ -35,7 +39,7 @@
 // enumeration (`for (UITouch *t in touches)`, via NSFastEnumeration), count, anyObject.
 @interface NSSet : NSObject <NSFastEnumeration> {
 @public
-    std::vector<id> _items;
+    eden_id_vector _items;
 }
 + (NSSet *)setWithObject:(id)obj;
 + (NSSet *)setWithArray:(NSArray *)arr;

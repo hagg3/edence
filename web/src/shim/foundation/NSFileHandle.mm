@@ -75,6 +75,16 @@ static void eden_backup_before_overwrite(NSString *path) {
         fclose(src);
         return;
     }
+    // A zero-length file has nothing to back up, and backing it up is worse than skipping: it
+    // leaves a 0-byte "<path>.bak" that eden_load_restore_backup() would offer as a restorable
+    // previous save. The path that made this reachable is C3's rollback journal, which is opened
+    // through -fileHandleForUpdatingAtPath: on a path that was just removed (the journal must be
+    // appended to across the save, so it cannot be one createFileAtPath: any more) — but the same
+    // hole existed for any freshly-created world file.
+    if (existing <= 0) {
+        fclose(src);
+        return;
+    }
     fseeko(src, 0, SEEK_SET);
     NSString *bakPath = [path stringByAppendingString:@".bak"];
     const char *bak = [bakPath UTF8String];

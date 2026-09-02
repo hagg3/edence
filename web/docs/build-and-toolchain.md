@@ -78,6 +78,14 @@ is not visible to a bare `require('./eden.js')` caller — drive it with
   `eden_debug_tick` are `#ifdef`'d out, and `eden_gl_dbg_active()` returns `false`
   unconditionally — which also removes a per-draw `glGetError()` pipeline stall, not
   just print noise.
+- `EDEN_ALLOC_TRACE` — **OFF, and a scratch-tree option only** (Phase M / M6). Adds
+  `src/seam/AllocTrace_web.c`, which defines strong `malloc`/`free`/`calloc`/`realloc`/`memalign`
+  over emmalloc's *weak* public symbols (no `--wrap`, no allocator replacement) and keeps a
+  per-pointer table plus live bytes per captured callstack; `--profiling-funcs` is added so those
+  stacks carry function names. It refuses to configure with `EDEN_THREADED=ON` (non-atomic
+  counters) or outside Release (`-sMALLOC=emmalloc` is a Release-only link flag here). Drive it
+  with `tools/headless-alloc-leak-probe.js`; it exists to answer "which call site is leaking",
+  which is how M6 was found. Never ship it — it perturbs what it measures.
 
 ## Case-sensitivity and dedup gotchas (Linux CI vs. macOS dev)
 - macOS's case-insensitive filesystem silently resolves quoted includes like
@@ -110,23 +118,26 @@ other memory number in this repo is a 64z number and is ~110 MB low.)*
    (`Classes/Terrain.mm`), so `blockarray` + `lightarray` go from ~21 MB at 64z to ~85 MB at 256z,
    plus 4× the `TerrainChunk` objects.
 
-2. **World *count* costs ~22 MB each, permanently.** Every world load grows linear memory by
-   ~22 MB that is never reclaimed — **at both heights, and with no plateau.** Reloading the *same*
-   256z world eight times in one session walks `sbrkTop` from 240 MB to 426 MB in a dead straight
-   line (~23 MB/load). A 64z world leaks the same fixed ~22 MB, once the freed arena from any
-   larger world already open in the session has been used up.
+2. **World *count* used to cost ~22 MB each, permanently — fixed 2026-09-02 (Phase M / M6).**
+   Every world load grew linear memory by ~22 MB that was never reclaimed, at both heights, with no
+   plateau: reloading the *same* 256z world eight times walked `sbrkTop` from 240 MB to 426 MB in a
+   dead straight line. It was a genuine leak, not fragmentation — four shim classes
+   (`NSData`/`NSMutableData`, `NSArray`/`NSSet`, `EdenConcreteString`/`NSMutableString`) held C++
+   ivars that this port's hand-written ObjC runtime never destroyed, because it emits no
+   `.cxx_destruct` and `object_dispose()` is a bare `free()`. Each got a `-dealloc`; see
+   [objc-runtime.md](objc-runtime.md), which now states the general rule.
 
-   This is a **leak, not fragmentation**: an identical allocate/free pattern repeated against the
-   same world should reuse its own freed memory perfectly, and it does not. `emmalloc` never
-   returns memory to the system, so the growth is monotonic for the life of the tab. It is
-   **unfixed** and filed as ROADMAP Phase M row **M6**.
+   **The same torture run is flat across 8 loads at every height combination**, so world *count* is
+   free again and peak is bounded by world size. Regression tests:
+   `tools/headless-heap-ceiling-probe.js --torture=same256|height|same64` (must stay flat) and
+   `tools/headless-alloc-leak-probe.js` (cheaper, and with `-DEDEN_ALLOC_TRACE=ON` it names the
+   leaking call site). A ~20 KB-per-load residual remains, absorbed by the allocator.
 
-The practical consequence, and the reason `-sMAXIMUM_MEMORY` above is 768 MB rather than a tighter
-fit: **"peak linear memory" is a function of how many worlds the player opens, not of how big they
-are.** Any cap sized on a single world load is sized on the wrong number, and since the cap is a
-hard abort, sizing it that way converts a slow leak into a lost session. At 768 MB there is roughly
-24 world loads of headroom above the 256z ceiling. When M6 lands and the peak is bounded again, the
-cap should come down to 512 MB.
+The practical consequence: **peak linear memory is set by the biggest world the session opens** —
+~222–233 MB at 256z. `-sMAXIMUM_MEMORY` is 512 MB, ~2.2× that ceiling. It shipped at 768 MB while
+the leak was live (peak then depended on how many worlds were opened, and since the cap is a hard
+abort, sizing it on one load would have converted a slow leak into a lost session) and came down
+when M6 landed.
 
 To read the current figure at any time: the dev console's `mem` command (backtick to open), or
 `eden_debug_heap()` from a script.
@@ -139,7 +150,7 @@ To read the current figure at any time: the dev console's `mem` command (backtic
 - `-sINITIAL_MEMORY=100663296` (~96 MB) — the engine's static data alone is ~62 MB;
   `ALLOW_MEMORY_GROWTH` is a *runtime* knob and doesn't help at link time, so this has
   to be sized up front.
-- `-sMAXIMUM_MEMORY=805306368` (768 MB) — **a hard cap: hitting it aborts the session**
+- `-sMAXIMUM_MEMORY=536870912` (512 MB) — **a hard cap: hitting it aborts the session**
   (`-sMALLOC=emmalloc` + the default `ABORTING_MALLOC=true`). Added by ROADMAP Phase M / M1
   (2026-08-31) to stop Emscripten's 2 GB default being baked into the module — in the threaded
   build that maximum is a *shared* `WebAssembly.Memory`, which cannot grow by realloc-and-copy, so
@@ -147,10 +158,11 @@ To read the current figure at any time: the dev console's `mem` command (backtic
   M0 measured desktop WebKit committing that reservation lazily, so capping moved Safari's physical
   footprint by ~nothing. It is here for Blink (which charges committed `SharedArrayBuffer`
   differently) and for 2 GB devices that can fail a 2 GB *virtual* reservation.
-  **Why 768 and not the 512 the plan proposed:** peak linear memory is not bounded by the largest
-  world a session opens — every world load leaks ~22 MB that is never reused, at both heights, with
-  no plateau (`tools/headless-heap-ceiling-probe.js`). See "Linear memory: what actually sets the
-  peak" below. `eden_heap_pressure_tick()` warns once at 80% and 90% so a cap abort is diagnosable.
+  **It was 768 MB from M1 until M6 (2026-09-02)**, because at the time every world load leaked
+  ~22 MB and peak was a function of session length rather than world size; with that leak fixed the
+  512 MB the plan originally prescribed applies again (~2.2× the measured 256z ceiling). See
+  "Linear memory: what actually sets the peak" below. `eden_heap_pressure_tick()` warns once at 80%
+  and 90% so a cap abort is diagnosable.
 - `-sSTACK_SIZE=8388608` (8 MB) — the wasm stack is carved out of `INITIAL_MEMORY`
   separately and defaults to 64 KB; `Terrain::render`'s ~380 KB of locals blows that
   default immediately.

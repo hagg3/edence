@@ -77,6 +77,25 @@
     return f.good() ? YES : NO;
 }
 
+
+// ROADMAP Phase M / M6 -- THE PER-WORLD-LOAD LEAK. `_bytes` is a std::vector ivar, and this port's
+// hand-written ObjC runtime emits no `.cxx_destruct`: object_dispose() is a bare free(), so
+// without this method every NSData that dies takes its heap buffer with it and never gives it
+// back. It is the same hazard NSUserDefaults.mm and NSAutoreleasePool.mm already document, and it
+// was the dominant term in the ~22 MB every world load leaked -- the texture loader reads ~25 PNGs
+// through +dataWithContentsOfFile: and the column streamer reads every bundled-map column through
+// NSFileHandle's -readDataOfLength: (~48 KB of NSMutableData each). Measured with
+// tools/headless-alloc-leak-probe.js.
+//
+// Explicit destructor call, then [super dealloc] -- the ivar must die BEFORE the storage it lives
+// in is freed. Safe on an instance that was calloc'd and never constructed (an all-zero vector is
+// a valid empty one, and ~vector on it deallocates nothing), which is exactly what
+// class_createInstance hands back. NSMutableData inherits this.
+- (void)dealloc {
+    _bytes.~eden_byte_vector();
+    [super dealloc];
+}
+
 @end
 
 @implementation NSMutableData

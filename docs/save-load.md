@@ -107,37 +107,58 @@ with **nothing edited** (`web/tools/headless-save-io-probe.js`): 558 MB read + 5
 save, against ~155 KB of genuinely-changed bytes. So above the threshold `saveWorld` writes
 straight into the world file and protects it with a **rollback journal** instead:
 
-- Before touching anything, `writeSaveJournal()` writes `<file>.savejrnl` — a small header
-  (magic `EDNJRNL`, version, original length, region offset/length) plus the world's current
-  192-byte header and the file's tail from `directory_offset − creature block` to EOF.
-- That tail is exactly the region a save can destroy: appended columns start at
-  `directory_offset − creature block`, and everything below that point is only ever overwritten
-  by a dirty column *at its own existing offset*. The journal is therefore O(number of columns),
-  not O(file size) — about 410 KB for a 3.97 GB world.
+The journal has **two phases**, written in that order and both before the first destructive byte:
+
+- **Phase 1 — the structural tail.** `beginSaveJournal()` writes `<file>.savejrnl`: a small header
+  (magic `EDNJRNL`, version 2, original length, region offset/length) plus the world's current
+  192-byte header and the file's tail from `directory_offset − creature block` to EOF. That tail
+  is exactly the region an *append* destroys: a new column record starts at
+  `directory_offset − creature block` and overwrites the old creature block and the front of the
+  old directory. O(number of columns), not O(file size) — about 410 KB for a 3.97 GB world.
+- **Phase 2 — the dirty columns** (2026-09-02, ROADMAP C3). `journalDirtyColumns()` appends one
+  `EDNJCOL` record per column this save is about to overwrite *at its own existing offset*,
+  holding that column's original bytes. It runs after `readDirectory()`, because "does this column
+  already have a directory row" is what separates an overwrite (needs a pre-image) from an append
+  (phase 1 already covers it) — and `readDirectory()` only reads, so this is still ahead of every
+  destructive write. It must not clear `modified`; `saveColumn()` owns that flag, and if the
+  journal fails the save is skipped and the flags have to survive for the next attempt.
 - Removing the journal after `closeFile` is the commit. `recoverInterruptedSave()` (called from
   `probeWorldHeight`, i.e. before anything reads the header, and again from `loadWorld`) replays a
-  surviving journal: restore the region, truncate to the original length, restore the header,
-  delete the journal. It is idempotent, and a journal too short to be complete is discarded
-  because it proves the crash happened *before* the world file was touched.
-- **The honest cost**: a crash between journal and commit can leave an individual dirty column
-  half-old/half-new. The file still loads, the directory is still valid, and no other column is
-  affected — but this is a real downgrade from the copy path's all-or-nothing guarantee.
-  Journalling the dirty columns too would restore it, at the cost of re-reading and re-writing
-  every dirty column each save (up to ~42 MB at 256z), which is most of what removing the copy
-  bought. Deliberate trade.
+  surviving journal: restore the region, truncate to the original length, restore the header, then
+  write back each `EDNJCOL` pre-image. It is idempotent; a journal too short to be complete is
+  discarded because it proves the crash happened *before* the world file was touched, and the
+  record scan stops at the first torn record for the same reason (a half-written pre-image proves
+  its column had not been reached yet). Records are disjoint by construction — one per column per
+  save — so replay order does not matter.
+- **What it costs, measured.** Phase 2 is one extra read + write of exactly the columns the save
+  was already writing. On the real 279 MB 256z specimen: a steady-state autosave with nothing
+  edited is **unchanged** (127 KB read / 83 KB written — zero dirty columns means zero records),
+  and a save with one edited column goes **155 KB → 259 KB read and 214 KB → 345 KB written**
+  (+131,096 B = one 131,072 B column plus a 24-byte record header). The in-place path stays
+  O(dirty columns) and never returns to O(file size). `g_save_journal_columns`
+  (`Classes/Constants.h`, default on) turns phase 2 off, reproducing the pre-C3 behaviour; it
+  exists so the cost can be A/B'd and as a one-flag rollback.
+- **What it replaced.** Through 2026-09-01 the journal was phase 1 only, and this list ended with
+  an honest caveat: a crash between journal and commit could leave an individual dirty column
+  half-old/half-new — the file still loaded and the directory was still valid, but a chunk of
+  terrain was garbage and nothing could detect or repair it. The estimate that made that trade
+  look right ("up to ~42 MB per save at 256z") was the worst case — every column in the resident
+  window dirty at once — and the typical case is the two numbers above. The in-place save path is
+  fully atomic again.
 - Above the threshold the port also stops maintaining a **whole-file backup slot**
   (`<file>.savetmp.bak` / `<file>.bak`, `web/src/shim/foundation/NSFileHandle.mm`) and deletes any
   stale one it finds: nothing above the threshold would ever refresh it, so it is a permanent
   second copy of the world that the load-failure dialog would offer as if it were the previous
   save. Durability above the threshold is the journal.
-- If the journal cannot be written (or, below the threshold, if the scratch copy fails), the save
-  is **skipped** with a log line and the last complete save is left intact — rather than
-  finishing a save with neither protection, which is the one path that can leave a world
-  unloadable.
+- If **either phase** of the journal cannot be written (or, below the threshold, if the scratch
+  copy fails), the save is **skipped** with a log line and the last complete save is left intact —
+  rather than finishing a save with neither protection, which is the one path that can leave a
+  world unloadable.
 
 Regression cover: `web/tools/headless-save-inplace-test.js` (both paths, a real
-engine-written journal replayed against a deliberately half-written file, journal hygiene on
-world delete).
+engine-written journal replayed against a deliberately half-written file, a deliberately torn
+dirty column repaired from its `EDNJCOL` pre-image — with the lever off as the control showing the
+identical damage surviving — and journal hygiene on world delete).
 
 **Every one of those sizes is per-world runtime now** (2026-08-06): `SIZEOF_COLUMN` is 32,768 or
 131,072 and `MAX_CREATURES_SAVED` is whatever the file actually has room for. See
@@ -197,8 +218,12 @@ original. Shows "Converting World…" in the UI via `convertingWorld`.
   existing file.
 - `twoToOne` returns 0 for out-of-range chunk coords and 0 is treated as
   "corrupt/skip" — worlds cannot extend to negative or ≥ 32768 chunk coordinates.
-- Column writes are not atomic; a crash mid-save can corrupt a world (there is no
-  journaling; the community's corrupted-world lore is real).
+- ~~Column writes are not atomic; a crash mid-save can corrupt a world (there is no
+  journaling; the community's corrupted-world lore is real).~~ **No longer true as of this fork**
+  — stock 2.1.1 wrote the world file in place with no protection at all, which is where the
+  community's corrupted-world lore comes from. A save is now either a scratch copy committed by
+  one rename (below the threshold) or an in-place write behind a two-phase rollback journal
+  (above it, see "Two save strategies" above), and both are all-or-nothing.
 - **`FileManager::loadWorld()` bailing out early (a corrupt/truncated header) does
   NOT, by itself, stop `World::loadWorld()`'s caller from proceeding as if the load
   had succeeded.** `loadWorldThread`/`World::loadWorld` (`World.mm`) unconditionally

@@ -8,6 +8,13 @@
 // the header plus the file's tail from (directory_offset - creature block) stands in for the
 // copy. Recovery runs from FileManager::probeWorldHeight, i.e. before anything reads the header.
 //
+// WHAT C3 ADDED (2026-09-02, section 4b). B5's journal covered only the region an APPEND can
+// destroy, so a crash could still leave one dirty column half-old/half-new — the file loaded, the
+// directory was valid, but a chunk of terrain was garbage. The journal now also carries a
+// pre-image record per column the save overwrites at its existing offset. Section 4b proves that
+// both ways: with the records the torn column is repaired byte-for-byte, and with
+// eden_debug_set_save_journal_columns(0) (B5's exact behaviour) the identical damage survives.
+//
 // WHY IT LOOKS LIKE THIS. Picking the path by file size would make the in-place path untestable
 // without a several-hundred-megabyte fixture, so eden_debug_set_save_inplace_threshold() forces
 // it (0 = always in place). And a crash cannot be staged from a headless harness — a JS throw
@@ -106,6 +113,8 @@ let lastJournal = null;
 
 // Journal layout — FileManager.mm's SaveJournalHeader. Kept in sync by hand; the magic/version
 // asserts below fail loudly if it ever drifts.
+const JOURNAL_HEADER_BYTES = 40 + 192;   // magic/version/reserved/3 u64s, then WorldFileHeader
+const JOURNAL_COLUMN_BYTES = 24;         // SaveJournalColumn: magic[8] + offset u64 + length u64
 function parseJournal(buf) {
     if (!buf || buf.length < 40) return null;
     return {
@@ -117,6 +126,22 @@ function parseJournal(buf) {
         worldHeader: buf.slice(40, 40 + 192),
         totalLength: buf.length,
     };
+}
+// C3's phase-2 records, which follow the region: one per column the save overwrote in place,
+// holding that column's original bytes. Parsed with the same stop-at-the-first-bad-record rule
+// FileManager::recoverInterruptedSave uses, so a drift in either shows up as a count mismatch.
+function parseJournalColumns(buf, j) {
+    const recs = [];
+    let p = JOURNAL_HEADER_BYTES + j.regionLength;
+    while (p + JOURNAL_COLUMN_BYTES <= buf.length) {
+        if (buf.slice(p, p + 7).toString('ascii') !== 'EDNJCOL') break;
+        const offset = Number(buf.readBigUInt64LE(p + 8));
+        const length = Number(buf.readBigUInt64LE(p + 16));
+        if (length <= 0 || p + JOURNAL_COLUMN_BYTES + length > buf.length) break;
+        recs.push({ offset, length, payloadAt: p + JOURNAL_COLUMN_BYTES });
+        p += JOURNAL_COLUMN_BYTES + length;
+    }
+    return recs;
 }
 function directoryOffset(bytes) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -179,7 +204,7 @@ global.Module.postRun.push(async () => {
 
     const j = parseJournal(lastJournal);
     check('journal magic/version are what FileManager.mm writes',
-        j.magic === 'EDNJRNL' && j.version === 1, `${j.magic} v${j.version}`);
+        j.magic === 'EDNJRNL' && j.version === 2, `${j.magic} v${j.version}`);
     check('journal covers the file tail exactly (region_offset + region_length == orig_length)',
         j.regionOffset + j.regionLength === j.origLength, JSON.stringify(j).slice(0, 200));
     check('journal is O(directory), not O(file): its payload is a small fraction of the world',
@@ -248,6 +273,76 @@ global.Module.postRun.push(async () => {
         global.Module._eden_console_getblock(bx + FAR2, bz + FAR2, by) !== 13,
         global.Module._eden_console_getblock(bx + FAR2, bz + FAR2, by));
     check('back in MENU (4th)', await quitToMenu());
+
+    // ---- 4b. C3: a TORN DIRTY COLUMN is rolled back too --------------------------------------
+    // This is the gap B5 shipped with and C3 closes. Section 4 only proves the structural tail
+    // (creature block + directory + append) survives a crash; a column overwritten at its own
+    // existing offset used to be left half-old/half-new with nothing able to repair it. The
+    // journal now carries a pre-image record per such column, and the two legs below are the
+    // whole claim: with the records the damage is repaired byte-for-byte, and with them turned
+    // off (eden_debug_set_save_journal_columns(0), i.e. B5's exact behaviour) the identical
+    // damage survives recovery. Without the second leg the first proves nothing — the tail
+    // restore alone could be doing the work.
+    check('dirty-column journalling is ON by default',
+        global.Module._eden_debug_get_save_journal_columns() === 1);
+
+    check('the world plays again for the torn-column leg', await playWorldNamed(displayName));
+    await new Promise((r) => setTimeout(r, 1500));
+    // (bx,bz) is the spawn column — already in the directory since step 1's save — so editing it
+    // makes the next save OVERWRITE it in place rather than append it.
+    global.Module._eden_console_setblock(bx, bz, by + 1, 13);
+    const beforeTorn = read(memPath);
+    lastJournal = null;
+    check('back in MENU (5th)', await quitToMenu());
+    const jt = parseJournal(lastJournal);
+    const recs = parseJournalColumns(lastJournal, jt);
+    check('the save journalled at least one dirty column pre-image', recs.length > 0,
+        `${recs.length} records`);
+    if (!recs.length) { console.log(`${failures} FAILURE(S)`); process.exit(1); }
+    check('every column record sits strictly below the phase-1 region (no double coverage)',
+        recs.every((r) => r.offset + r.length <= jt.regionOffset),
+        JSON.stringify(recs.map((r) => [r.offset, r.length])).slice(0, 200));
+    check('each record holds the column\'s bytes as they were BEFORE the save',
+        recs.every((r) => lastJournal.slice(r.payloadAt, r.payloadAt + r.length)
+            .equals(beforeTorn.slice(r.offset, r.offset + r.length))));
+
+    // What a crash mid-column-write leaves: the last complete save, with one column half
+    // overwritten. Nothing structural is damaged — this file loads fine, it just has garbage
+    // terrain in it, which is exactly why B5's journal could not detect or repair it.
+    function stageTornColumn(base, rec) {
+        const torn = Buffer.from(base);
+        torn.fill(0xcd, rec.offset, rec.offset + Math.floor(rec.length / 2));
+        global.FS.writeFile(memPath, new Uint8Array(torn));
+        global.FS.writeFile(memPath + '.savejrnl', new Uint8Array(lastJournal));
+    }
+    stageTornColumn(beforeTorn, recs[0]);
+    check('the staged torn column really is damaged', !read(memPath).equals(beforeTorn));
+    JSON.parse(utf8(global.Module._eden_storage_list_worlds()));   // -> recoverInterruptedSave
+    check('an interrupted in-place save no longer tears a dirty column — it is rolled back byte for byte',
+        read(memPath).equals(beforeTorn));
+    check('recovery consumed the journal (torn-column leg)', !exists(memPath + '.savejrnl'));
+
+    // The control: same damage, same recovery, journal written B5-style with no column records.
+    global.Module._eden_debug_set_save_journal_columns(0);
+    check('dirty-column journalling can be turned off',
+        global.Module._eden_debug_get_save_journal_columns() === 0);
+    check('the world plays again for the control leg', await playWorldNamed(displayName));
+    await new Promise((r) => setTimeout(r, 1500));
+    global.Module._eden_console_setblock(bx, bz, by + 2, 13);
+    const beforeControl = read(memPath);
+    lastJournal = null;
+    check('back in MENU (6th)', await quitToMenu());
+    const jc = parseJournal(lastJournal);
+    const recsOff = parseJournalColumns(lastJournal, jc);
+    check('with the lever off the journal carries no column records (B5\'s exact behaviour)',
+        recsOff.length === 0, `${recsOff.length} records`);
+    stageTornColumn(beforeControl, recs[0]);
+    JSON.parse(utf8(global.Module._eden_storage_list_worlds()));
+    check('...and the identical damage SURVIVES recovery, which is the gap C3 closes',
+        !read(memPath).equals(beforeControl));
+    global.Module._eden_debug_set_save_journal_columns(1);
+    global.FS.writeFile(memPath, new Uint8Array(beforeControl));   // undo the control's damage
+    try { global.FS.unlink(memPath + '.savejrnl'); } catch (e) {}
 
     // ---- 5. a truncated journal must be discarded, not applied -------------------------------
     const untouched = read(memPath);

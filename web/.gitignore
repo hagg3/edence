@@ -11,6 +11,9 @@
 # ROADMAP Phase M / M0 — scratch trees with -sMAXIMUM_MEMORY=512MB, driven by tools/browser-memory-probe.js
 /build-relwdiag-cap512/
 /build-relthr-cap512/
+# ROADMAP Phase M / M6 — -DEDEN_ALLOC_TRACE=ON scratch tree (src/seam/AllocTrace_web.c interposes
+# malloc/free); driven by tools/headless-alloc-leak-probe.js
+/build-alloctrace/
 /dist/
 *.wasm
 *.wasm.map

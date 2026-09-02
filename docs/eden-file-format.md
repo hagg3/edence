@@ -295,9 +295,11 @@ block**, the adversarial case for the derived-size logic above. Regenerate them 
   `NSFileHandle` shim keeps for the load-failure dialog. None of these are `.eden` files and none
   are listed as worlds; all three are absent above the in-place-save threshold.
 - `<world>.savejrnl` — the rollback journal a large in-place save writes before it starts, and
-  deletes on commit. Its own small header (`EDNJRNL`) plus the world's previous 192-byte header
-  and the file's pre-save tail. If you find one on disk the last save was interrupted; the engine
-  replays it on next load. See [save-load.md](save-load.md).
+  deletes on commit. Its own small header (`EDNJRNL`, version 2) plus the world's previous 192-byte
+  header and the file's pre-save tail, then zero or more `EDNJCOL` records — a 24-byte
+  `{magic, offset, length}` followed by `length` bytes — holding the pre-save contents of each
+  column the save overwrites in place. If you find one on disk the last save was interrupted; the
+  engine replays it on next load. See [save-load.md](save-load.md).
 - `FileArchive.h` (compress-on-exit via zlib/`zpipe`) is **entirely commented out** —
   `compressLastPlayed()` is a no-op. Worlds on disk are uncompressed.
 

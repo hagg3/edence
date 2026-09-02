@@ -276,6 +276,26 @@ if(EDEN_DIAGNOSTICS)
   list(APPEND EDEN_SEAM_SOURCES src/shim/objc/objc_selftest.mm)
 endif()
 
+# ROADMAP Phase M / M6 — the per-world-load leak bisect instrument. Interposes malloc/free on top
+# of emmalloc's weak symbols and keeps a live-allocation histogram + a big-allocation table
+# (src/seam/AllocTrace_web.c). Separate option from EDEN_DIAGNOSTICS on purpose: it replaces the
+# allocator entry points, it is single-threaded-only, and it perturbs what it measures, so it must
+# never be on by accident. Build a scratch tree with -DEDEN_ALLOC_TRACE=ON to use it.
+option(EDEN_ALLOC_TRACE "Interpose malloc/free to bisect allocation leaks (Phase M / M6). Single-threaded scratch builds only — never ship." OFF)
+if(EDEN_ALLOC_TRACE)
+  if(EDEN_THREADED)
+    message(FATAL_ERROR "EDEN_ALLOC_TRACE uses non-atomic counters; it is single-threaded-only (see src/seam/AllocTrace_web.c).")
+  endif()
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    # It forwards to emmalloc_* by name, and -sMALLOC=emmalloc is a Release-only link flag below.
+    message(FATAL_ERROR "EDEN_ALLOC_TRACE needs -DCMAKE_BUILD_TYPE=Release (emmalloc is Release-only here).")
+  endif()
+  list(APPEND EDEN_SEAM_SOURCES src/seam/AllocTrace_web.c)
+endif()
+# --profiling-funcs keeps the wasm name section, without which AllocTrace's captured callstacks are
+# a list of `wasm-function[1234]` indices. Applied at the bottom of this file with the other link
+# options (see the EDEN_ALLOC_TRACE entry there).
+
 # ---- case-mismatched #import shims -----------------------------------------------------------
 # macOS's default filesystem is case-INsensitive, so Classes/*.mm quoting the wrong case for a
 # sibling header (e.g. Camera.h: `#import "Glu.h"` when the real file is `glu.h`) has always
@@ -486,6 +506,7 @@ target_compile_definitions(eden PRIVATE
   BUILD_OGLES
   EGL_NOT_PRESENT
   $<$<BOOL:${EDEN_DIAGNOSTICS}>:EDEN_DIAGNOSTICS=1>
+  $<$<BOOL:${EDEN_ALLOC_TRACE}>:EDEN_ALLOC_TRACE=1>
 )
 
 # Pass 4 found ~90 -Wc++11-narrowing errors in unmodified engine constant tables (e.g. values
@@ -638,27 +659,27 @@ if(EMSCRIPTEN)
     #   256z world loaded, 5 teleport bursts, save ...................  232 - 240 MB   <- the real
     #     ceiling for ONE world load; the 64z number every other probe reports is ~110 MB low
     #
-    # AND THE REASON THIS IS 768 MB AND NOT THE 512 MB THE PLAN PROPOSED: the same probe's
-    # fragmentation torture run found that peak linear memory is NOT bounded by the biggest world
-    # a session opens. Every world load leaks ~22 MB that is never reused, at BOTH heights, with
-    # no plateau — reloading the SAME 256z world 8 times walks sbrkTop 240 -> 426 MB in a dead
-    # straight line (~23 MB/load), and 64z leaks the same fixed ~22 MB once the freed 256z arena
-    # is used up. So "peak" is a function of how many worlds the player opens, not of world size,
-    # and a cap sized on a single load turns a long session into a HARD ABORT (-sMALLOC=emmalloc
-    # with the default ABORTING_MALLOC=true aborts cleanly with a message — but it is still a lost
-    # session). 768 MB buys ~24 world loads at 256z / ~29 at 64z above the ceiling, where 512 MB
-    # would have bought ~12. It still deletes the 2 GB reservation, which is the entire point of
-    # the row; the extra 256 MB is address space nobody commits.
+    # M1 shipped this at 768 MB rather than the planned 512 MB, because the same probe's torture
+    # run found peak linear memory was NOT bounded by the biggest world a session opens: every
+    # world load leaked ~22 MB that was never reused, at both heights, with no plateau (reloading
+    # the SAME 256z world 8 times walked sbrkTop 240 -> 426 MB in a straight line). Peak was a
+    # function of how many worlds the player opened, and a cap sized on one load would have turned
+    # a long session into a hard abort (-sMALLOC=emmalloc + the default ABORTING_MALLOC=true —
+    # a clean abort with a message, but still a lost session).
     #
-    # The leak itself is the real bug and it is NOT fixed here — it is filed as Phase M row M6.
-    # WHEN M6 LANDS, BRING THIS BACK DOWN TO 512 MB: with a bounded peak, 512 MB is 2.1x the
-    # measured 256z ceiling and the sizing method's 1.5x rule applies again as written.
+    # THAT LEAK IS FIXED (Phase M / M6, 2026-09-02) — four shim classes held C++ ivars that this
+    # port's hand-written ObjC runtime never destroyed; see src/shim/foundation/NSData.mm's
+    # -dealloc. The same torture run is now dead flat at 233.2 MB across 8 loads, so peak is
+    # bounded by world size again and this comes down to 512 MB as M1 said it would: 2.2x the
+    # measured 256z ceiling, i.e. the sizing method's 1.5x rule with room to spare.
+    # `node tools/headless-heap-ceiling-probe.js --cycles=4 --torture=same256` is the regression
+    # test; tools/headless-alloc-leak-probe.js is the finer-grained one.
     #
     # Failing safe: eden_heap_pressure_tick() (src/seam/HeapProbe_web.mm) warns once at 80% and
     # once at 90% of this number, so the first field report of a cap abort arrives as "Eden: wasm
-    # heap at 82% of its 768 MB cap" and not as an unexplained crash. Rollback is deleting this
+    # heap at 82% of its 512 MB cap" and not as an unexplained crash. Rollback is deleting this
     # one line.
-    -sMAXIMUM_MEMORY=805306368
+    -sMAXIMUM_MEMORY=536870912
     # P4: the wasm STACK is separate from INITIAL_MEMORY and defaults to only 64 KB. Terrain::render
     # declares `vertexObject objVertices[300*6*6]` (10800 * 64 B ≈ 690 KB) as a plain LOCAL, plus the
     # mesher's own large frames — the iOS build had a multi-MB thread stack, so these never mattered.
@@ -978,6 +999,10 @@ if(EMSCRIPTEN)
     $<$<CONFIG:Release>:-sGL_ASSERTIONS=0>
     $<$<CONFIG:Release>:-sTEXTDECODER=2>
     $<$<CONFIG:Release>:--emit-symbol-map>
+    # ROADMAP Phase M / M6: AllocTrace_web.c captures a JS callstack per big allocation, and
+    # without the wasm name section every frame reads `wasm-function[1234]`. --profiling-funcs
+    # keeps the names without pulling in DWARF.
+    $<$<BOOL:${EDEN_ALLOC_TRACE}>:--profiling-funcs>
   )
   # --pre-js files are consumed at LINK time and CMake cannot see that from the flag string, so
   # without this an edit to eden_default_world.pre.js rebuilds NOTHING ("Built target eden") and

@@ -43,6 +43,12 @@ const SHELL_URLS = [
   'public/eden-pausemenu.js',
   'public/eden-settings.js',
   'public/eden-storage.js',
+  // ROADMAP Phase C / C2: the OPFS persistence backend and its worker. Both precached for the
+  // same reason as the shell scripts above — on an offline load a missing eden-opfs.js would
+  // silently drop every visitor back to the IndexedDB whole-file save path, and a missing
+  // eden-opfs-worker.js would fail the same way one step later (the worker never starts).
+  'public/eden-opfs.js',
+  'public/eden-opfs-worker.js',
   'public/eden-loading.js',
   'public/eden-loaderror.js',
   // Audit row 28/C5: the five files eden-st.html's own inline script was split into — required for

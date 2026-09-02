@@ -112,9 +112,14 @@
      sequence, not just once the runtime is initialised — see eden-loading.js's header. -->
 <script src="eden-loading.js"></script>
 
+<!-- The OPFS persistence backend (ROADMAP Phase C / C2). Loaded BEFORE eden-storage.js, which
+     picks a backend at mount time and needs window.EdenOPFS to already exist to prefer it. Its
+     worker half (eden-opfs-worker.js) is loaded by this file at run time, not by a <script> tag. -->
+<script src="eden-opfs.js"></script>
+
 <!-- Local persistence + the Storage tab (pass 29). Loaded BEFORE the inline script so
      window.EdenStorage.mountAndSync exists in time to go into Module.preRun below — see
-     eden-storage.js's header for why the IndexedDB populate has to block main(). -->
+     eden-storage.js's header for why the populate has to block main(). -->
 <script src="eden-storage.js"></script>
 
 <!-- The settings panel (pass 28). Self-contained; talks only to the C settings model in

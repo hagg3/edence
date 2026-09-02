@@ -67,10 +67,11 @@ void eden_debug_heap_reset_peak(void) {
 // rather than corruption — but without this warning the first field report would be "it crashed",
 // with no way to tell a cap abort from any other abort.
 //
-// It is a live case, not a theoretical one: the M1 sizing run measured a ~22 MB-per-world-load
-// leak with no plateau (see the -sMAXIMUM_MEMORY comment in CMakeLists.txt, and Phase M row M6),
-// so a long enough session walks toward this cap by construction. Warning at 80% gives roughly
-// three more world loads of notice at 768 MB.
+// M1 shipped alongside a measured ~22 MB-per-world-load leak, which made a long session walk
+// toward the cap by construction. M6 fixed that leak (2026-09-02) and the cap came down to
+// 512 MB, so today the warning is a genuine tripwire rather than a countdown: peak linear memory
+// is bounded by world size again (233 MB for a 256z world), and anything that pushes a session
+// past 80% of 512 MB is a regression somebody needs to hear about.
 //
 // Called from eden_frame_tick() (src/entry/eden_main.cpp), throttled to once every 600 frames
 // (~10 s at 60 fps) because sbrk(0) is cheap but not free and this is a slow-moving number.
@@ -101,9 +102,49 @@ void eden_heap_pressure_tick(void) {
     } else if (pct >= 80.0 && !g_warned80) {
         g_warned80 = true;
         std::fprintf(stderr, "Eden: wasm heap at %.0f%% of its %llu MB cap (-sMAXIMUM_MEMORY). "
-                             "Memory grows ~22 MB per world load (Phase M row M6).\n",
+                             "That is well above the ~233 MB a 256z world should peak at — "
+                             "likely a memory regression.\n",
                      pct, (unsigned long long)(heapMax / (1024 * 1024)));
     }
+}
+
+// emmalloc's statistics API, declared WEAK rather than pulled in from <emscripten/emmalloc.h>:
+// -sMALLOC=emmalloc is a Release-only link flag here (see CMakeLists.txt), so in a Debug build
+// these symbols do not exist and a hard reference fails the link. Weak undefined symbols resolve
+// to 0 in wasm-ld, which is what eden_debug_alloc() below checks for.
+extern "C" {
+__attribute__((weak)) size_t emmalloc_dynamic_heap_size(void);
+__attribute__((weak)) size_t emmalloc_free_dynamic_memory(void);
+}
+
+// ROADMAP Phase M / M6: sbrkTop alone cannot tell a leak from fragmentation -- emmalloc never
+// returns memory to the system, so both look like a monotonically rising heap top. These two
+// emmalloc statistics separate them:
+//
+//   dynHeap   -- emmalloc_dynamic_heap_size(): bytes emmalloc has sbrk()ed for itself.
+//   freeDyn   -- emmalloc_free_dynamic_memory(): bytes inside that region sitting in free lists.
+//   live      -- dynHeap - freeDyn: bytes actually held by live allocations RIGHT NOW.
+//
+// If `live` at the menu is flat across load/quit cycles while sbrkTop climbs, the growth is
+// fragmentation; if `live` climbs with it, allocations are genuinely being leaked. (freeDyn walks
+// every free block, so this is slow -- a diagnostic call, never a per-frame one.)
+EMSCRIPTEN_KEEPALIVE
+const char* eden_debug_alloc(void) {
+    static char buf[192];
+    if (!emmalloc_dynamic_heap_size || !emmalloc_free_dynamic_memory) {
+        // Debug build (dlmalloc). Report -1s rather than zeros so a probe reading this cannot
+        // mistake "not measurable in this build" for "nothing is allocated".
+        std::snprintf(buf, sizeof(buf), "{\"dynHeap\":-1,\"freeDyn\":-1,\"live\":-1}");
+        return buf;
+    }
+    size_t dyn  = emmalloc_dynamic_heap_size();
+    size_t freeDyn = emmalloc_free_dynamic_memory();
+    std::snprintf(buf, sizeof(buf),
+        "{\"dynHeap\":%llu,\"freeDyn\":%llu,\"live\":%llu}",
+        (unsigned long long)dyn,
+        (unsigned long long)freeDyn,
+        (unsigned long long)(dyn > freeDyn ? dyn - freeDyn : 0));
+    return buf;
 }
 
 } // extern "C"

@@ -413,7 +413,7 @@ regression, not a design question.
   progress screen, not a bare status line.)
 
 ## `public/*.js` dependency graph (audit row I2)
-Twelve files, ~2.5 kLOC, loaded as plain `<script>` tags (no bundler, no `MODULARIZE`) sharing
+Thirteen files, ~2.9 kLOC, loaded as plain `<script>` tags (no bundler, no `MODULARIZE`) sharing
 `window` globals — deliberate, not an oversight: the non-`MODULARIZE` `eden.js` output and the
 `vm.runInThisContext`-based headless harnesses (`tools/headless-*.js`) both depend on everything
 living in global scope, so a module system would need its own headless-compatible shim before it
@@ -421,10 +421,15 @@ earned its keep. Load order in `eden-st.html` is therefore significant and is th
 order — a file may only assume an earlier `<script>`'s global already exists:
 
 ```
-eden-icons.js  →  eden-ui.js  →  eden-assets.js  →  eden-loading.js  →  eden-storage.js
-   →  eden-settings.js  →  eden-pausemenu.js  →  eden-loaderror.js  →  eden-menu.js
+eden-icons.js  →  eden-ui.js  →  eden-assets.js  →  eden-loading.js  →  eden-opfs.js
+   →  eden-storage.js  →  eden-settings.js  →  eden-pausemenu.js  →  eden-loaderror.js  →  eden-menu.js
    →  eden-gamepad.js  →  eden-console.js
 ```
+
+(`eden-opfs-worker.js` is a fourteenth file but deliberately not in that list: it is loaded by
+`eden-opfs.js` as a **dedicated Worker**, not a `<script>`, because `FileSystemSyncAccessHandle`
+exists only in a worker realm. It shares no globals with the page and talks to it over one
+request/response `postMessage` protocol.)
 
 Each file publishes exactly one `window.Eden*` namespace object (assigned once, at the bottom of an
 IIFE) and reads only the namespaces of files that loaded before it, plus the wasm boundary
@@ -440,7 +445,8 @@ library). `eden-gamepad.js` is the one leaf with no `Eden*` dependency at all �
 | `eden-ui.js` | `EdenUI` | `EdenAssets`, `EdenIcons` | — |
 | `eden-assets.js` | `EdenAssets` | — | `Module.FS` |
 | `eden-loading.js` | `EdenLoading` | `EdenUI` | `Module.dataFileDownloads` |
-| `eden-storage.js` | `EdenStorage` | `EdenLoadError` (only inside a callback fired well after boot — see below) | `Module.preRun`, `FS.mount`/`mkdir`/`readFile`/`writeFile`/`syncfs`, `Module._eden_storage_list_worlds` |
+| `eden-opfs.js` | `EdenOPFS` | — | `FS.mount`/`getPath`/`lookupPath`, `MEMFS.mount`, `new Worker('eden-opfs-worker.js')` |
+| `eden-storage.js` | `EdenStorage` | `EdenOPFS`, `EdenLoadError` (only inside a callback fired well after boot — see below) | `Module.preRun`, `FS.mount`/`mkdir`/`readFile`/`writeFile`/`syncfs`, `Module._eden_storage_list_worlds` |
 | `eden-settings.js` | `EdenSettings` | `EdenUI`, `EdenStorage`, `EdenConsole` (feature-detect only), `EdenKeybinds` | `Module._eden_settings_schema` |
 | `eden-pausemenu.js` | `EdenPauseMenu` | `EdenUI`, `EdenSettings`, `EdenAssets` | — |
 | `eden-loaderror.js` | `EdenLoadError` | `EdenUI`, `EdenPauseMenu.tick` (to suspend it while the dialog is up) | `FS.syncfs` |

@@ -233,8 +233,17 @@ global.Module.postRun.push(async () => {
     console.log(`\n[M1 sizing] 256z peak linear memory: ${MB(ceiling256)} MB` +
         `  ·  whole-session peak (incl. fragmentation torture): ${MB(final.peakSbrkTop)} MB` +
         `  ·  final heapSize (peak + growth overshoot): ${MB(final.heapSize)} MB`);
-    console.log(`[M1 sizing] headroom left under the ${MB(cap)} MB cap: ${MB(cap - final.peakSbrkTop)} MB` +
-        `  =  ~${Math.floor((cap - final.peakSbrkTop) / (22 * 1024 * 1024))} more world loads at the measured ~22 MB/load leak (Phase M / M6)`);
+    console.log(`[M1 sizing] headroom left under the ${MB(cap)} MB cap: ${MB(cap - final.peakSbrkTop)} MB`);
+    // M6 (2026-09-02) fixed the ~22 MB-per-world-load leak this probe found, so a torture run
+    // should now be FLAT: peak is bounded by the biggest world the session opens, not by how many
+    // it opened. A rising sbrkTop across the torture phases is the regression to look for.
+    const tortureStart = phases.find((p) => p.phase.startsWith('torture c1: quit'));
+    const tortureEnd = phases[phases.length - 1];
+    if (tortureStart) {
+        const drift = +(tortureEnd.sbrkTop_MB - tortureStart.sbrkTop_MB).toFixed(1);
+        console.log(`[M6] sbrkTop drift across the ${TORTURE_CYCLES}-cycle torture run: ${drift} MB` +
+            `  (${drift <= 2 ? 'FLAT — no per-load leak' : 'RISING — the per-load leak is back'})`);
+    }
     console.log(`[M1 sizing] 1.5x the session peak = ${MB(final.peakSbrkTop * 1.5)} MB` +
         `  ·  rounded up to a 16 MB growth step = ${MB(Math.ceil(final.peakSbrkTop * 1.5 / (16 * 1024 * 1024)) * 16 * 1024 * 1024)} MB`);
     process.exit(0);

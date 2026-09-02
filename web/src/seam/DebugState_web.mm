@@ -375,4 +375,18 @@ extern "C" double eden_debug_get_save_inplace_threshold(void) {
     return (double)g_save_inplace_threshold;
 }
 
+// C3: turn the rollback journal's phase 2 (the dirty-column pre-images that make an in-place save
+// fully atomic) off. Two callers: tools/headless-opfs-mirror-test.js A/Bs the per-save byte cost
+// with it on and off, and tools/headless-save-inplace-test.js needs B5's old behaviour to prove
+// the new records are what closes the tearing gap rather than something else having changed.
+EMSCRIPTEN_KEEPALIVE
+extern "C" void eden_debug_set_save_journal_columns(int on) {
+    eden_set_save_journal_columns(on);
+}
+
+EMSCRIPTEN_KEEPALIVE
+extern "C" int eden_debug_get_save_journal_columns(void) {
+    return g_save_journal_columns;
+}
+
 } // extern "C"

@@ -82,6 +82,17 @@ void eden_set_creature_slots(int slots);
 #define EDEN_SAVE_INPLACE_THRESHOLD_DEFAULT (16ull*1024*1024)
 extern unsigned long long g_save_inplace_threshold;
 void eden_set_save_inplace_threshold(unsigned long long bytes);
+
+// ---- save strategy: does the rollback journal cover the dirty columns too? (C3) ----
+// B5 shipped with a known hole: above the threshold the journal covered only the region an
+// APPEND can destroy (the creature block, the directory, everything past them), so a crash
+// between journal and commit could leave one dirty column half-old/half-new. C3 (2026-09-02)
+// closes it -- saveWorld now also journals the ORIGINAL bytes of every column it is about to
+// overwrite at its existing offset, which costs one extra read + write of exactly the columns
+// the save was writing anyway. Default TRUE; a probe sets it FALSE to A/B that cost, and it is
+// the one-flag rollback if a world ever turns out to dirty enough columns for it to hurt.
+extern int g_save_journal_columns;
+void eden_set_save_journal_columns(int on);
 #ifdef __cplusplus
 }
 #endif

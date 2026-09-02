@@ -65,6 +65,12 @@ void eden_set_save_inplace_threshold(unsigned long long bytes){
     g_save_inplace_threshold=bytes;
     printf("save: whole-file-copy threshold set to %llu B\n",g_save_inplace_threshold);
 }
+// C3: see Constants.h. TRUE is the atomic setting; FALSE reproduces B5's tear-one-column trade.
+int g_save_journal_columns=1;
+void eden_set_save_journal_columns(int on){
+    g_save_journal_columns=on?1:0;
+    printf("save: dirty-column journalling %s\n",g_save_journal_columns?"ON":"OFF");
+}
 
 extern "C" const int blockinfo[NUM_BLOCKS+1]={
 	[TYPE_NONE]=IS_NOTSOLID,

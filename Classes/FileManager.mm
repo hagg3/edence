@@ -432,14 +432,40 @@ void FileManager::writeGenToDisk(){
 // file's tail from that point is enough to put the file back exactly as the last successful save
 // left it -- and it is O(number of columns), not O(file size): ~410 KB for a 3.97 GB specimen.
 //
-// The residual, and it is a real downgrade from the copy path: a crash between the journal and
-// the commit CAN leave an individual dirty column half-old/half-new. Those bytes are terrain the
-// player was editing in that instant; the file still loads, the directory is still valid, and no
-// other column is touched. Journalling the dirty columns too would restore full atomicity at the
-// cost of re-reading and re-writing every dirty column each save (up to ~42 MB at 256z), which is
-// most of the cost this row exists to remove. Documented trade, not an oversight -- docs/save-load.md.
-#define SAVE_JOURNAL_VERSION 1
+// C3 (2026-09-02) closed the residual this comment used to end with. It read: "a crash between the
+// journal and the commit CAN leave an individual dirty column half-old/half-new... journalling the
+// dirty columns too would restore full atomicity at the cost of re-reading and re-writing every
+// dirty column each save (up to ~42 MB at 256z), which is most of the cost this row exists to
+// remove." Two things made that trade worth reversing:
+//
+//  * The ~42 MB was the WORST case (every column in the resident window dirty at 256z), and the
+//    typical case is nothing like it -- a save only writes columns whose chunks are `modified`,
+//    and a column the directory does not yet have is APPENDED, i.e. already covered by the region
+//    below and needing no pre-image at all. A steady-state autosave journals zero columns.
+//  * Under IDBFS the cost was unmeasurable anyway, because the persistence layer re-wrote the
+//    whole world file to IndexedDB on every save regardless (ROADMAP C1). Since C2 put an OPFS
+//    backend underneath that mirrors only the byte ranges actually written, the extra journal
+//    write is a real, visible number for the first time -- and it is one extra copy of exactly the
+//    bytes the save was already writing, i.e. the in-place path stays O(dirty columns) and never
+//    goes back to O(file size).
+//
+// So the journal now has TWO phases and the in-place path is fully atomic again:
+//   phase 1  the world header + the file's tail from (directory_offset - creature block) to EOF,
+//            written before saveWorld touches anything -- the region an APPEND destroys.
+//   phase 2  one record per column this save will overwrite AT ITS EXISTING OFFSET, holding that
+//            column's original bytes. Written after readDirectory(), because "does this column
+//            already have a directory row" is what separates an overwrite from an append, and
+//            still before the first destructive byte (readDirectory only reads).
+// Both are O(number of columns), never O(file size). `g_save_journal_columns` (Constants.h) turns
+// phase 2 off, which reproduces B5's behaviour exactly -- it exists to A/B the cost.
+#define SAVE_JOURNAL_VERSION 2
 static const char kSaveJournalMagic[8]="EDNJRNL";
+// A phase-2 record, repeated to the end of the journal: this header, then `length` original bytes.
+static const char kSaveJournalColumnMagic[8]="EDNJCOL";
+// The largest a column record can be at any world height, for bounds-checking a journal read back
+// before the world's height is known (recoverInterruptedSave runs from probeWorldHeight).
+#define SAVE_JOURNAL_MAX_COLUMN \
+	((unsigned long long)CHUNK_SIZE*CHUNK_SIZE*CHUNK_SIZE*2*CHUNKS_PER_COLUMN_MAX)
 typedef struct{
 	char magic[8];
 	unsigned int version;
@@ -449,6 +475,22 @@ typedef struct{
 	unsigned long long region_length;
 	unsigned char world_header[sizeof(WorldFileHeader)];
 }SaveJournalHeader;
+typedef struct{
+	char magic[8];
+	unsigned long long offset;
+	unsigned long long length;
+}SaveJournalColumn;
+
+// The journal handle stays open across the whole in-place save so phase 2 can append to it; see
+// beginSaveJournal()/journalDirtyColumns()/endSaveJournal().
+static NSFileHandle* saveJournalFile=NULL;
+static unsigned long long saveJournalRegionOffset=0;
+static unsigned long long saveJournalColumnBytes=0;
+// How many bytes the journal SHOULD contain so far. -writeData: cannot report a short write (the
+// shim's fwrite return is unchecked, and was equally unchecked behind the createFileAtPath: this
+// replaced), so each phase compares this against the file's real length before letting the save
+// proceed. A journal that did not fit is the exact failure the whole mechanism exists for.
+static unsigned long long saveJournalExpected=0;
 
 static NSString* journalPathFor(NSString* file_name){
 	return [file_name stringByAppendingString:@".savejrnl"];
@@ -460,15 +502,24 @@ static unsigned long long fileByteLength(NSString* path){
 	[fh closeFile];
 	return len;
 }
-// Writes the journal in ONE createFileAtPath: so it is never observed half-built through a handle,
-// and so it never trips the shim's own backup-before-overwrite. Must complete before saveWorld
-// touches the world file. Answers FALSE if anything went wrong, in which case the caller falls
-// back to the copy path rather than writing unprotected.
-static BOOL writeSaveJournal(NSString* file_name,unsigned long long orig_length,
+// Phase 1. Must complete before saveWorld touches the world file. Answers FALSE if anything went
+// wrong, in which case the caller skips the save rather than writing unprotected. The handle is
+// left OPEN, positioned at EOF, for journalDirtyColumns() to append phase 2 to.
+//
+// This used to be one createFileAtPath: "so the journal is never observed half-built through a
+// handle, and so it never trips the shim's own backup-before-overwrite". The first property is
+// gone by construction now -- phase 2 is not knowable this early -- but it was never the thing
+// keeping recovery honest: recoverInterruptedSave() discards whatever it cannot read to the end,
+// because a torn record proves the crash happened before the bytes that record protects were
+// written. The second property still holds, and is why the handle is opened on a path that was
+// just removed: the shim only backs up a file that already has bytes in it.
+static BOOL beginSaveJournal(NSString* file_name,unsigned long long orig_length,
 							 unsigned long long dir_offset){
 	NSFileManager* fm=[NSFileManager defaultManager];
 	NSString* jrnl=journalPathFor(file_name);
 	[fm removeItemAtPath:jrnl error:NULL];
+	saveJournalRegionOffset=0;
+	saveJournalColumnBytes=0;
 	unsigned long long creatures=(unsigned long long)sizeof(EntityData)*MAX_CREATURES_SAVED;
 	unsigned long long region_off=(dir_offset>creatures)?(dir_offset-creatures):0;
 	if(region_off>orig_length)return FALSE;   // header disagrees with the file; don't guess
@@ -491,10 +542,92 @@ static BOOL writeSaveJournal(NSString* file_name,unsigned long long orig_length,
 	NSMutableData* out=[NSMutableData dataWithCapacity:(NSUInteger)(sizeof(jh)+region_len)];
 	[out appendBytes:&jh length:sizeof(jh)];
 	[out appendData:region];
-	if(![fm createFileAtPath:jrnl contents:out attributes:nil])return FALSE;
+	NSFileHandle* jf=[NSFileHandle fileHandleForUpdatingAtPath:jrnl];
+	if(jf==NULL)return FALSE;
+	[jf writeData:out];
+	saveJournalExpected=(unsigned long long)sizeof(jh)+region_len;
+	if([jf seekToEndOfFile]!=saveJournalExpected){[jf closeFile];return FALSE;}
+	saveJournalFile=[jf retain];
+	saveJournalRegionOffset=region_off;
 	printg("save: journalled %llu B of tail (offset %llu) before writing %s in place\n",
 		   region_len,region_off,[file_name UTF8String]);
 	return TRUE;
+}
+// Phase 2 (C3). Appends the ORIGINAL bytes of every column this save is about to overwrite at its
+// existing offset. Runs after readDirectory() and before the first destructive write.
+//
+// Three things it must get right:
+//  * It must NOT clear `modified`. saveColumn() owns that flag, and if this fails the save is
+//    skipped, so the flags have to survive for the next one.
+//  * A column with no directory row is APPENDED, at or above saveJournalRegionOffset, so phase 1
+//    already holds its pre-image; skipping it here is what keeps a first save of a big new area
+//    from journalling twice.
+//  * Each (cx,cz) is visited once, so no offset is ever journalled twice and replay order does
+//    not matter.
+// A short column record (deriveColumnSpans' case) is journalled at the full stride the save will
+// write, clamped to the phase-1 region -- the pre-image has to cover the bytes that get destroyed,
+// not the bytes the directory claims are the column's.
+static BOOL journalDirtyColumns(NSFileHandle* world){
+	if(saveJournalFile==NULL)return FALSE;
+	if(!g_save_journal_columns)return TRUE;
+	Terrain* ter=World::getWorld->terrain;
+	int columns=0;
+	for(int x=0;x<CHUNKS_PER_SIDE;x++){
+		for(int z=0;z<CHUNKS_PER_SIDE;z++){
+			TerrainChunk* col=ter->chunkTable[threeToOne(x,0,z)];
+			if(col==NULL||col->pbounds[1]!=0)continue;   // same guard the save loop uses
+			int cx=col->pbounds[0]/CHUNK_SIZE;
+			int cz=col->pbounds[2]/CHUNK_SIZE;
+			BOOL dirty=FALSE;
+			for(int cy=0;cy<CHUNKS_PER_COLUMN;cy++){
+				TerrainChunk* chunk=ter->chunkTable[threeToOne(cx,cy,cz)];
+				if(chunk&&chunk->modified){dirty=TRUE;break;}
+			}
+			if(!dirty)continue;
+			int n=twoToOneTest(cx,cz);
+			if(n==0)continue;                            // saveColumn drops these too
+			ColumnIndex* colIndex=NULL;
+			hashmap_get(indexes,n,(any_t*)&colIndex);
+			if(colIndex==NULL)continue;                  // new column -> appended, phase 1 covers it
+			unsigned long long off=colIndex->chunk_offset;
+			if(off>=saveJournalRegionOffset)continue;    // already inside phase 1
+			unsigned long long len=SIZEOF_COLUMN;
+			if(off+len>saveJournalRegionOffset)len=saveJournalRegionOffset-off;
+			[world seekToFileOffset:off];
+			NSData* pre=[world readDataOfLength:(NSUInteger)len];
+			if(pre==NULL||[pre length]<len)return FALSE;
+			SaveJournalColumn rec;
+			memset(&rec,0,sizeof(rec));
+			memcpy(rec.magic,kSaveJournalColumnMagic,sizeof(rec.magic));
+			rec.offset=off;
+			rec.length=len;
+			// Two writes rather than one concatenated buffer, so a 128 KB column is never held
+			// twice at once -- this runs on the same heap Phase M is trying to keep under a cap.
+			[saveJournalFile writeData:[NSData dataWithBytesNoCopy:&rec length:sizeof(rec)
+													 freeWhenDone:FALSE]];
+			[saveJournalFile writeData:pre];
+			saveJournalExpected+=sizeof(rec)+len;
+			saveJournalColumnBytes+=len;
+			columns++;
+		}
+	}
+	if([saveJournalFile seekToEndOfFile]!=saveJournalExpected)return FALSE;
+	if(columns)printg("save: journalled %d dirty column(s), %llu B, before overwriting them\n",
+					  columns,saveJournalColumnBytes);
+	return TRUE;
+}
+// Closes the journal handle, and on `remove_it` deletes the journal -- which is the commit: the
+// point after which recoverInterruptedSave() will no longer roll this save back.
+static void endSaveJournal(NSString* file_name,BOOL remove_it){
+	if(saveJournalFile){
+		[saveJournalFile closeFile];
+		[saveJournalFile release];
+		saveJournalFile=NULL;
+	}
+	if(remove_it)[[NSFileManager defaultManager] removeItemAtPath:journalPathFor(file_name)
+														   error:NULL];
+	saveJournalRegionOffset=0;
+	saveJournalExpected=0;
 }
 // Roll a world file back to the last successful save if one was interrupted. Idempotent: the
 // journal is only removed once the restore has fully landed, so a crash DURING recovery just
@@ -512,29 +645,54 @@ void FileManager::recoverInterruptedSave(NSString* file_name){
 	BOOL ok=([jhd length]==sizeof(SaveJournalHeader));
 	if(ok){
 		memcpy(&jh,[jhd bytes],sizeof(jh));
+		// v1 journals (B5, phase 1 only) are still replayable and mean exactly what they meant
+		// then; v2 adds the phase-2 column records after the region.
 		ok=(memcmp(jh.magic,kSaveJournalMagic,sizeof(jh.magic))==0
-			&&jh.version==SAVE_JOURNAL_VERSION
+			&&jh.version>=1&&jh.version<=SAVE_JOURNAL_VERSION
 			&&jh.region_offset+jh.region_length==jh.orig_length);
 	}
 	NSData* region=ok?[jf readDataOfLength:(NSUInteger)jh.region_length]:NULL;
 	if(ok&&[region length]!=jh.region_length)ok=FALSE;
-	[jf closeFile];
 	if(!ok){
+		[jf closeFile];
 		printg("save: discarding an incomplete journal for %s (world file untouched)\n",[file_name UTF8String]);
 		[fm removeItemAtPath:jrnl error:NULL];
 		return;
 	}
 	NSFileHandle* wf=[NSFileHandle fileHandleForUpdatingAtPath:file_name];
-	if(wf==NULL){[fm removeItemAtPath:jrnl error:NULL];return;}
+	if(wf==NULL){[jf closeFile];[fm removeItemAtPath:jrnl error:NULL];return;}
 	[wf seekToFileOffset:jh.region_offset];
 	[wf writeData:region];
 	[wf truncateFileAtOffset:jh.orig_length];
 	[wf seekToFileOffset:0];
 	[wf writeData:[NSData dataWithBytes:jh.world_header length:sizeof(WorldFileHeader)]];
+	// C3: then put back every column the interrupted save had started overwriting in place. The
+	// scan stops at the first record that is short, mis-magicked or out of range -- a torn record
+	// proves the crash happened WHILE that pre-image was being written, i.e. before its column had
+	// been touched, so there is nothing to undo past that point. Records are disjoint by
+	// construction (one per column per save), so replay order is irrelevant.
+	int restored=0;
+	if(jh.version>=2){
+		while(TRUE){
+			NSData* rd=[jf readDataOfLength:sizeof(SaveJournalColumn)];
+			if(rd==NULL||[rd length]<sizeof(SaveJournalColumn))break;
+			SaveJournalColumn rec;
+			memcpy(&rec,[rd bytes],sizeof(rec));
+			if(memcmp(rec.magic,kSaveJournalColumnMagic,sizeof(rec.magic))!=0)break;
+			if(rec.length==0||rec.length>SAVE_JOURNAL_MAX_COLUMN)break;
+			if(rec.offset+rec.length>jh.orig_length)break;
+			NSData* pre=[jf readDataOfLength:(NSUInteger)rec.length];
+			if(pre==NULL||[pre length]<rec.length)break;
+			[wf seekToFileOffset:rec.offset];
+			[wf writeData:pre];
+			restored++;
+		}
+	}
 	[wf closeFile];
+	[jf closeFile];
 	[fm removeItemAtPath:jrnl error:NULL];
-	printg("save: rolled %s back to its last complete save (%llu B) after an interrupted one\n",
-		   [file_name UTF8String],jh.orig_length);
+	printg("save: rolled %s back to its last complete save (%llu B, %d column(s) restored) after an interrupted one\n",
+		   [file_name UTF8String],jh.orig_length,restored);
 }
 void FileManager::saveWorld(Vector warp){
     //[TestFlight passCheckpoint:[NSString stringWithFormat:@"header_size:%d",(int)sizeof(WorldFileHeader)]];
@@ -595,7 +753,7 @@ void FileManager::saveWorld(Vector warp){
 	BOOL inPlace=FALSE;
 	unsigned long long existing=existed?fileByteLength(file_name):0;
 	if(existed&&existing>=g_save_inplace_threshold){
-		if(!writeSaveJournal(file_name,existing,sfh->directory_offset)){
+		if(!beginSaveJournal(file_name,existing,sfh->directory_offset)){
 			// Bail rather than fall through to the copy path: a file this big is exactly the one
 			// whose whole-file copy cannot be relied on to succeed, and finishing the save with
 			// neither a scratch copy nor a journal is the one outcome that can leave the world
@@ -603,6 +761,7 @@ void FileManager::saveWorld(Vector warp){
 			// `modified` flag, and the next save retries. (Chunks are re-marked by endDynamics
 			// only; nothing above this point has cleared them.)
 			NSLog(@"saveWorld: could not journal %@ -- SKIPPING this save, last one left intact",file_name);
+			endSaveJournal(file_name,TRUE);
 			free(sfh);
 			return;
 		}
@@ -674,6 +833,20 @@ void FileManager::saveWorld(Vector warp){
 	count=0;
 	this->readDirectory();
 	NSLog(@"read %d colidx's",count);
+
+	// C3: phase 2 of the rollback journal, here because this is the first point at which the
+	// directory is known -- and still before the first destructive byte (readDirectory only reads,
+	// and the column loop below is what starts writing). Same bail rule as phase 1: an in-place
+	// save with an incomplete journal is the one outcome the journal exists to prevent, so skip it
+	// and leave the last complete save alone. Every chunk keeps its `modified` flag (nothing has
+	// cleared them yet -- journalDirtyColumns deliberately does not) and the next save retries.
+	if(inPlace&&!journalDirtyColumns(saveFile)){
+		NSLog(@"saveWorld: could not journal the dirty columns of %@ -- SKIPPING this save, last one left intact",file_name);
+		endSaveJournal(file_name,TRUE);
+		[saveFile closeFile];
+		free(sfh);
+		return;
+	}
  //   Player* player=World::getWorld->player;
   //  int scox=player.pos.x/CHUNK_SIZE-T_RADIUS;
    // int scoz=player.pos.z/CHUNK_SIZE-T_RADIUS;
@@ -747,7 +920,7 @@ void FileManager::saveWorld(Vector warp){
 	if(inPlace){
 		// Commit. Everything is written, flushed and closed; removing the journal is the point
 		// after which recoverInterruptedSave() will no longer roll this save back.
-		[fm removeItemAtPath:journalPathFor(file_name) error:NULL];
+		endSaveJournal(file_name,TRUE);
 	}else{
 	// The atomic swap: temp_name is now a fully-written, closed, valid save. Replace file_name with
 	// it in one rename() — the point at which a crash can no longer produce a half-written world.
