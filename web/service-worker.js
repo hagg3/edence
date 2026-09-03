@@ -99,12 +99,36 @@ self.addEventListener('activate', (event) => {
 //
 // TWO DELIBERATE NARROWINGS vs. upstream coi-serviceworker, both load-bearing:
 //
-//  1. **Navigations only.** COOP and COEP are DOCUMENT-level policies; a subresource does not
-//     need them (a same-origin subresource needs nothing at all under require-corp, and a
-//     cross-origin one needs CORP or a passing CORS check, neither of which a header on our own
-//     response could provide). Upstream rewrites every response because it cannot tell what it is
-//     proxying; we can, so we do not touch a single subresource — which keeps the byte-serving,
-//     ETag and cache paths above exactly as they were.
+//  1. **Navigations, plus WORKER SCRIPTS.** COOP and COEP are DOCUMENT-level policies; an ordinary
+//     subresource does not need them (a same-origin subresource needs nothing at all under
+//     require-corp, and a cross-origin one needs CORP or a passing CORS check, neither of which a
+//     header on our own response could provide). Upstream rewrites every response because it
+//     cannot tell what it is proxying; we can, so we do not touch an ordinary subresource — which
+//     keeps the byte-serving, ETag and cache paths above exactly as they were.
+//
+//     **A dedicated worker's own script is the exception, and missing it broke the deployed
+//     threaded build for six days (ROADMAP V7, root-caused 2026-09-03).** HTML's "check a global
+//     object's embedder policy" step says: if the OWNER is cross-origin isolated and the worker
+//     script's response is not itself `COEP: require-corp`, the worker fails to load. Chromium
+//     enforces it; WebKit did not, which is exactly why every local `tools/serve.js` run (real
+//     headers on EVERY response) and every Safari pass looked fine while deployed Chrome did not.
+//     The failure is silent by construction — a blocked worker fires a bare `error` event with an
+//     empty message and logs nothing — and it took out BOTH workers this port has:
+//       * `build-thr/eden.js` loaded as the pthread pool's worker script (`new Worker(_scriptName)`)
+//         → the `loading-workers` run dependency never resolves → `Module.calledRun` never flips →
+//         menu never appears, no error, and only M5.1's 45 s failsafe rescues the visitor;
+//       * `public/eden-opfs-worker.js` → `[eden-storage] OPFS unavailable (eden-opfs worker
+//         failed: unknown)` → silent downgrade to the IndexedDB whole-file save path.
+//     Both were reported as separate bugs. They are one bug, and this is it.
+//
+//     Applied to a worker script UNCONDITIONALLY rather than only when some client wants
+//     isolation: a `fetch` event for a worker's main script does not reliably identify the
+//     document that created it (`clientId` is the creator's only on some engines, and the SW
+//     instance may have been spun up for this very request), and the header is inert where it is
+//     not needed — an owner that is not isolated never runs the compatibility check, and neither
+//     of this port's two workers loads a cross-origin no-cors subresource that a require-corp
+//     policy of its own could block. `?coi=off` therefore stays honest too: it prevents any
+//     ISOLATED DOCUMENT from existing, so the header on the worker script is unobservable.
 //
 //  2. **Only when the page asked for the threaded build.** Isolation is not free: under COEP
 //     require-corp the document may no longer embed a cross-origin subresource that neither sends
@@ -131,13 +155,15 @@ function wantsIsolation(url) {
   return url.searchParams.get('build') === 'thr';
 }
 
-function withIsolationHeaders(res) {
+// `kind` is 'document' (COOP + COEP, the navigation case) or 'worker' (COEP only — COOP is a
+// browsing-context policy and means nothing on a worker script).
+function withIsolationHeaders(res, kind) {
   // `new Response(res.body, …)` cannot reconstruct these: an opaque/opaqueredirect response has an
   // unreadable body (status 0), and rewriting a redirect would swallow it. Pass them through — a
   // page that failed to load is not one that needs isolating.
   if (!res || res.status === 0 || res.type === 'opaqueredirect' || !res.ok) return res;
   const headers = new Headers(res.headers);
-  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  if (kind !== 'worker') headers.set('Cross-Origin-Opener-Policy', 'same-origin');
   headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
@@ -163,7 +189,11 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;      // don't cache cross-origin requests
   if (/\/Eden\.eden$/.test(url.pathname)) return;        // never cache the default-world file itself
 
-  const isolate = req.mode === 'navigate' && wantsIsolation(url);
+  // 'document' | 'worker' | null — see narrowing 1 above. `req.destination` is 'worker' for
+  // `new Worker(url)` (the pthread pool's copy of eden.js, and eden-opfs-worker.js).
+  const isolate = (req.mode === 'navigate' && wantsIsolation(url)) ? 'document'
+    : (req.destination === 'worker' || req.destination === 'sharedworker') ? 'worker'
+    : null;
 
   event.respondWith(
     fetch(req).then((res) => {
@@ -178,6 +208,6 @@ self.addEventListener('fetch', (event) => {
     }).catch(() => caches.match(req).then((cached) => {
       if (cached) return cached;
       throw new Error('eden-sw: offline and not cached: ' + url.pathname);
-    })).then((res) => (isolate ? withIsolationHeaders(res) : res))
+    })).then((res) => (isolate ? withIsolationHeaders(res, isolate) : res))
   );
 });

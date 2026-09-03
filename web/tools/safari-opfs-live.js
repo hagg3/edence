@@ -127,6 +127,7 @@ async function main() {
       const idx = M._eden_menu_create_world();
       const name = utf8(M._eden_menu_world_name(idx));
       M._eden_menu_clear_pending_world_type();
+      M._eden_menu_set_pending_world_type(0);   // answer the world-type modal up front, like eden-menu.js does
       M._eden_menu_play();
       if (!(await waitFor(() => menuState().game_mode === 1, 40000, 'play'))) return done({ error: 'never played' });
       await sleep(2500);
