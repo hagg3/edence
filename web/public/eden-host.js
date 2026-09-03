@@ -105,17 +105,48 @@ let EDEN_BUILD_DIR = EDEN_BUILD_PARAM === 'rel' ? '../build-rel/'
 // row seeds a leaner video preset (1x pixel ratio, 75% render scale). navigator.deviceMemory ≤ 4
 // feeds the video preset only — it is too coarse to deny a device the threaded build.
 const EDEN_LOWMEM_KEY = 'eden.lowmem';        // '1' once a device is known/declared low-memory
+const EDEN_LOWMEM_GEN_KEY = 'eden.lowmem.gen';
 const EDEN_LOWMEM_PARAM = new URLSearchParams(location.search).get('lowmem');
+
+// A remembered downgrade is a VERDICT ABOUT A BUILD, not a permanent fact about the device, and
+// it is stored forever — so when the reason a device failed is fixed, the memory has to be
+// invalidated or that visitor never gets the threaded build again. That was not hypothetical:
+// ROADMAP V7 (2026-09-03) had the deployed threaded build failing to boot in EVERY Chromium
+// because the service worker never sent `COEP: require-corp` on worker scripts, so between
+// 2026-08-30 and the fix, every desktop visitor's failsafe fired and wrote this flag.
+//
+// **Bump this string whenever a change could plausibly turn a previous "it didn't load" into
+// "it loads now"** — a boot/isolation/worker fix, an Emscripten flag change, a memory cut. The
+// cost of bumping it wrongly is bounded and small: a device that really cannot run the threaded
+// build (the 2 GB iPad Air 2) pays one more 45 s failsafe wait, once, and re-remembers.
+const EDEN_LOWMEM_GEN = '2026-09-03-coi-worker-coep';
 
 function edenLowMemStored() {
   try { return localStorage.getItem(EDEN_LOWMEM_KEY) === '1'; } catch (e) { return false; }
 }
 function edenLowMemSetStored(on) {
   try {
-    if (on) localStorage.setItem(EDEN_LOWMEM_KEY, '1');
-    else localStorage.removeItem(EDEN_LOWMEM_KEY);
+    if (on) {
+      localStorage.setItem(EDEN_LOWMEM_KEY, '1');
+      localStorage.setItem(EDEN_LOWMEM_GEN_KEY, EDEN_LOWMEM_GEN);
+    } else {
+      localStorage.removeItem(EDEN_LOWMEM_KEY);
+      localStorage.removeItem(EDEN_LOWMEM_GEN_KEY);
+    }
   } catch (e) { /* private mode / disabled storage — the session-scoped path still works */ }
 }
+// Runs before anything reads the flag: a memory recorded by an older build is discarded and the
+// device gets one clean attempt at the current one.
+(function edenExpireStaleLowMemVerdict() {
+  try {
+    if (localStorage.getItem(EDEN_LOWMEM_KEY) !== '1') return;
+    if (localStorage.getItem(EDEN_LOWMEM_GEN_KEY) === EDEN_LOWMEM_GEN) return;
+    localStorage.removeItem(EDEN_LOWMEM_KEY);
+    localStorage.removeItem(EDEN_LOWMEM_GEN_KEY);
+    console.log('[eden-host] discarding a threaded-load downgrade remembered by an older build ' +
+      '(ROADMAP Phase M / M5.1) — retrying the threaded build once.');
+  } catch (e) { /* no storage: nothing remembered, nothing to expire */ }
+})();
 // Apply the by-hand overrides once, at load.
 if (EDEN_LOWMEM_PARAM === '1' || EDEN_LOWMEM_PARAM === 'on') edenLowMemSetStored(true);
 else if (EDEN_LOWMEM_PARAM === 'off' || EDEN_LOWMEM_PARAM === '0' || EDEN_LOWMEM_PARAM === 'retry') {

@@ -105,7 +105,15 @@ async function main() {
   // 1. M5.1 — a remembered threaded-load failure downgrades ?build=thr before requesting it
   // ============================================================================================
   console.log('\n--- M5.1: remembered-downgrade path ---');
-  await wd.exec(s, `localStorage.setItem('eden.lowmem','1');`);
+  // The generation key must match eden-host.js's EDEN_LOWMEM_GEN or the flag is (correctly)
+  // discarded as a verdict from an older build — see edenExpireStaleLowMemVerdict(). Read it out of
+  // the page rather than hard-coding it here, so bumping the constant does not silently make this
+  // section test the expiry path instead of the downgrade path.
+  await wd.exec(s, `
+    localStorage.setItem('eden.lowmem','1');
+    localStorage.setItem('eden.lowmem.gen',
+      typeof EDEN_LOWMEM_GEN === 'string' ? EDEN_LOWMEM_GEN : '');   // a top-level const is NOT on window
+    return localStorage.getItem('eden.lowmem.gen');`);
   await wd.go(s, base + '?build=thr');
   if (!(await waitRuntime(s))) { console.log('RUNTIME NEVER READY (?build=thr w/ eden.lowmem)'); process.exit(1); }
   const dg = await wd.exec(s, `
